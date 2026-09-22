@@ -1,4 +1,15 @@
-import { Color, DoubleSide, NormalBlending, ShaderMaterial, Vector2, type Texture } from '@iwsdk/core';
+import {
+  AdditiveBlending,
+  Color,
+  DataTexture,
+  DoubleSide,
+  LinearFilter,
+  LinearSRGBColorSpace,
+  NormalBlending,
+  ShaderMaterial,
+  Vector2,
+  type Texture,
+} from '@iwsdk/core';
 // three compiles these as GLSL ES 3.00 with its WebGL1-style defines (varying, gl_FragColor),
 // which also keeps its multiview prefix working for the headset.
 import { UNIT } from './layout.js';
@@ -102,7 +113,10 @@ export function ghostMaterial(u: StackUniforms): ShaderMaterial {
         a *= edgeFeather(vUv, uFeather);
         if (a < 0.003) discard;
         vec3 rgb = texture(uFrames, vec3(vUv.x, 1.0 - vUv.y, vLayer)).rgb; // canvas rows are stored top-down
-        gl_FragColor = vec4(rgb, a);
+        float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+        // A small lift so midtones hold against a bright room. Still well under the focused frame.
+        vec3 lit = rgb * 1.18 + rgb * smoothstep(0.3, 0.85, luma) * 0.22;
+        gl_FragColor = vec4(lit, a);
         #include <colorspace_fragment>
       }`,
     transparent: true,
@@ -113,8 +127,10 @@ export function ghostMaterial(u: StackUniforms): ShaderMaterial {
 }
 
 /**
- * The current frame. Additive glow reads beautifully on a black stage but washes
- * out over a real room, so it's alpha-blended and brightened instead.
+ * The selected frame. Brightened like the browser version, then drawn with
+ * premultiplied alpha so the feather fades onto whatever is behind it.
+ * Additive blending cannot show the dark parts of a photo, so those were
+ * reading as a black fade.
  */
 export function currentMaterial(u: StackUniforms): ShaderMaterial {
   return new ShaderMaterial({
@@ -136,23 +152,34 @@ export function currentMaterial(u: StackUniforms): ShaderMaterial {
       void main() {
         vec3 rgb = texture(uFrames, vec3(vUv.x, 1.0 - vUv.y, uCur)).rgb;
         float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
-        vec3 lit = rgb * (1.0 + uGlow * 0.3) + rgb * smoothstep(0.35, 0.8, luma) * (uGlow * 0.45);
+        vec3 lit = rgb * (1.0 + uGlow * 0.72) + rgb * smoothstep(0.35, 0.8, luma) * (uGlow * 0.95);
         float a = edgeFeather(vUv, uFeather);
         if (a < 0.003) discard;
-        gl_FragColor = vec4(min(lit, vec3(1.0)), a);
+        gl_FragColor = vec4(lit, a);
         #include <colorspace_fragment>
+        gl_FragColor.rgb *= gl_FragColor.a;
       }`,
     transparent: true,
     depthWrite: false,
     side: DoubleSide,
     blending: NormalBlending,
+    premultipliedAlpha: true,
   });
 }
 
-/** Stands in for bloom, which XR can't afford: a soft spill in the current frame's own average colour. */
+/**
+ * Stands in for the browser version's bloom. The spill is masked by the same
+ * edge feather as the slice, so it dies at the corners instead of filling the quad.
+ */
 export function haloMaterial(u: StackUniforms): ShaderMaterial {
   return new ShaderMaterial({
-    uniforms: { uColor: u.haloColor, uStrength: u.haloStrength, uHalf: u.haloHalf, uReach: u.haloReach },
+    uniforms: {
+      uColor: u.haloColor,
+      uStrength: u.haloStrength,
+      uHalf: u.haloHalf,
+      uReach: u.haloReach,
+      uFeather: u.feather,
+    },
     vertexShader: /* glsl */ `
       uniform vec2 uHalf;
       uniform float uReach;
@@ -166,32 +193,105 @@ export function haloMaterial(u: StackUniforms): ShaderMaterial {
       uniform float uStrength;
       uniform vec2 uHalf;
       uniform float uReach;
+      uniform float uFeather;
       varying vec2 vPos;
+      ${FEATHER}
       void main() {
+        vec2 uv = clamp(vPos / (uHalf * 2.0) + 0.5, 0.0, 1.0);
+        float vignette = edgeFeather(uv, uFeather);
         vec2 q = abs(vPos) - uHalf;
         float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
-        float a = uStrength * exp(-max(d, 0.0) / uReach);
+        float a = uStrength * vignette * exp(-max(d, 0.0) / max(uReach, 1e-4));
         if (a < 0.003) discard;
         gl_FragColor = vec4(uColor, a);
         #include <colorspace_fragment>
+        gl_FragColor.rgb *= gl_FragColor.a;
       }`,
     transparent: true,
     depthWrite: false,
     side: DoubleSide,
-    blending: NormalBlending,
+    blending: AdditiveBlending,
+    premultipliedAlpha: true,
   });
 }
 
-/** Dot grid plus a soft contact shadow, drawn on the real table under the stack. */
+/**
+ * The pinched frame, enlarged. A flat photo until depth arrives, then the grid
+ * pushes near pixels toward the viewer and grows them, so the picture stretches
+ * instead of sitting as a flat card. High depth values are near.
+ */
+export function reliefMaterial(): ShaderMaterial {
+  const depth = new DataTexture(new Uint8Array([255, 255, 255, 255]), 1, 1);
+  depth.colorSpace = LinearSRGBColorSpace;
+  depth.magFilter = LinearFilter;
+  depth.minFilter = LinearFilter;
+  depth.generateMipmaps = false;
+  depth.flipY = true;
+  depth.needsUpdate = true;
+  return new ShaderMaterial({
+    uniforms: {
+      uPhoto: { value: null as Texture | null },
+      uDepth: { value: depth },
+      uTexel: { value: new Vector2(1, 1) },
+      uRelief: { value: 0 },
+      uHasDepth: { value: 0 },
+      uDepthAmt: { value: 0.62 },
+      uFeather: { value: 0.08 },
+    },
+    vertexShader: /* glsl */ `
+      uniform sampler2D uDepth;
+      uniform vec2 uTexel;
+      uniform float uRelief;
+      uniform float uHasDepth;
+      uniform float uDepthAmt;
+      varying vec2 vUv;
+      float raw(vec2 q) { return texture(uDepth, clamp(q, vec2(0.001), vec2(0.999))).r; }
+      float depthAt(vec2 q) {
+        vec2 r = uTexel * 4.5;
+        float s = raw(q) * 4.0;
+        s += (raw(q + vec2(r.x, 0.0)) + raw(q - vec2(r.x, 0.0)) + raw(q + vec2(0.0, r.y)) + raw(q - vec2(0.0, r.y))) * 2.0;
+        s += raw(q + r) + raw(q - r) + raw(q + vec2(r.x, -r.y)) + raw(q - vec2(r.x, -r.y));
+        return s / 16.0;
+      }
+      void main() {
+        vUv = uv;
+        vec3 p = position;
+        if (uHasDepth > 0.5) {
+          float z = (depthAt(uv) - 0.5) * uDepthAmt * uRelief;
+          p.z += z;
+          p.xy *= 1.0 + z * 0.7;
+        }
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(p, 1.0);
+      }`,
+    fragmentShader: /* glsl */ `
+      uniform sampler2D uPhoto;
+      uniform float uFeather;
+      varying vec2 vUv;
+      ${FEATHER}
+      void main() {
+        vec3 rgb = texture(uPhoto, vUv).rgb;
+        float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+        vec3 lit = rgb * 1.15 + rgb * smoothstep(0.35, 0.8, luma) * 0.2;
+        float a = edgeFeather(vUv, uFeather);
+        if (a < 0.003) discard;
+        gl_FragColor = vec4(lit, a);
+        #include <colorspace_fragment>
+        gl_FragColor.rgb *= gl_FragColor.a;
+      }`,
+    transparent: true,
+    depthWrite: true,
+    side: DoubleSide,
+    blending: NormalBlending,
+    premultipliedAlpha: true,
+  });
+}
+
+/** Soft contact shadow under the stack, drawn on the real table. */
 export function floorMaterial(u: StackUniforms): ShaderMaterial {
   return new ShaderMaterial({
     uniforms: {
       uHalf: u.half,
       uFloorR: u.floorR,
-      uGap: { value: 0.1 * UNIT },
-      uDotR: { value: 0.0011 },
-      uDotColor: { value: new Color('#8B92A3') },
-      uDotA: { value: 0.7 },
       uShadowColor: { value: new Color('#000000') },
       uShadowA: { value: 0.45 },
       uUnit: { value: UNIT },
@@ -206,29 +306,16 @@ export function floorMaterial(u: StackUniforms): ShaderMaterial {
       }`,
     fragmentShader: /* glsl */ `
       uniform vec2 uHalf;
-      uniform float uFloorR;
-      uniform float uGap;
-      uniform float uDotR;
-      uniform vec3 uDotColor;
-      uniform float uDotA;
       uniform vec3 uShadowColor;
       uniform float uShadowA;
       uniform float uUnit;
       varying vec2 vPos;
       void main() {
-        vec2 g = vPos / uGap;
-        float dist = length((g - floor(g + 0.5)) * uGap);
-        float aa = max(fwidth(dist), 1e-6);
-        float dots = 1.0 - smoothstep(uDotR - aa, uDotR + aa, dist);
-        vec2 gfw = fwidth(g);
-        dots *= 1.0 - smoothstep(0.12, 0.3, max(gfw.x, gfw.y)); // fade before dots alias into moiré
-        dots *= (1.0 - smoothstep(uFloorR * 0.3, uFloorR, length(vPos))) * uDotA;
         vec2 q = abs(vPos) - uHalf;
         float rectDist = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
         float shadow = (1.0 - smoothstep(-0.1 * uUnit, 0.55 * uUnit, rectDist)) * uShadowA;
-        float a = max(dots, shadow);
-        if (a < 0.003) discard;
-        gl_FragColor = vec4(mix(uShadowColor, uDotColor, dots / max(dots + shadow, 1e-4)), a);
+        if (shadow < 0.003) discard;
+        gl_FragColor = vec4(uShadowColor, shadow);
         #include <colorspace_fragment>
       }`,
     transparent: true,

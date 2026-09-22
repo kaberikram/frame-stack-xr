@@ -1,4 +1,5 @@
 import { createSystem, VisibilityState } from '@iwsdk/core';
+import { prepareDepthModel } from './depth-model.js';
 import {
   DEFAULT_CLIP_NAME,
   DEFAULT_CLIP_URL,
@@ -14,6 +15,8 @@ import { FrameStackSystem } from './frame-stack-system.js';
 import { TableTouchSystem } from './table-touch-system.js';
 
 const NO_PASSTHROUGH = 'Open this page in the Meta Quest browser to use passthrough.';
+const DEPTH_WAIT = 'Downloading the depth model. Passthrough unlocks when it’s ready.';
+const DEPTH_FAIL = 'The depth model didn’t load. Reload the page to try again.';
 
 /** Wires the 2D launch card in index.html: pick a clip and a sample rate, then enter passthrough. */
 export class LauncherSystem extends createSystem({}) {
@@ -70,19 +73,45 @@ export class LauncherSystem extends createSystem({}) {
     enter.addEventListener('click', onEnter);
 
     enter.disabled = true;
+    const placeHint = hint.textContent ?? '';
+    let xrKnown = false;
+    let xrOk = false;
+    let depthReady = false;
+    let depthNote = DEPTH_WAIT;
+    const syncEnter = () => {
+      enter.disabled = !(xrOk && depthReady);
+      if (!xrKnown) return;
+      if (!xrOk) hint.textContent = NO_PASSTHROUGH;
+      else if (!depthReady) hint.textContent = depthNote;
+      else hint.textContent = placeHint;
+    };
     if (this.world.xrEnabled && navigator.xr) {
       navigator.xr.isSessionSupported('immersive-ar').then(
         (ok) => {
-          enter.disabled = !ok;
-          if (!ok) hint.textContent = NO_PASSTHROUGH;
+          xrKnown = true;
+          xrOk = ok;
+          syncEnter();
         },
         () => {
-          hint.textContent = NO_PASSTHROUGH;
+          xrKnown = true;
+          syncEnter();
         },
       );
     } else {
-      hint.textContent = NO_PASSTHROUGH;
+      xrKnown = true;
+      syncEnter();
     }
+
+    void prepareDepthModel().then(
+      () => {
+        depthReady = true;
+        syncEnter();
+      },
+      () => {
+        depthNote = DEPTH_FAIL;
+        syncEnter();
+      },
+    );
 
     void this.openDefault(stack, rate, source);
 

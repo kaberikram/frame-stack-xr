@@ -1,12 +1,8 @@
 import {
   BoxGeometry,
-  BufferAttribute,
-  BufferGeometry,
   CanvasTexture,
-  Color,
   DataArrayTexture,
   EdgesGeometry,
-  Float32BufferAttribute,
   Group,
   InstancedBufferGeometry,
   LinearFilter,
@@ -23,9 +19,11 @@ import {
   type Material,
   type Object3D,
 } from '@iwsdk/core';
+import { DepthCard } from './depth-card.js';
+import { cancelDepth, estimateDepth } from './depth-model.js';
 import { FrameStack } from './frame-stack-component.js';
-import { DEMO_SECONDS, fmtTime, type FrameSource } from './frame-sources.js';
-import { INK, drawMove, drawPlay, drawSpeed, drawStrip, drawTag, makeCanvas, type Atlas, type Canvas2D } from './labels.js';
+import { DEMO_SECONDS, type FrameSource } from './frame-sources.js';
+import { INK, drawMove, drawPlay, drawSpeed, drawStrip, makeCanvas, type Atlas, type Canvas2D } from './labels.js';
 import {
   BUTTON_R,
   FRAME_H,
@@ -40,7 +38,6 @@ import {
   STRIP_GAP,
   STRIP_LENGTH,
   SURFACE_Y,
-  UNIT,
 } from './layout.js';
 import {
   createStackUniforms,
@@ -58,8 +55,6 @@ const GPU_BUDGET = 32 * 1024 * 1024; // bytes for the whole frame array
 const MAX_FRAME_PIXELS = 320 * 180;
 const SPEEDS = [0.5, 1, 2, 4];
 const MAJORS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
-const TAG_W = 0.054;
-const TAG_H = 0.012;
 const LOOK_KEYS = ['ghost', 'trail', 'length', 'lift', 'feather', 'glow'] as const;
 type Look = Record<(typeof LOOK_KEYS)[number], number>;
 
@@ -102,7 +97,7 @@ interface Button {
 }
 
 /**
- * The frame stack on the table: slices, ghosts, glow, ruler, dot grid, and the
+ * The frame stack on the table: slices, ghosts, glow, and the
  * filmstrip slider with its controls. Owns the clip and playback; the table touch
  * system drives it through seek(), skimAt(), togglePlay() and cycleSpeed().
  */
@@ -133,24 +128,28 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
   private H = FRAME_H;
   private pressed: Target | null = null;
   private repaint = true;
-  private painted = { playing: false, speed: 0, pressed: null as Target | null, tag: -1, tagN: -1 };
+  private painted = { playing: false, speed: 0, pressed: null as Target | null };
   private readonly look: Look = { ghost: 1, trail: 16, length: 2, lift: 0.15, feather: 0.4, glow: 1 };
+  private card!: DepthCard;
+  private source: FrameSource | null = null;
+  private frameCPU: { data: Uint8Array; w: number; h: number } | null = null;
+  private sliceCanvas: HTMLCanvasElement | null = null;
+  private reliefIndex = 0;
   private rig: Entity | null = null;
   private readonly listeners = new Set<() => void>();
   private readonly eye = new Vector3();
-  private readonly eyeQuat = new Quaternion();
   private readonly local = new Vector3();
   private readonly touchPoint = new Vector3();
+  private readonly camQuat = new Quaternion();
+  private readonly dockPos = new Vector3();
+  private readonly dockQuat = new Quaternion();
+  private readonly dockScale = new Vector3();
   /** 0 at the first frame, 1 at the last. Written by `probe`. */
   stackU = 0;
   /** Meters outside the frame volume. 0 when the point is inside. Written by `probe`. */
   stackOutside = Infinity;
   /** Stack-local position along the time axis, in meters. Written by `probe`. */
   stackAxis = 0;
-  private readonly cornerA = new Vector3();
-  private readonly cornerB = new Vector3();
-  private readonly right = new Vector3();
-  private readonly up = new Vector3();
 
   private U!: StackUniforms;
   private root!: Group;
@@ -162,8 +161,6 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
   private current!: Mesh;
   private floor!: Mesh;
   private box!: LineSegments;
-  private ruler!: LineSegments;
-  private tick!: LineSegments;
   private stripPaint!: Canvas2D;
   private stripTex!: CanvasTexture;
   private curMarker!: Group;
@@ -171,16 +168,13 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
   private playBtn!: Button;
   private speedBtn!: Button;
   private move!: Button;
-  private tag!: Mesh;
-  private tagPaint!: Canvas2D;
-  private tagTex!: CanvasTexture;
-  private tagEntity!: Entity;
   private work!: Canvas2D;
   private atlas!: Atlas;
   private atlasCtx!: CanvasRenderingContext2D;
 
   init(): void {
     this.U = createStackUniforms(makeFrameArray(2, 2, 1).tex);
+    this.card = new DepthCard(this.scene);
     this.root = new Group();
     this.base = new Group(); // on the table, time axis along the film strip; grows upward on reveal
     this.stackGroup = new Group();
@@ -203,30 +197,18 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     this.floor = new Mesh(flatQuad, floorMaterial(this.U));
     this.floor.frustumCulled = false;
 
-    const line = (color: string | Color) => new LineBasicMaterial({ color, transparent: true, depthWrite: true });
+    const line = (color: string) => new LineBasicMaterial({ color, transparent: true, depthWrite: true });
     this.box = new LineSegments(new EdgesGeometry(new BoxGeometry(1, 1, 1)), line(INK.red));
     this.box.visible = false;
-    const rulerGeo = new BufferGeometry();
-    rulerGeo.setAttribute('position', new BufferAttribute(new Float32Array(MAX_LAYERS * 6), 3));
-    rulerGeo.setDrawRange(0, 0);
-    this.ruler = new LineSegments(rulerGeo, line(new Color(INK.text).lerp(new Color(INK.stage), 0.4)));
-    this.ruler.frustumCulled = false;
-    this.tick = new LineSegments(
-      new BufferGeometry().setAttribute('position', new Float32BufferAttribute([0, 0, 0, 0.17 * UNIT, 0, 0], 3)),
-      line(INK.text),
-    );
 
     // Draw order. IWSDK's hand mesh is invisible but writes depth at order 0, so a real
-    // finger cuts through everything drawn after it. Lines go before the slices so the
-    // slices blend over them, as in the browser version.
+    // finger cuts through everything drawn after it.
     this.floor.renderOrder = 1;
     this.box.renderOrder = 5;
-    this.ruler.renderOrder = 5;
-    this.tick.renderOrder = 5;
     this.ghosts.renderOrder = 6;
     this.halo.renderOrder = 7;
     this.current.renderOrder = 8;
-    this.stackGroup.add(this.floor, this.box, this.ruler, this.tick, this.ghosts, this.halo, this.current);
+    this.stackGroup.add(this.floor, this.box, this.ghosts, this.halo, this.current);
 
     // Filmstrip slider and controls, flat on the table
     this.stripPaint = makeCanvas(2048, 164);
@@ -244,19 +226,6 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     this.move = this.button(256, 118, MOVE_W, MOVE_H, MOVE_X);
     this.root.add(strip, this.curMarker, this.headMarker, this.playBtn.mesh, this.speedBtn.mesh, this.move.mesh);
 
-    // The frame tag lives in world space so it can turn to face the viewer.
-    this.tagPaint = makeCanvas(288, 64);
-    this.tagTex = this.canvasTexture(this.tagPaint.canvas);
-    this.tag = new Mesh(
-      new PlaneGeometry(TAG_W, TAG_H),
-      new MeshBasicMaterial({ map: this.tagTex, transparent: true, depthWrite: false }),
-    );
-    this.tag.renderOrder = 9;
-    this.tag.visible = false;
-    const tagRoot = new Group();
-    tagRoot.add(this.tag);
-    this.tagEntity = this.world.createTransformEntity(tagRoot);
-
     this.work = makeCanvas(16, 16, true);
     const atlas = makeCanvas(16, 16, true); // CPU-backed so thumbnails survive GPU resets
     this.atlas = { canvas: atlas.canvas, w: 160, h: 90, cols: 12 };
@@ -269,7 +238,6 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     );
     void document.fonts.ready.then(() => {
       this.repaint = true; // repaint labels once the Recursive face has arrived
-      this.painted.tag = -1;
     });
   }
 
@@ -341,13 +309,51 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     this.pressed = target;
   }
 
+  get reliefOccupied(): boolean {
+    return this.card.occupied;
+  }
+
+  /** Pinch: lift the frame under the playhead and turn it to face the head. */
+  openRelief(headPos: Vector3, headQuat: Quaternion): void {
+    if (!this.ready || this.card.occupied) return;
+    const index = this.displayIndex();
+    const photo = this.sliceImage(index);
+    if (!photo) return;
+    this.reliefIndex = index;
+    this.skim = null;
+    this.playhead = index;
+    this.setPlaying(false);
+    const gen = this.card.begin(this.current, headPos, headQuat, photo, this.aspect);
+    void this.finishRelief(index, gen);
+  }
+
+  /** Pinch again: fly that frame back into its slot. */
+  closeRelief(): void {
+    if (!this.card.occupied) return;
+    cancelDepth();
+    this.playhead = this.reliefIndex;
+    this.skim = null;
+    this.framePose(this.reliefIndex, this.dockPos, this.dockQuat, this.dockScale);
+    this.card.close(this.dockPos, this.dockQuat, this.dockScale);
+  }
+
+  /** A pinch aimed at the selected slice, with the hand close to it. */
+  hitCurrent(head: Vector3, pinch: Vector3): boolean {
+    return this.loaded > 0 && this.card.aimHit(this.current, head, pinch, 0.045, 0.14);
+  }
+
+  /** A pinch aimed at the enlarged card. The hand can sit well in front of it. */
+  hitRelief(head: Vector3, pinch: Vector3): boolean {
+    return this.card.occupied && this.card.aimHit(this.card.mesh, head, pinch, 0.08, 0.4);
+  }
+
   /** Slices rise out of the table after placement. */
   reveal(): void {
     this.revealT = reduceMotion.matches ? 1 : 0;
     this.base.scale.y = reduceMotion.matches ? 1 : 0.001;
   }
 
-  /** Whether a slice sits on a long ruler tick. */
+  /** Whether a slice lands on a strong beat, for the scrub click. */
   isMajor(i: number): boolean {
     return i % this.major === 0;
   }
@@ -380,12 +386,16 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
   /** Slices a source into the frame array, uploading layers in batches as they land. */
   async build(source: FrameSource): Promise<boolean> {
     const my = ++this.job; // stops any slicing in progress
+    this.source = source;
+    this.card.dismiss();
+    cancelDepth();
     const N = clamp(Math.round(source.duration * this.rate), 2, MAX_LAYERS);
     const { W, H } = frameSize(source.aspect, N);
     const { tex, data } = makeFrameArray(W, H, N);
     const old = this.U.frames.value;
     this.U.frames.value = tex;
     old.dispose();
+    this.frameCPU = { data, w: W, h: H };
 
     this.meanColors = new Float32Array(N * 3);
     this.kind = source.kind;
@@ -444,12 +454,21 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
   // ---------------------------------------------------------------- frame loop
 
   update(delta: number): void {
-    if (!this.rig) return;
     const dt = Math.min(0.1, delta);
+    this.card.update(dt);
+    if (!this.rig) return;
     const now = performance.now();
     this.readLook();
 
-    if (this.playing) this.playhead = (this.playhead + dt * (this.N / this.duration) * this.speed) % this.N;
+    if (!this.card.occupied && this.playing) this.playhead = (this.playhead + dt * (this.N / this.duration) * this.speed) % this.N;
+    if (!this.renderer.xr.isPresenting && this.ready && this.input.keyboard.getKeyDown('KeyP')) {
+      if (this.card.occupied) this.closeRelief();
+      else {
+        this.viewer(this.eye);
+        this.camera.getWorldQuaternion(this.camQuat);
+        this.openRelief(this.eye, this.camQuat);
+      }
+    }
     const target = this.displayIndex();
     if (this.focus !== target) {
       const jump = Math.abs(target - this.focus);
@@ -483,7 +502,7 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
 
     // Draw each side from the far end toward the viewer. One sweep across the
     // whole stack piles the slices up and washes the middle out.
-    this.viewer(this.eye, this.eyeQuat);
+    this.viewer(this.eye);
     this.stackGroup.updateWorldMatrix(true, false);
     this.local.copy(this.eye);
     this.stackGroup.worldToLocal(this.local);
@@ -491,24 +510,25 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     U.split.value = clamp(Math.floor(ci) + 1, 0, this.N);
 
     // Per-slice opacity is normalised by slice count, so density reads the same at 16 or 128 frames.
+    // The coefficient is higher than the monitor build: passthrough washes low alpha out,
+    // and 4.5 left the stack barely there in the headset.
     const s = (this.look.ghost / 0.5) ** 2;
-    U.ghost.value = 1 - Math.exp((-4.5 * s) / Math.max(2, this.N));
+    U.ghost.value = 1 - Math.exp((-6.75 * s) / Math.max(2, this.N));
     U.spread.value = this.look.trail;
     U.lift.value = this.look.lift;
     U.feather.value = this.look.feather;
     U.glow.value = this.look.glow;
 
     const has = this.loaded > 0;
+    const held = this.card.occupied;
     this.box.visible = false;
-    this.current.visible = has;
-    this.halo.visible = has;
-    this.tick.visible = has;
+    this.current.visible = has && !held;
+    this.halo.visible = has && !held;
     this.curMarker.visible = has;
     const z = U.z0.value - idx * U.spacing.value;
     const ly = this.look.lift * FRAME_H * 0.85;
     this.current.position.set(0, ly, z);
     this.halo.position.set(0, ly, z);
-    this.tick.position.z = z;
     const m = idx * 3;
     if (m + 2 < this.meanColors.length) {
       const c = this.meanColors;
@@ -520,35 +540,73 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     this.headMarker.visible = has && this.skim !== null;
     if (this.headMarker.visible) this.headMarker.position.x = this.stripX(Math.floor(this.playhead));
     this.paintButtons();
-    this.placeTag(idx, ly, z);
   }
 
-  private viewer(pos: Vector3, quat: Quaternion): void {
+  private async finishRelief(index: number, gen: number): Promise<void> {
+    const still = await this.captureStill(index);
+    if (!still || gen !== this.card.generation) return;
+    this.card.setPhoto(still);
+    try {
+      const depth = await estimateDepth(still);
+      if (gen !== this.card.generation) return;
+      this.card.setDepth(depth);
+    } catch (err) {
+      if (err instanceof Error && err.message === 'cancelled') return;
+      console.warn('Depth relief unavailable', err);
+    }
+  }
+
+  private async captureStill(index: number): Promise<HTMLCanvasElement | null> {
+    const source = this.source;
+    if (!source) return null;
+    const max = 768;
+    const aspect = Math.max(0.2, this.aspect);
+    const w = aspect >= 1 ? max : Math.max(2, Math.round(max * aspect));
+    const h = aspect >= 1 ? Math.max(2, Math.round(max / aspect)) : max;
+    const canvas = document.createElement('canvas');
+    canvas.width = w;
+    canvas.height = h;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    await source.draw(ctx, w, h, (index / Math.max(1, this.N)) * this.duration, index);
+    return canvas;
+  }
+
+  /** The stack slice, so the card can leave immediately while the sharp frame is sought. */
+  private sliceImage(index: number): HTMLCanvasElement | null {
+    const frames = this.frameCPU;
+    if (!frames) return null;
+    const { data, w, h } = frames;
+    const canvas = this.sliceCanvas ?? document.createElement('canvas');
+    this.sliceCanvas = canvas;
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return null;
+    const img = ctx.createImageData(w, h);
+    const start = index * w * h * 4;
+    img.data.set(data.subarray(start, start + w * h * 4));
+    ctx.putImageData(img, 0, 0);
+    return canvas;
+  }
+
+  /** World pose of one slice, without moving the mesh that is currently on screen. */
+  private framePose(index: number, pos: Vector3, quat: Quaternion, scale: Vector3): void {
+    const z = this.U.z0.value - index * this.U.spacing.value;
+    const ly = this.look.lift * FRAME_H * 0.85;
+    this.touchPoint.set(0, ly, z);
+    this.stackGroup.updateWorldMatrix(true, false);
+    this.stackGroup.localToWorld(this.touchPoint);
+    pos.copy(this.touchPoint);
+    this.stackGroup.getWorldQuaternion(quat);
+    this.current.getWorldScale(scale);
+  }
+
+  private viewer(pos: Vector3): void {
     const source = this.renderer.xr.isPresenting ? this.player.head : this.camera;
     source.getWorldPosition(pos);
-    source.getWorldQuaternion(quat);
-  }
-
-  private placeTag(idx: number, ly: number, z: number): void {
-    const show = this.loaded > 0 && this.revealT >= 1 && (this.rig?.object3D?.visible ?? false);
-    this.tag.visible = show;
-    if (!show) return;
-    if (this.painted.tag !== idx || this.painted.tagN !== this.N) {
-      this.painted.tag = idx;
-      this.painted.tagN = this.N;
-      drawTag(this.tagPaint, String(idx + 1).padStart(3, '0'), fmtTime((idx / Math.max(1, this.N)) * this.duration));
-      this.tagTex.needsUpdate = true;
-    }
-    this.cornerA.set(-this.W / 2, this.H / 2 + ly, z);
-    this.cornerB.set(this.W / 2, this.H / 2 + ly, z);
-    this.stackGroup.localToWorld(this.cornerA);
-    this.stackGroup.localToWorld(this.cornerB);
-    this.right.set(1, 0, 0).applyQuaternion(this.eyeQuat);
-    this.up.set(0, 1, 0).applyQuaternion(this.eyeQuat);
-    // whichever top corner of the current frame is on the viewer's left right now
-    const corner = this.cornerA.dot(this.right) <= this.cornerB.dot(this.right) ? this.cornerA : this.cornerB;
-    this.tag.position.copy(corner).addScaledVector(this.right, TAG_W / 2 - 0.001).addScaledVector(this.up, TAG_H / 2 + 0.006);
-    this.tag.quaternion.copy(this.eyeQuat);
   }
 
   private paintButtons(): void {
@@ -603,22 +661,6 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
 
     const seconds = MAJORS.find((k) => this.duration / k <= 20) ?? 600;
     this.major = Math.max(1, Math.round((seconds * this.N) / Math.max(this.duration, 1e-6)));
-    const x0 = W / 2 + PAD;
-    const attr = this.ruler.geometry.getAttribute('position') as BufferAttribute;
-    const pos = attr.array as Float32Array;
-    for (let i = 0; i < this.N; i++) {
-      const z = U.z0.value - i * U.spacing.value;
-      const o = i * 6;
-      pos[o] = x0;
-      pos[o + 1] = floorY;
-      pos[o + 2] = z;
-      pos[o + 3] = x0 + (i % this.major === 0 ? 0.09 : 0.035) * UNIT;
-      pos[o + 4] = floorY;
-      pos[o + 5] = z;
-    }
-    attr.needsUpdate = true;
-    this.ruler.geometry.setDrawRange(0, this.N * 2);
-    this.tick.position.set(x0, floorY, 0);
 
     // Sit the stack behind the strip: its turned footprint has to clear the strip's far edge.
     const halfDepth = Math.abs((W / 2 + PAD) * Math.sin(STACK_YAW)) + Math.abs((D / 2 + PAD) * Math.cos(STACK_YAW));
@@ -649,7 +691,6 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     if (entity !== this.rig) return;
     this.root.removeFromParent();
     this.rig = null;
-    this.tag.visible = false;
   }
 
   private readLook(force = false): void {
@@ -712,9 +753,8 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
         else material?.dispose();
       });
     release(this.root);
-    release(this.tag);
-    for (const tex of [this.U.frames.value, this.stripTex, this.tagTex, this.playBtn.tex, this.speedBtn.tex, this.move.tex]) tex.dispose();
+    this.card.dispose();
+    for (const tex of [this.U.frames.value, this.stripTex, this.playBtn.tex, this.speedBtn.tex, this.move.tex]) tex.dispose();
     this.root.removeFromParent();
-    this.tagEntity.dispose();
   }
 }

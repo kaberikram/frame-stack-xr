@@ -12,6 +12,7 @@ import {
   type Entity,
   type ShaderMaterial,
 } from '@iwsdk/core';
+import { InputComponent } from '@iwsdk/xr-input';
 import { FrameStack } from './frame-stack-component.js';
 import { FrameStackSystem } from './frame-stack-system.js';
 import { INK, drawHint, makeCanvas, type Canvas2D } from './labels.js';
@@ -72,6 +73,11 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
   private restY = 0.008;
   private capture: { side: Side; target: Target | 'stack' } | null = null;
   private fingers!: Record<Side, Finger>;
+  private pinched = { left: false, right: false };
+  private pinchArm = 0;
+  private readonly pinchPos = new Vector3();
+  private readonly thumbPos = new Vector3();
+  private readonly indexPos = new Vector3();
   private readonly sound = new TickSound();
   private lastIdx = -1;
   private readonly homePos = new Vector3();
@@ -269,7 +275,7 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
       g.contact.touching = true;
     }
     this.stack.reveal();
-    this.sound.tap();
+    this.sound.appear();
   }
 
   private startPlacing(): void {
@@ -306,6 +312,8 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
       else if (edge === 'up') this.onUp(side, f);
     }
 
+    this.updatePinch(dt);
+
     const cap = this.capture;
     if (cap?.target === 'stack') {
       const f = this.fingers[cap.side];
@@ -318,13 +326,72 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
       this.stack.setPressed(inZone(cap.target, f.local.x, f.local.z, BUTTON_SLOP) ? cap.target : null);
     }
 
-    if (!this.capture) this.grabOrSkim(dt);
+    if (!this.capture && !this.stack.reliefOccupied) this.grabOrSkim(dt);
 
     const idx = this.stack.displayIndex();
     if (idx !== this.lastIdx) {
       const scrubbing = this.capture?.target === 'strip' || this.capture?.target === 'stack';
       if (scrubbing || this.stack.skim !== null) this.sound.tick(this.stack.isMajor(idx));
       this.lastIdx = idx;
+    }
+  }
+
+  /** Thumb-to-index pinch on the selected frame. Table touches stay index-tip scrubs. */
+  private updatePinch(dt: number): void {
+    if (this.pinchArm > 0) this.pinchArm = Math.max(0, this.pinchArm - dt);
+    if (!this.stack.ready) return;
+    for (let i = 0; i < SIDES.length; i++) {
+      const side = SIDES[i];
+      const dist = this.pinchSpan(side);
+      const was = this.pinched[side];
+      if (dist === null) {
+        this.pinched[side] = false;
+        continue;
+      }
+      const trigger = this.input.xr.gamepads[side]?.getButtonDown(InputComponent.Trigger) ?? false;
+      if (!was && (dist < 0.032 || (trigger && dist < 0.05))) {
+        this.pinched[side] = true;
+        if (this.pinchArm === 0) this.onPinch();
+      } else if (was && dist > 0.045) {
+        this.pinched[side] = false;
+      }
+    }
+  }
+
+  /** Distance between thumb tip and index tip, in meters. The midpoint is left in `pinchPos`. */
+  private pinchSpan(side: Side): number | null {
+    const frame = this.world.xrFrame;
+    const ref = this.world.xrReferenceSpace;
+    const hand = this.input.xr.getPrimaryInputSource(side)?.hand;
+    if (!frame || !ref || !hand || !this.input.xr.isPrimary('hand', side)) return null;
+    const thumb = hand.get('thumb-tip');
+    const index = hand.get('index-finger-tip');
+    if (!thumb || !index) return null;
+    const thumbPose = frame.getJointPose?.(thumb, ref);
+    const indexPose = frame.getJointPose?.(index, ref);
+    if (!thumbPose || !indexPose) return null;
+    const tp = thumbPose.transform.position;
+    const ip = indexPose.transform.position;
+    this.player.updateWorldMatrix(true, false);
+    this.thumbPos.set(tp.x, tp.y, tp.z).applyMatrix4(this.player.matrixWorld);
+    this.indexPos.set(ip.x, ip.y, ip.z).applyMatrix4(this.player.matrixWorld);
+    this.pinchPos.copy(this.thumbPos).add(this.indexPos).multiplyScalar(0.5);
+    return this.thumbPos.distanceTo(this.indexPos);
+  }
+
+  private onPinch(): void {
+    const scrubbing = this.capture?.target === 'strip' || this.capture?.target === 'stack';
+    if (scrubbing) return;
+    const open = this.stack.reliefOccupied;
+    const hit = open ? this.stack.hitRelief(this.head, this.pinchPos) : this.stack.hitCurrent(this.head, this.pinchPos);
+    if (!hit) return;
+    this.pinchArm = 0.45;
+    if (open) {
+      this.stack.closeRelief();
+      this.sound.select();
+    } else {
+      this.stack.openRelief(this.head, this.headQuat);
+      this.sound.appear();
     }
   }
 
@@ -354,7 +421,7 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
     if (grab) {
       this.capture = { side: grab.side, target: 'stack' };
       grab.finger.axis.reset();
-      this.sound.tap();
+      this.sound.select();
       this.stack.seek(this.stack.uOnAxis(grab.finger.axis.filter(grab.finger.axisZ, dt)));
       return;
     }
@@ -380,7 +447,8 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
     this.capture = { side, target };
     f.ripple.position.set(f.local.x, SURFACE_Y + 0.0008, f.local.z);
     f.rippleT = 0;
-    this.sound.tap();
+    if (target === 'strip') this.sound.select();
+    else this.sound.button();
     if (target === 'strip') {
       f.filter.reset(); // land exactly where the finger touched
       f.sx = f.local.x;
@@ -460,13 +528,8 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
         Math.abs(f.local.x) < STRIP_LENGTH / 2 + 0.16 &&
         Math.abs(f.local.z) < 0.14;
       f.shadow.visible = near && !f.contact.touching;
-      f.ring.visible = (near && f.contact.touching) || (ready && onStack);
-      if (onStack) {
-        f.ring.position.set(f.local.x, f.local.y, f.local.z);
-        f.ring.renderOrder = 9;
-        f.ringMat.depthTest = false;
-        f.ring.scale.setScalar(0.02);
-      } else if (near) {
+      f.ring.visible = near && f.contact.touching;
+      if (near) {
         // A fingertip "shadow" that tightens and darkens as the finger nears the table.
         const k = clamp01(f.height / 0.12);
         f.shadow.position.set(f.local.x, SURFACE_Y + 0.0006, f.local.z);

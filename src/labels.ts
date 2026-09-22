@@ -28,31 +28,6 @@ export function makeCanvas(w: number, h: number, willReadFrequently = false): Ca
   return { canvas, ctx };
 }
 
-/** Frame number and timecode in a white outline, like the browser version's floating tag. */
-export function drawTag({ canvas, ctx }: Canvas2D, num: string, time: string): void {
-  const w = canvas.width;
-  const h = canvas.height;
-  const s = h / 32;
-  ctx.clearRect(0, 0, w, h);
-  ctx.beginPath();
-  ctx.roundRect(s, s, w - 2 * s, h - 2 * s, 6 * s);
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.38)'; // keeps white text legible over a bright room
-  ctx.fill();
-  ctx.lineWidth = 1.5 * s;
-  ctx.strokeStyle = '#FFFFFF';
-  ctx.stroke();
-  ctx.fillStyle = '#FFFFFF';
-  ctx.textAlign = 'left';
-  ctx.textBaseline = 'middle';
-  ctx.font = `600 ${15 * s}px ${MONO}`;
-  ctx.fillText(num, 9 * s, h / 2 + 0.5 * s);
-  const x = 18 * s + ctx.measureText(num).width;
-  ctx.globalAlpha = 0.85;
-  ctx.font = `450 ${15 * s}px ${MONO}`;
-  ctx.fillText(time, x, h / 2 + 0.5 * s);
-  ctx.globalAlpha = 1;
-}
-
 /** The floating instruction card shown while placing the rig. */
 export function drawHint({ canvas, ctx }: Canvas2D, title: string, body: string): void {
   const w = canvas.width;
@@ -75,19 +50,34 @@ export function drawHint({ canvas, ctx }: Canvas2D, title: string, body: string)
   ctx.fillText(body, 60, 182);
 }
 
-/** Solid round play button, with the browser version's 24-unit icon paths. */
+/** White outline only. A press thickens the stroke; the plate itself stays empty. */
+function strokeOutline(ctx: CanvasRenderingContext2D, x: number, y: number, w: number, h: number, pressed: boolean): void {
+  ctx.beginPath();
+  ctx.roundRect(x, y, w, h, h / 2);
+  ctx.lineWidth = Math.max(2, h * (pressed ? 0.05 : 0.032));
+  ctx.strokeStyle = '#FFFFFF';
+  ctx.stroke();
+}
+
+function paintWhiteLabel(ctx: CanvasRenderingContext2D, label: string, x: number, y: number, font: string): void {
+  ctx.fillStyle = '#FFFFFF';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.font = font;
+  ctx.fillText(label, x, y);
+}
+
+/** Round play button: white ring and white icon, with the browser version's 24-unit paths. */
 export function drawPlay({ canvas, ctx }: Canvas2D, playing: boolean, pressed: boolean): void {
   const s = canvas.width;
   ctx.clearRect(0, 0, s, s);
-  ctx.beginPath();
-  ctx.arc(s / 2, s / 2, s / 2 - 2, 0, Math.PI * 2);
-  ctx.fillStyle = pressed ? '#FFFFFF' : INK.text;
-  ctx.fill();
-  const k = (s * 0.5) / 24;
+  const inset = 5;
+  strokeOutline(ctx, inset, inset, s - inset * 2, s - inset * 2, pressed);
+  const k = (s * 0.42) / 24;
   ctx.save();
   ctx.translate(s / 2 - 12 * k, s / 2 - 12 * k);
   ctx.scale(k, k);
-  ctx.fillStyle = INK.stage;
+  ctx.fillStyle = '#FFFFFF';
   ctx.beginPath();
   if (playing) {
     ctx.roundRect(6.5, 5, 4, 14, 1);
@@ -105,36 +95,18 @@ export function drawPlay({ canvas, ctx }: Canvas2D, playing: boolean, pressed: b
 export function drawSpeed({ canvas, ctx }: Canvas2D, speed: number, pressed: boolean): void {
   const s = canvas.width;
   ctx.clearRect(0, 0, s, s);
-  ctx.beginPath();
-  ctx.arc(s / 2, s / 2, s / 2 - 5, 0, Math.PI * 2);
-  ctx.fillStyle = pressed ? INK.well : INK.surface;
-  ctx.fill();
-  ctx.lineWidth = 6;
-  ctx.strokeStyle = INK.line;
-  ctx.stroke();
-  ctx.fillStyle = INK.text;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.font = `600 ${Math.round(s * 0.28)}px ${MONO}`;
-  ctx.fillText(`${speed}×`, s / 2, s / 2 + s * 0.01);
+  const inset = 5;
+  strokeOutline(ctx, inset, inset, s - inset * 2, s - inset * 2, pressed);
+  paintWhiteLabel(ctx, `${speed}×`, s / 2, s / 2 + s * 0.01, `600 ${Math.round(s * 0.28)}px ${MONO}`);
 }
 
 export function drawMove({ canvas, ctx }: Canvas2D, pressed: boolean): void {
   const w = canvas.width;
   const h = canvas.height;
   ctx.clearRect(0, 0, w, h);
-  ctx.beginPath();
-  ctx.roundRect(4, 4, w - 8, h - 8, (h - 8) / 2);
-  ctx.fillStyle = pressed ? INK.well : INK.surface;
-  ctx.fill();
-  ctx.lineWidth = 6;
-  ctx.strokeStyle = INK.line;
-  ctx.stroke();
-  ctx.fillStyle = INK.text;
-  ctx.textAlign = 'center';
-  ctx.textBaseline = 'middle';
-  ctx.font = `600 ${Math.round(h * 0.4)}px ${SANS}`;
-  ctx.fillText('Move', w / 2, h / 2 + h * 0.02);
+  const inset = 4;
+  strokeOutline(ctx, inset, inset, w - inset * 2, h - inset * 2, pressed);
+  paintWhiteLabel(ctx, 'Move', w / 2, h / 2 + h * 0.02, `600 ${Math.round(h * 0.4)}px ${SANS}`);
 }
 
 export interface Atlas {
