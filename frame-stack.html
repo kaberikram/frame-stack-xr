@@ -1,0 +1,1339 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Frame stack</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Recursive:slnt,wght,CASL,CRSV,MONO@-15..0,300..1000,0..1,0..1,0..1&display=swap">
+<style>
+:root {
+  --stage: #F1F2EE;
+  --surface: #FFFFFF;
+  --well: #E4E6E1;
+  --line: #D8DBD4;
+  --text: #1A1D23;
+  --muted: #5E6470;
+  --red: #DB4733;
+  --blue: #3868DD;
+  --on-blue: #FFFFFF;
+  --dot: #B3B7AE;
+  --shadow: #1A1D23;
+  --scheme: light;
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  color-scheme: light;
+  box-sizing: border-box;
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --stage: #000000; --surface: #141822; --well: #1C212C; --line: #242A37;
+    --text: #E5E8EE; --muted: #8B92A3; --red: #EE5F4B; --blue: #6E96FF; --on-blue: #000000;
+    --dot: #2C3342; --shadow: #000000; --scheme: dark; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --stage: #000000; --surface: #141822; --well: #1C212C; --line: #242A37;
+  --text: #E5E8EE; --muted: #8B92A3; --red: #EE5F4B; --blue: #6E96FF; --on-blue: #000000;
+  --dot: #2C3342; --shadow: #000000; --scheme: dark; color-scheme: dark;
+}
+*, *::before, *::after { box-sizing: inherit; }
+[hidden] { display: none !important; }
+html { height: 100%; scroll-padding-top: env(safe-area-inset-top, 0px); }
+body {
+  height: 100%; margin: 0; overflow: hidden;
+  background: var(--stage); color: var(--text);
+  font-family: "Recursive", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  font-variation-settings: "CASL" 0, "MONO" 0, "CRSV" 0.5;
+  font-size: 14px; line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+  -webkit-tap-highlight-color: transparent;
+}
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+
+.app {
+  height: 100%;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 276px;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  grid-template-areas: "top top" "stage panel" "transport transport";
+  padding-left: env(safe-area-inset-left, 0px);
+  padding-right: env(safe-area-inset-right, 0px);
+}
+
+/* Header */
+.top {
+  grid-area: top;
+  display: flex; align-items: center; justify-content: space-between; gap: 16px;
+  padding: 14px 20px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.brand { min-width: 0; }
+h1 {
+  margin: 0; font-size: 22px; line-height: 1.1; font-weight: 820; letter-spacing: -0.01em;
+  font-variation-settings: "CASL" 1, "MONO" 0, "CRSV" 1;
+}
+.source { margin: 3px 0 0; color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.actions { display: flex; gap: 8px; flex: none; }
+.btn {
+  height: 34px; padding: 0 14px; border-radius: 9px;
+  border: 1px solid var(--line); background: var(--surface);
+  font-size: 13px; font-weight: 600; white-space: nowrap; cursor: pointer;
+  transition: transform 140ms var(--ease-out), background-color 160ms ease;
+}
+.btn:active { transform: scale(0.97); }
+.btn.primary { background: var(--text); border-color: var(--text); color: var(--stage); }
+.only-narrow { display: none; }
+
+/* Stage */
+.stage { grid-area: stage; position: relative; overflow: hidden; min-height: 0; }
+.stage > canvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; outline: none; }
+.progress { position: absolute; z-index: 1; inset: 0 0 auto; height: 2px; }
+.progress-bar { height: 100%; background: var(--blue); transform-origin: left center; transform: scaleX(0); }
+.tag { position: absolute; z-index: 1; left: 0; top: 0; pointer-events: none; will-change: transform; }
+.tag-inner {
+  display: inline-flex; align-items: baseline; gap: 9px;
+  transform: translate(-1px, calc(-100% - 8px));
+  padding: 3px 8px 4px; border-radius: 6px;
+  background: none; color: #fff; border: 1px solid #fff;
+  font-variation-settings: "CASL" 0, "MONO" 1; font-size: 12px; font-weight: 600; white-space: nowrap;
+}
+.tag-inner span + span { font-weight: 450; opacity: 0.85; }
+.hint { position: absolute; z-index: 1; left: 20px; bottom: 14px; margin: 0; color: var(--muted); font-size: 12.5px; pointer-events: none; }
+
+/* Settings */
+.panel {
+  grid-area: panel;
+  display: flex; flex-direction: column; gap: 20px;
+  overflow-y: auto; overscroll-behavior: contain;
+  padding: 18px 20px 20px;
+  border-left: 1px solid var(--line);
+  background: var(--stage);
+}
+.field { display: grid; gap: 8px; }
+.label, .row { font-size: 13px; font-weight: 600; }
+.row { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.row output { font-weight: 450; color: var(--muted); font-variation-settings: "CASL" 0, "MONO" 1; font-size: 12px; }
+.note { margin: 0; font-size: 12.5px; color: var(--muted); }
+.seg, .views { display: grid; gap: 3px; padding: 3px; border-radius: 10px; background: var(--well); }
+.seg { grid-template-columns: 1fr 1fr; }
+.views { grid-template-columns: repeat(4, 1fr); }
+.seg button, .views button {
+  height: 30px; border: 0; border-radius: 7px; background: transparent;
+  color: var(--muted); font-size: 13px; font-weight: 600; cursor: pointer;
+  transition: background-color 160ms ease, color 160ms ease;
+}
+.seg button[aria-pressed="true"] { background: var(--surface); color: var(--text); box-shadow: 0 0 0 1px var(--line); }
+.views button:active { background: var(--surface); color: var(--text); }
+input[type="range"] { -webkit-appearance: none; appearance: none; width: 100%; height: 20px; margin: 0; background: transparent; cursor: pointer; --fill: 50%; }
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px; border-radius: 2px;
+  background: linear-gradient(var(--text), var(--text)) 0 0 / var(--fill) 100% no-repeat, var(--well);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none; width: 16px; height: 16px; margin-top: -6px; border-radius: 50%;
+  background: var(--surface); border: 2px solid var(--text);
+  transition: transform 140ms var(--ease-out);
+}
+input[type="range"]:active::-webkit-slider-thumb { transform: scale(1.15); }
+input[type="range"]::-moz-range-track { height: 4px; border-radius: 2px; background: var(--well); }
+input[type="range"]::-moz-range-progress { height: 4px; border-radius: 2px; background: var(--text); }
+input[type="range"]::-moz-range-thumb { width: 12px; height: 12px; border-radius: 50%; background: var(--surface); border: 2px solid var(--text); }
+select { height: 34px; padding: 0 10px; border-radius: 9px; border: 1px solid var(--line); background: var(--surface); font-size: 13px; cursor: pointer; }
+.check { display: flex; align-items: center; gap: 8px; font-size: 13px; font-weight: 600; cursor: pointer; }
+.check input { width: 16px; height: 16px; margin: 0; accent-color: var(--text); }
+.panel-foot { margin-top: auto; padding-top: 12px; border-top: 1px solid var(--line); display: grid; gap: 6px; }
+.panel-foot p { margin: 0; font-size: 12px; color: var(--muted); }
+
+/* Transport */
+.transport {
+  grid-area: transport;
+  display: grid; align-items: center; gap: 14px;
+  grid-template-columns: auto auto minmax(0, 1fr) auto;
+  grid-template-areas: "play readout strip speed";
+  padding: 12px 20px 14px;
+  border-top: 1px solid var(--line);
+}
+.play {
+  grid-area: play; width: 42px; height: 42px; border-radius: 50%; border: 0;
+  display: grid; place-items: center; cursor: pointer;
+  background: var(--text); color: var(--stage);
+  transition: transform 140ms var(--ease-out);
+}
+.play:active { transform: scale(0.94); }
+.play svg { fill: currentColor; }
+.play[data-playing="true"] .i-play, .play[data-playing="false"] .i-pause { display: none; }
+.readout { grid-area: readout; display: grid; min-width: 9.5ch; font-variation-settings: "CASL" 0, "MONO" 1; font-size: 13px; line-height: 1.35; }
+.readout span + span { color: var(--muted); }
+.strip { grid-area: strip; position: relative; height: 48px; border-radius: 8px; overflow: hidden; background: var(--well); cursor: pointer; touch-action: none; }
+.strip canvas { display: block; width: 100%; height: 100%; }
+.speed {
+  grid-area: speed; height: 30px; min-width: 46px; padding: 0 10px; border-radius: 8px;
+  border: 1px solid var(--line); background: var(--surface); cursor: pointer;
+  font-variation-settings: "CASL" 0, "MONO" 1; font-size: 12.5px; font-weight: 600;
+}
+
+/* Overlays */
+.drop {
+  position: fixed; inset: 12px; z-index: 20;
+  display: grid; place-items: center;
+  border: 2px dashed var(--muted); border-radius: 18px;
+  background: color-mix(in srgb, var(--stage) 86%, transparent);
+  pointer-events: none;
+}
+.drop p { margin: 0; font-size: 20px; font-weight: 760; font-variation-settings: "CASL" 1, "MONO" 0, "CRSV" 1; }
+.toast {
+  position: fixed; z-index: 30; left: 50%; top: calc(env(safe-area-inset-top, 0px) + 14px);
+  transform: translateX(-50%);
+  max-width: min(440px, calc(100vw - 28px));
+  padding: 10px 14px; border-radius: 10px;
+  background: var(--text); color: var(--stage);
+  font-size: 13px; font-weight: 500;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.22);
+}
+.decoder { position: fixed; left: 0; top: 0; width: 2px; height: 2px; opacity: 0; pointer-events: none; }
+
+@media (hover: hover) and (pointer: fine) {
+  .btn:hover { background: var(--well); }
+  .btn.primary:hover { background: var(--text); opacity: 0.88; }
+  .seg button:hover, .views button:hover { color: var(--text); }
+}
+@media (max-width: 860px) {
+  .app { grid-template-columns: minmax(0, 1fr); grid-template-areas: "top" "stage" "transport"; }
+  .only-narrow { display: inline-block; }
+  .panel {
+    grid-area: stage; align-self: end; z-index: 3;
+    margin: 10px; max-height: 58%;
+    border: 1px solid var(--line); border-radius: 14px;
+    background: var(--surface); box-shadow: 0 14px 36px rgba(0, 0, 0, 0.2);
+    padding: 16px;
+    opacity: 0; transform: translateY(10px); visibility: hidden;
+    transition: opacity 180ms var(--ease-out), transform 220ms var(--ease-out), visibility 0s linear 220ms;
+  }
+  .panel[data-open="true"] {
+    opacity: 1; transform: none; visibility: visible;
+    transition: opacity 180ms var(--ease-out), transform 220ms var(--ease-out);
+  }
+}
+@media (max-width: 560px) {
+  .top { padding: 10px 14px; }
+  h1 { font-size: 19px; }
+  .transport {
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: "play readout speed" "strip strip strip";
+    gap: 10px 12px; padding: 10px 14px 12px;
+  }
+  .readout { grid-auto-flow: column; justify-content: start; gap: 12px; }
+  .hint { display: none; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .panel, .panel[data-open="true"] { transform: none; }
+  .btn:active, .play:active { transform: none; }
+}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.184.0/build/three.webgpu.js",
+    "three/webgpu": "https://cdn.jsdelivr.net/npm/three@0.184.0/build/three.webgpu.js",
+    "three/tsl": "https://cdn.jsdelivr.net/npm/three@0.184.0/build/three.tsl.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.184.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+<div class="app">
+  <header class="top">
+    <div class="brand">
+      <h1>Frame stack</h1>
+      <p class="source" id="source">Slicing the demo clip</p>
+    </div>
+    <div class="actions">
+      <button class="btn only-narrow" id="panelToggle" type="button" aria-expanded="false" aria-controls="panel">Adjust</button>
+      <button class="btn primary" id="loadBtn" type="button">Load video</button>
+      <input id="file" type="file" accept="video/*" hidden>
+    </div>
+  </header>
+
+  <main class="stage" id="stage">
+    <div class="progress" id="progress"><div class="progress-bar" id="progressBar"></div></div>
+    <div class="tag" id="tag" hidden><div class="tag-inner"><span id="tagN">001</span><span id="tagT">00:00.00</span></div></div>
+    <p class="hint" id="hint">Drag to orbit, scroll to zoom, hover the stack to skim.</p>
+  </main>
+
+  <aside class="panel" id="panel" aria-label="Stack settings" data-open="false">
+    <div class="field">
+      <label class="row" for="ghost"><span>Ghost frames</span><output id="ghostOut" for="ghost"></output></label>
+      <input type="range" id="ghost" min="0" max="1" step="0.01" value="1">
+    </div>
+    <div class="field">
+      <label class="row" for="trail"><span>Trail</span><output id="trailOut" for="trail"></output></label>
+      <input type="range" id="trail" min="0" max="16" step="1" value="16">
+    </div>
+    <div class="field">
+      <label class="row" for="length"><span>Length</span><output id="lengthOut" for="length"></output></label>
+      <input type="range" id="length" min="0.3" max="3" step="0.05" value="2">
+    </div>
+    <div class="field">
+      <label class="row" for="lift"><span>Lift current frame</span><output id="liftOut" for="lift"></output></label>
+      <input type="range" id="lift" min="0" max="1" step="0.01" value="0.15">
+    </div>
+    <div class="field">
+      <label class="row" for="feather"><span>Feather</span><output id="featherOut" for="feather"></output></label>
+      <input type="range" id="feather" min="0" max="0.4" step="0.01" value="0.4">
+    </div>
+    <div class="field">
+      <label class="row" for="glow"><span>Glow</span><output id="glowOut" for="glow"></output></label>
+      <input type="range" id="glow" min="0" max="1" step="0.01" value="1">
+    </div>
+    <div class="field">
+      <label class="row" for="rate"><span>Samples</span></label>
+      <select id="rate">
+        <option value="1">1 per second</option>
+        <option value="2">2 per second</option>
+        <option value="4">4 per second</option>
+        <option value="8" selected>8 per second</option>
+        <option value="15">15 per second</option>
+        <option value="30">30 per second</option>
+      </select>
+      <p class="note" id="rateNote"></p>
+    </div>
+    <div class="field">
+      <span class="label" id="viewLabel">View</span>
+      <div class="views" role="group" aria-labelledby="viewLabel">
+        <button type="button" data-view="angle" aria-label="Three-quarter view">¾</button>
+        <button type="button" data-view="front">Front</button>
+        <button type="button" data-view="side">Side</button>
+        <button type="button" data-view="top">Top</button>
+      </div>
+    </div>
+    <div class="field">
+      <label class="check"><input type="checkbox" id="skimToggle" checked> Hover to skim</label>
+    </div>
+    <div class="panel-foot">
+      <p id="foot"></p>
+      <p>Space plays and pauses. Arrow keys step one frame, or ten with Shift.</p>
+    </div>
+  </aside>
+
+  <footer class="transport">
+    <button class="play" id="play" type="button" aria-label="Play" data-playing="false">
+      <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+        <path class="i-play" d="M8 5.2v13.6L19 12z"/>
+        <g class="i-pause"><rect x="6.5" y="5" width="4" height="14" rx="1"/><rect x="13.5" y="5" width="4" height="14" rx="1"/></g>
+      </svg>
+    </button>
+    <div class="readout"><span id="frameOut">000 / 000</span><span id="timeOut">00:00.00</span></div>
+    <div class="strip" id="strip" role="slider" tabindex="0" aria-label="Frame" aria-valuemin="1" aria-valuemax="1" aria-valuenow="1">
+      <canvas id="stripCanvas"></canvas>
+    </div>
+    <button class="speed" id="speed" type="button" aria-label="Playback speed, 1×">1×</button>
+  </footer>
+</div>
+<div class="drop" id="drop" hidden><p>Drop a video to slice it into frames</p></div>
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+
+<script type="module">
+import * as THREE from 'three/webgpu';
+import {
+  uniform, texture, uv, vec2, vec3, abs, min, max, exp, mix, step, smoothstep,
+  select, fwidth, floor, length, positionLocal, positionWorld, instanceIndex, vertexStage,
+  pass, mrt, output, float
+} from 'three/tsl';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { bloom } from 'three/addons/tsl/display/BloomNode.js';
+
+const MAX_LAYERS = 256;                // WebGPU's default maxTextureArrayLayers
+const GPU_BUDGET = 64 * 1024 * 1024;   // bytes for the whole frame array
+const MAX_FRAME_PIXELS = 480 * 270;
+const FRAME_H = 1.2;                   // world-space frame height
+const PAD = 0.035;                     // gap between the slices and the box outline
+const RATES = [1, 2, 4, 8, 15, 30];
+const DEMO_SECONDS = 16;
+
+const $ = (id) => document.getElementById(id);
+const clamp = (v, a, b) => Math.min(b, Math.max(a, v));
+const smooth01 = (x, a, b) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const coarsePointer = matchMedia('(pointer: coarse)');
+
+const el = {
+  stage: $('stage'), source: $('source'), tag: $('tag'), tagN: $('tagN'), tagT: $('tagT'),
+  progress: $('progress'), progressBar: $('progressBar'), hint: $('hint'),
+  panel: $('panel'), panelToggle: $('panelToggle'), loadBtn: $('loadBtn'), file: $('file'),
+  play: $('play'), frameOut: $('frameOut'), timeOut: $('timeOut'), strip: $('strip'), stripCanvas: $('stripCanvas'), speed: $('speed'),
+  ghost: $('ghost'), trail: $('trail'), length: $('length'), lift: $('lift'), feather: $('feather'), glow: $('glow'), rate: $('rate'),
+  ghostOut: $('ghostOut'), trailOut: $('trailOut'), lengthOut: $('lengthOut'), liftOut: $('liftOut'), featherOut: $('featherOut'), glowOut: $('glowOut'),
+  rateNote: $('rateNote'), skimToggle: $('skimToggle'), foot: $('foot'),
+  drop: $('drop'), toast: $('toast'),
+};
+
+const state = {
+  kind: 'demo', name: 'Demo clip', duration: DEMO_SECONDS, aspect: 16 / 9,
+  N: 0, loaded: 0, W: 0, H: 0, lum: 0.05,
+  playhead: 0, playing: false, speed: 1, skim: null, focus: 0,
+  ghost: 1, trail: 16, length: 2, lift: 0.15, feather: 0.4, glow: 1, rate: 8, hoverSkim: true,
+  dark: true,
+};
+
+let needsRender = true;
+let texDirty = false;
+let stripDirty = true;
+const invalidate = () => { needsRender = true; };
+
+// ---------------------------------------------------------------- renderer
+
+const renderer = new THREE.WebGPURenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.toneMapping = THREE.NoToneMapping;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+el.stage.prepend(renderer.domElement);
+try {
+  await renderer.init();
+} catch (err) {
+  el.source.textContent = 'This browser can’t run WebGPU or WebGL 2, which the stack needs.';
+  throw err;
+}
+renderer.onDeviceLost = () => toast('The graphics device was reset. Reload the page to keep going.', { sticky: true });
+const backendName = renderer.backend.isWebGPUBackend ? 'WebGPU' : 'WebGL 2 (WebGPU fallback)';
+
+const scene = new THREE.Scene();
+const camera = new THREE.PerspectiveCamera(30, 1, 0.01, 200);
+camera.position.set(0, 0, 10);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.09;
+controls.minDistance = 1.2;
+controls.maxDistance = 30;
+controls.maxPolarAngle = Math.PI * 0.56;
+controls.screenSpacePanning = true;
+controls.addEventListener('change', invalidate);
+
+// ---------------------------------------------------------------- frames + uniforms
+
+function makeFrameArray(W, H, N) {
+  const tex = new THREE.DataArrayTexture(new Uint8Array(W * H * 4 * N), W, H, N);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  tex.minFilter = THREE.LinearFilter;
+  tex.magFilter = THREE.LinearFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+// Base node: assigning frames.value swaps the texture for every derived sample below.
+const frames = texture(makeFrameArray(2, 2, 1));
+
+const U = {
+  n: uniform(1), loaded: uniform(0), split: uniform(0), z0: uniform(0), spacing: uniform(0),
+  cur: uniform(0), focus: uniform(0), camIdx: uniform(-1e4),
+  ghost: uniform(0), peak: uniform(0.4), spread: uniform(4), frontFade: uniform(0.3),
+  feather: uniform(0.16), glow: uniform(0.65),
+  dotC: uniform(new THREE.Color()), shadowC: uniform(new THREE.Color()), shadowA: uniform(0.2),
+  half: uniform(new THREE.Vector2(1, 1)), floorR: uniform(3), dotGap: uniform(0.1),
+};
+
+const frameUV = vec2(uv().x, uv().y.oneMinus()); // canvas pixel rows are stored top-down
+
+// ---- ghost slices: one instanced draw for the whole stack
+// Instances are emitted farthest-first for the current camera so plain alpha blending composites
+// correctly with no CPU sort. Slices on opposite sides of the camera's z never overlap on screen,
+// so each side only needs its own order: draw slots [0, split) walk front-to-back, the rest back-to-front.
+const drawIdx = instanceIndex.toFloat();
+const layerV = select(drawIdx.lessThan(U.split), drawIdx, U.n.sub(1).sub(drawIdx.sub(U.split)));
+const layer = floor(vertexStage(layerV).add(0.5));
+
+const rel = layer.sub(U.cur);
+const isCur = abs(rel).lessThan(0.5);
+const isLoaded = layer.lessThan(U.loaded);
+const onion = U.peak.mul(exp(abs(layer.sub(U.focus)).div(U.spread.max(0.001)).pow(2).negate())).mul(step(0.5, U.spread));
+const baseA = max(U.ghost, onion);
+const coversCurrent = rel.mul(U.camIdx.sub(U.cur)).greaterThan(0); // sits between camera and current frame
+const contentA = select(isCur, 0, select(isLoaded, select(coversCurrent, baseA.mul(U.frontFade), baseA), 0));
+
+const texel = frames.sample(frameUV).depth(layer).rgb;
+
+// Soft rectangular mask: each side dissolves independently so corners go first, like a dream vignette.
+function edgeFeather() {
+  const u = uv();
+  const w = U.feather.max(1e-5);
+  const fx = smoothstep(0, w, min(u.x, u.x.oneMinus()));
+  const fy = smoothstep(0, w, min(u.y, u.y.oneMinus()));
+  return select(U.feather.greaterThan(1e-4), fx.mul(fy).pow(0.65), 1);
+}
+
+const edgeA = edgeFeather();
+const sliceA = contentA.mul(edgeA);
+
+const ghostMat = new THREE.MeshBasicNodeMaterial({ transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.NormalBlending });
+ghostMat.positionNode = positionLocal.add(vec3(0, 0, U.z0.sub(layerV.mul(U.spacing))));
+ghostMat.colorNode = texel;
+ghostMat.opacityNode = sliceA;
+ghostMat.mrtNode = mrt({ bloomIntensity: float(1) });
+
+const ghostGeo = new THREE.InstancedBufferGeometry().copy(new THREE.PlaneGeometry(1, 1));
+ghostGeo.instanceCount = 1;
+const ghosts = new THREE.Mesh(ghostGeo, ghostMat);
+ghosts.frustumCulled = false; // slices are offset in the shader, so the CPU bounds are meaningless
+ghosts.renderOrder = 2;
+
+// ---- current frame: same feather, drawn on its own so the focused slice still reads
+const curRgb = frames.sample(frameUV).depth(U.cur).rgb;
+const curLuma = curRgb.x.mul(0.2126).add(curRgb.y.mul(0.7152)).add(curRgb.z.mul(0.0722));
+const curFeather = edgeFeather();
+const curLit = curRgb.mul(U.glow.mul(0.55).add(1)).add(curRgb.mul(smoothstep(0.35, 0.8, curLuma)).mul(U.glow.mul(0.8)));
+const curMat = new THREE.MeshBasicNodeMaterial({
+  transparent: true, depthWrite: false, side: THREE.DoubleSide,
+  blending: THREE.AdditiveBlending,
+});
+curMat.colorNode = curLit;
+curMat.opacityNode = curFeather;
+curMat.mrtNode = mrt({ bloomIntensity: float(1) });
+const current = new THREE.Mesh(new THREE.PlaneGeometry(1, 1), curMat);
+current.renderOrder = 3;
+
+// ---- floor: dot grid plus a soft contact shadow
+const fp = positionWorld.xz;
+const grid = fp.div(U.dotGap);
+const gridFw = max(fwidth(grid), vec2(1e-6));
+const dotPx = length(grid.sub(floor(grid.add(0.5))).div(gridFw));
+const dots = smoothstep(0.6, 1.4, dotPx).oneMinus()
+  .mul(smoothstep(U.floorR.mul(0.3), U.floorR, length(fp)).oneMinus())
+  .mul(smoothstep(0.12, 0.3, max(gridFw.x, gridFw.y)).oneMinus()); // fade before dots alias into moiré
+const q = abs(fp).sub(U.half);
+const rectDist = length(max(q, vec2(0))).add(min(max(q.x, q.y), 0));
+const shadow = smoothstep(-0.1, 0.55, rectDist).oneMinus().mul(U.shadowA);
+const floorMat = new THREE.MeshBasicNodeMaterial({ transparent: true, depthWrite: false });
+floorMat.colorNode = mix(U.shadowC, U.dotC, dots.div(dots.add(shadow).max(1e-4)));
+floorMat.opacityNode = max(dots, shadow);
+const floorMesh = new THREE.Mesh(new THREE.PlaneGeometry(40, 40), floorMat);
+floorMesh.rotation.x = -Math.PI / 2;
+floorMesh.renderOrder = 1;
+
+// ---- box outline, time ruler, playhead tick (opaque lines so slices composite over them correctly)
+const boxMat = new THREE.LineBasicNodeMaterial();
+const box = new THREE.LineSegments(new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)), boxMat);
+box.visible = false;
+const rulerMat = new THREE.LineBasicNodeMaterial();
+const ruler = new THREE.LineSegments(new THREE.BufferGeometry(), rulerMat);
+const tickMat = new THREE.LineBasicNodeMaterial();
+const tick = new THREE.LineSegments(
+  new THREE.BufferGeometry().setAttribute('position', new THREE.Float32BufferAttribute([0, 0, 0, 0.17, 0, 0], 3)),
+  tickMat,
+);
+
+scene.add(floorMesh, box, ruler, tick, current, ghosts);
+
+const scenePass = pass(scene, camera);
+scenePass.setMRT(mrt({
+  output,
+  bloomIntensity: float(0),
+}));
+const sceneColor = scenePass.getTextureNode('output');
+const bloomMask = scenePass.getTextureNode('bloomIntensity');
+const bloomPass = bloom(sceneColor.mul(bloomMask), 1.25, 0.78, 0.16);
+const pipeline = new (THREE.RenderPipeline ?? THREE.PostProcessing)(renderer);
+pipeline.outputNode = sceneColor.add(bloomPass);
+
+// ---------------------------------------------------------------- theme + look
+
+const stageColor = new THREE.Color();
+const colors = { stage: '#F1F2EE', text: '#1A1D23' };
+
+function applyTheme() {
+  const cs = getComputedStyle(document.documentElement);
+  const v = (name) => cs.getPropertyValue(name).trim();
+  state.dark = v('--scheme') === 'dark';
+  Object.assign(colors, { stage: v('--stage'), text: v('--text') });
+  stageColor.set(colors.stage);
+  scene.background = stageColor;
+  boxMat.color.set(v('--red'));
+  rulerMat.color.set(v('--text')).lerp(stageColor, 0.4);
+  tickMat.color.set(v('--text'));
+  U.dotC.value.set(v('--dot'));
+  U.shadowC.value.set(v('--shadow'));
+  U.shadowA.value = state.dark ? 0.55 : 0.13;
+  stripDirty = true;
+  invalidate();
+}
+
+// Per-slice opacity is normalised by slice count, so density looks the same at 16 or 256 frames.
+function updateGhostUniforms() {
+  const N = Math.max(2, state.N);
+  const s = (state.ghost / 0.5) ** 2;
+  U.ghost.value = 1 - Math.exp((-4.5 * s) / N);
+  U.peak.value = 0.5;
+  U.frontFade.value = 0.2 + 0.8 * smooth01(state.lift, 0.08, 0.45);
+  U.spread.value = state.trail;
+}
+
+// ---------------------------------------------------------------- layout
+
+function dims() {
+  const H = FRAME_H;
+  const W = FRAME_H * state.aspect;
+  return { W, H, D: Math.max(W, H) * state.length };
+}
+const zOf = (i) => U.z0.value - i * U.spacing.value;
+const liftY = () => state.lift * FRAME_H * 0.85;
+const majorSeconds = () => [1, 2, 5, 10, 15, 30, 60, 120, 300, 600].find((k) => state.duration / k <= 20) ?? 600;
+const majorStep = () => Math.max(1, Math.round((majorSeconds() * state.N) / state.duration));
+
+const box3 = new THREE.Box3();
+
+function layout() {
+  const { W, H, D } = dims();
+  const N = Math.max(1, state.N);
+  U.n.value = N;
+  U.z0.value = D / 2;
+  U.spacing.value = N > 1 ? D / (N - 1) : 0;
+  ghostGeo.instanceCount = N;
+  ghosts.scale.set(W, H, 1); // x/y only: the z offsets come from the shader
+  current.scale.set(W, H, 1);
+  box.scale.set(W + 2 * PAD, H + 2 * PAD, D + 2 * PAD);
+  box3.min.set(-W / 2 - PAD, -H / 2 - PAD, -D / 2 - PAD);
+  box3.max.set(W / 2 + PAD, H / 2 + PAD, D / 2 + PAD);
+
+  const floorY = -H / 2 - PAD;
+  floorMesh.position.y = floorY - 0.004;
+  U.half.value.set(W / 2 + PAD, D / 2 + PAD);
+  U.floorR.value = Math.hypot(W, D) * 1.1;
+
+  const x0 = W / 2 + PAD;
+  const major = majorStep();
+  const pos = new Float32Array(N * 6);
+  for (let i = 0; i < N; i++) {
+    const z = zOf(i);
+    pos.set([x0, floorY, z, x0 + (i % major === 0 ? 0.09 : 0.035), floorY, z], i * 6);
+  }
+  ruler.geometry.dispose();
+  ruler.geometry = new THREE.BufferGeometry().setAttribute('position', new THREE.BufferAttribute(pos, 3));
+  tick.position.set(x0, floorY, 0);
+  invalidate();
+}
+
+// ---------------------------------------------------------------- camera views
+
+const VIEWS = {
+  angle: new THREE.Vector3(1.0, 0.62, 1.25),
+  front: new THREE.Vector3(0, 0.001, 1),
+  side: new THREE.Vector3(1, 0.04, 0),
+  top: new THREE.Vector3(0.035, 1, 0),
+};
+let tween = null;
+const sph = new THREE.Spherical();
+
+// Distance at which the box's projected corners fill ~78% of the view, for a given direction.
+const fitCam = new THREE.PerspectiveCamera();
+const corner = new THREE.Vector3();
+function fitDistance(dir, target) {
+  const { W, H, D } = dims();
+  const hx = W / 2 + PAD, hy = H / 2 + PAD, hz = D / 2 + PAD;
+  fitCam.copy(camera);
+  let r = 8;
+  for (let k = 0; k < 4; k++) {
+    fitCam.position.copy(dir).setLength(r).add(target);
+    fitCam.lookAt(target);
+    fitCam.updateMatrixWorld();
+    let m = 0;
+    for (const sx of [-1, 1]) for (const sy of [-1, 1]) for (const sz of [-1, 1]) {
+      corner.set(sx * hx, sy * hy + (sy > 0 ? liftY() : 0), sz * hz).project(fitCam);
+      m = Math.max(m, Math.abs(corner.x), Math.abs(corner.y));
+    }
+    r *= m / 0.78;
+  }
+  return r;
+}
+
+function flyTo(name, instant = false) {
+  const target = new THREE.Vector3(0, liftY() * 0.4, 0);
+  const to = new THREE.Spherical().setFromVector3(VIEWS[name].clone().setLength(fitDistance(VIEWS[name], target)));
+  const from = new THREE.Spherical().setFromVector3(camera.position.clone().sub(controls.target));
+  tween = {
+    t0: performance.now(), dur: instant || reduceMotion.matches ? 0 : 700,
+    from, to, dTheta: Math.atan2(Math.sin(to.theta - from.theta), Math.cos(to.theta - from.theta)),
+    target0: controls.target.clone(), target,
+  };
+  controls.enabled = false;
+  invalidate();
+}
+
+function stepTween(now) {
+  const { t0, dur, from, to, dTheta, target0, target } = tween;
+  const p = dur ? Math.min(1, (now - t0) / dur) : 1;
+  const e = p < 0.5 ? 4 * p * p * p : 1 - (-2 * p + 2) ** 3 / 2;
+  controls.target.lerpVectors(target0, target, e);
+  sph.set(from.radius + (to.radius - from.radius) * e, from.phi + (to.phi - from.phi) * e, from.theta + dTheta * e);
+  camera.position.setFromSpherical(sph).add(controls.target);
+  camera.lookAt(controls.target);
+  if (p >= 1) {
+    tween = null;
+    controls.enabled = true;
+    controls.update();
+  }
+}
+
+// ---------------------------------------------------------------- sources
+
+let job = 0;
+const work = document.createElement('canvas');
+const workCtx = work.getContext('2d', { willReadFrequently: true });
+const atlas = document.createElement('canvas');
+const atlasCtx = atlas.getContext('2d', { willReadFrequently: true }); // CPU-backed: survives GPU resets
+const cell = { w: 160, h: 90, cols: 12 };
+const nextFrame = () => new Promise((r) => requestAnimationFrame(r));
+
+const LINEAR = Float32Array.from({ length: 256 }, (_, i) => {
+  const c = i / 255;
+  return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+});
+function frameLuminance(px) {
+  let sum = 0, n = 0;
+  for (let p = 0; p < px.length; p += 4 * 17) {
+    sum += 0.2126 * LINEAR[px[p]] + 0.7152 * LINEAR[px[p + 1]] + 0.0722 * LINEAR[px[p + 2]];
+    n++;
+  }
+  return sum / n;
+}
+
+const sliceCount = (duration, rate) => clamp(Math.round(duration * rate), 2, MAX_LAYERS);
+function frameSize(aspect, N) {
+  const px = Math.min(MAX_FRAME_PIXELS, GPU_BUDGET / (4 * N));
+  const W = Math.sqrt(px * aspect), H = W / aspect;
+  const s = Math.min(1, 512 / Math.max(W, H));
+  return { W: Math.max(16, Math.floor((W * s) / 2) * 2), H: Math.max(16, Math.floor((H * s) / 2) * 2) };
+}
+
+async function build(source) {
+  const my = ++job;
+  const first = state.N === 0;
+  const aspectChanged = Math.abs(source.aspect - state.aspect) > 1e-3;
+  const N = sliceCount(source.duration, state.rate);
+  const { W, H } = frameSize(source.aspect, N);
+
+  const tex = makeFrameArray(W, H, N);
+  const old = frames.value;
+  frames.value = tex;
+  old.dispose();
+
+  Object.assign(state, {
+    kind: source.kind, name: source.name, duration: source.duration, aspect: source.aspect,
+    N, W, H, loaded: 0, playhead: 0, skim: null, focus: 0,
+  });
+  setPlaying(false);
+  work.width = W;
+  work.height = H;
+  cell.w = Math.max(24, Math.round(cell.h * source.aspect));
+  cell.cols = Math.max(1, Math.floor(2048 / cell.w));
+  atlas.width = cell.cols * cell.w;
+  atlas.height = Math.ceil(N / cell.cols) * cell.h;
+  layout();
+  if (first || aspectChanged) flyTo('angle', first);
+  updateRateNote();
+  el.foot.textContent = `Rendering with ${backendName}. Each frame is ${W} × ${H} px.`;
+
+  let lumSum = 0;
+  for (let i = 0; i < N; i++) {
+    await source.draw(workCtx, W, H, (i / N) * source.duration, i);
+    if (my !== job) return false;
+    const px = workCtx.getImageData(0, 0, W, H).data;
+    tex.image.data.set(px, i * W * H * 4);
+    tex.addLayerUpdate(i);
+    lumSum += frameLuminance(px);
+    state.lum = lumSum / (i + 1);
+    atlasCtx.drawImage(work, 0, 0, W, H, (i % cell.cols) * cell.w, Math.floor(i / cell.cols) * cell.h, cell.w, cell.h);
+    state.loaded = i + 1;
+    texDirty = true;
+    updateProgress();
+    invalidate();
+    if (source.kind === 'demo' && i % 3 === 2) await nextFrame();
+  }
+  state.playhead = 0;
+  setPlaying(!reduceMotion.matches);
+  return true;
+}
+
+function describeSource() {
+  const t = Math.round(state.duration);
+  const d = state.duration < 60 ? `${+state.duration.toFixed(1)} s` : `${Math.floor(t / 60)} min${t % 60 ? ` ${t % 60} s` : ''}`;
+  return `${state.name}, ${d}, cut into ${state.N} frames`;
+}
+function updateProgress() {
+  const done = state.loaded >= state.N;
+  el.progress.hidden = done;
+  el.progressBar.style.transform = `scaleX(${state.N ? state.loaded / state.N : 0})`;
+  el.source.textContent = done ? describeSource() : `Slicing ${state.name}: ${state.loaded} of ${state.N} frames`;
+}
+function updateRateNote() {
+  const every = state.duration / state.N;
+  const capped = Math.round(state.duration * state.rate) > MAX_LAYERS;
+  const k = majorSeconds();
+  el.rateNote.textContent = `${capped ? 'Capped at ' : ''}${state.N} frames, one every ${every < 1 ? every.toFixed(2) : every.toFixed(1)} s. `
+    + `Long ruler ticks mark ${k === 1 ? 'each second' : `every ${k} s`}.`;
+}
+
+// ---- demo clip: drawn procedurally so the page works with no assets
+function mulberry32(a) {
+  return () => {
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+const rand = mulberry32(7);
+const STARS = Array.from({ length: 60 }, () => ({ x: rand(), y: rand(), s: 0.6 + rand() * 1.6, a: 0.2 + rand() * 0.6 }));
+
+function drawDemoFrame(ctx, w, h, t, i) {
+  const u = t / DEMO_SECONDS, cx = w / 2, cy = h / 2, k = h / 252;
+  ctx.fillStyle = '#000000';
+  ctx.fillRect(0, 0, w, h);
+
+  for (const s of STARS) { // static pixels become straight lines through the volume
+    ctx.fillStyle = `rgba(226, 232, 255, ${s.a})`;
+    ctx.fillRect(s.x * w, s.y * h, s.s * k, s.s * k);
+  }
+
+  const sx = u * w; // a sweep becomes a diagonal plane
+  const sweep = ctx.createLinearGradient(sx - w * 0.1, 0, sx, 0);
+  sweep.addColorStop(0, 'rgba(140, 170, 255, 0)');
+  sweep.addColorStop(1, 'rgba(140, 170, 255, 0.28)');
+  ctx.fillStyle = sweep;
+  ctx.fillRect(sx - w * 0.1, 0, w * 0.1, h);
+  ctx.fillStyle = 'rgba(220, 230, 255, 0.85)';
+  ctx.fillRect(sx - k, 0, 2 * k, h);
+
+  const breath = 0.5 - 0.5 * Math.cos(u * Math.PI * 4); // a breathing ring becomes a vase
+  ctx.lineWidth = 3 * k;
+  ctx.strokeStyle = 'rgba(244, 238, 228, 0.8)';
+  ctx.beginPath();
+  ctx.arc(cx, cy, h * (0.09 + 0.15 * breath), 0, Math.PI * 2);
+  ctx.stroke();
+
+  for (const [phase, rgb] of [[0, '255, 96, 70'], [Math.PI, '96, 140, 255']]) { // orbiting pair becomes a double helix
+    const a = u * Math.PI * 4 + phase;
+    const ox = cx + Math.cos(a) * w * 0.3, oy = cy + Math.sin(a) * h * 0.3, r = h * 0.1;
+    const g = ctx.createRadialGradient(ox, oy, 0, ox, oy, r);
+    g.addColorStop(0, 'rgba(255, 255, 255, 1)');
+    g.addColorStop(0.22, `rgba(${rgb}, 1)`);
+    g.addColorStop(1, `rgba(${rgb}, 0)`);
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.arc(ox, oy, r, 0, Math.PI * 2);
+    ctx.fill();
+  }
+
+  const pad = h * 0.06;
+  ctx.font = `600 ${Math.round(h * 0.07)}px ui-monospace, "SF Mono", Menlo, Consolas, monospace`;
+  ctx.fillStyle = 'rgba(238, 241, 248, 0.9)';
+  ctx.textAlign = 'left';
+  ctx.fillText(fmtTime(t), pad, h - pad);
+  ctx.textAlign = 'right';
+  ctx.fillText(`#${String(i + 1).padStart(3, '0')}`, w - pad, h - pad);
+}
+
+const demoSource = () => ({
+  kind: 'demo', name: 'Demo clip', duration: DEMO_SECONDS, aspect: 16 / 9,
+  draw: (ctx, w, h, t, i) => drawDemoFrame(ctx, w, h, t, i),
+});
+
+// ---- user video: seek + drawImage per slice, all local
+let video = null; // { el, url, name }
+let cspBlocked = false;
+document.addEventListener('securitypolicyviolation', (e) => {
+  if (/^(blob|data)/.test(e.blockedURI)) cspBlocked = true;
+});
+
+function loadVideo(src) {
+  return new Promise((resolve, reject) => {
+    const v = document.createElement('video');
+    v.muted = true;
+    v.playsInline = true;
+    v.preload = 'auto';
+    v.className = 'decoder';
+    let settled = false;
+    const fail = () => {
+      if (settled) return;
+      settled = true;
+      v.removeAttribute('src');
+      v.remove();
+      reject(new Error('video'));
+    };
+    const timer = setTimeout(fail, 20000);
+    v.addEventListener('error', fail, { once: true });
+    v.addEventListener('loadeddata', async () => {
+      clearTimeout(timer);
+      await ensureDuration(v);
+      if (!Number.isFinite(v.duration) || v.duration <= 0 || !v.videoWidth) return fail();
+      settled = true;
+      resolve(v);
+    }, { once: true });
+    v.src = src;
+    document.body.appendChild(v);
+  });
+}
+
+// Recorded WebM often reports Infinity until the end has been seeked once.
+async function ensureDuration(v) {
+  if (Number.isFinite(v.duration)) return;
+  await new Promise((resolve) => {
+    const done = () => { v.removeEventListener('durationchange', check); resolve(); };
+    const check = () => { if (Number.isFinite(v.duration)) done(); };
+    v.addEventListener('durationchange', check);
+    v.currentTime = 1e7;
+    setTimeout(done, 3000);
+  });
+  v.currentTime = 0;
+}
+
+function seekTo(v, t) {
+  return new Promise((resolve) => {
+    const done = () => { clearTimeout(timer); v.removeEventListener('seeked', done); resolve(); };
+    const timer = setTimeout(done, 4000);
+    v.addEventListener('seeked', done);
+    v.currentTime = Math.min(t, Math.max(0, v.duration - 0.001));
+  });
+}
+
+const videoSource = ({ el: v, name }) => ({
+  kind: 'video', name, duration: v.duration, aspect: v.videoWidth / v.videoHeight,
+  draw: async (ctx, w, h, t) => { await seekTo(v, t); ctx.drawImage(v, 0, 0, w, h); },
+});
+
+const readAsDataURL = (file) => new Promise((resolve, reject) => {
+  const r = new FileReader();
+  r.onload = () => resolve(r.result);
+  r.onerror = () => reject(r.error);
+  r.readAsDataURL(file);
+});
+
+function disposeVideo(vid) {
+  vid.el.removeAttribute('src');
+  vid.el.load();
+  vid.el.remove();
+  if (vid.url.startsWith('blob:')) URL.revokeObjectURL(vid.url);
+}
+
+const autoRate = (duration) => [...RATES].reverse().find((r) => duration * r <= 160) ?? 1;
+
+async function openVideo(file) {
+  if (file.type && !file.type.startsWith('video/')) {
+    toast(`${file.name} isn’t a video file.`);
+    return;
+  }
+  const my = ++job; // stops any slicing in progress
+  el.source.textContent = `Opening ${file.name}`;
+  let url = URL.createObjectURL(file);
+  let v = await loadVideo(url).catch(() => null);
+  if (!v) { // some hosts allow data: media but not blob:
+    URL.revokeObjectURL(url);
+    url = await readAsDataURL(file).catch(() => '');
+    v = url ? await loadVideo(url).catch(() => null) : null;
+  }
+  if (my !== job) {
+    if (v) disposeVideo({ el: v, url });
+    return;
+  }
+  if (!v) {
+    toast(cspBlocked
+      ? 'This viewer blocks local video files. Download the page and open it in your browser to slice your own clips.'
+      : `Couldn’t decode ${file.name}. MP4 (H.264) and WebM files work in most browsers.`);
+    if (state.loaded < state.N) rebuild(); // opening interrupted a slice in progress
+    else updateProgress();
+    return;
+  }
+  if (video) disposeVideo(video);
+  video = { el: v, url, name: file.name };
+  state.rate = autoRate(v.duration);
+  el.rate.value = String(state.rate);
+  build(videoSource(video));
+}
+
+const rebuild = () => build(state.kind === 'video' && video ? videoSource(video) : demoSource());
+
+// ---------------------------------------------------------------- playback
+
+function setPlaying(p) {
+  state.playing = p && state.N > 1 && state.loaded === state.N;
+  el.play.dataset.playing = String(state.playing);
+  el.play.setAttribute('aria-label', state.playing ? 'Pause' : 'Play');
+  invalidate();
+}
+const togglePlay = () => setPlaying(!state.playing);
+
+function displayIndex() {
+  if (!state.loaded) return 0;
+  if (state.loaded < state.N) return state.loaded - 1; // follow the slicing head while loading
+  return clamp(state.skim ?? Math.floor(state.playhead), 0, state.N - 1);
+}
+
+function stepFrames(n) {
+  if (state.loaded < state.N) return;
+  setPlaying(false);
+  state.skim = null;
+  state.playhead = clamp(Math.floor(state.playhead) + n, 0, state.N - 1);
+}
+
+const fmtTime = (t) => {
+  const cs = Math.round(t * 100), m = Math.floor(cs / 6000), s = Math.floor((cs % 6000) / 100);
+  return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(cs % 100).padStart(2, '0')}`;
+};
+
+// ---------------------------------------------------------------- per-frame sync
+
+const tagA = new THREE.Vector3(), tagB = new THREE.Vector3();
+let stageW = 1, stageH = 1, readoutKey = '';
+
+function positionTag(idx) {
+  if (!state.loaded) { el.tag.hidden = true; return; }
+  const { W, H } = dims();
+  const y = H / 2 + liftY(), z = zOf(idx);
+  tagA.set(-W / 2, y, z).project(camera);
+  tagB.set(W / 2, y, z).project(camera);
+  const p = tagA.x <= tagB.x ? tagA : tagB; // whichever top corner is on the left right now
+  el.tag.hidden = !(p.z > -1 && p.z < 1);
+  if (el.tag.hidden) return;
+  const x = clamp((p.x * 0.5 + 0.5) * stageW, 4, stageW - 150);
+  el.tag.style.transform = `translate3d(${x.toFixed(1)}px, ${((-p.y * 0.5 + 0.5) * stageH).toFixed(1)}px, 0)`;
+  el.tag.dataset.skim = String(state.skim !== null);
+}
+
+function updateReadouts(idx) {
+  const n = Math.max(1, state.N);
+  const key = `${idx}|${n}|${state.skim}|${Math.floor(state.playhead)}|${state.loaded}`;
+  if (key === readoutKey) return;
+  readoutKey = key;
+  const t = (idx / n) * state.duration;
+  const num = String(idx + 1).padStart(3, '0');
+  el.frameOut.textContent = `${num} / ${String(n).padStart(3, '0')}`;
+  el.timeOut.textContent = fmtTime(t);
+  el.tagN.textContent = num;
+  el.tagT.textContent = fmtTime(t);
+  el.strip.setAttribute('aria-valuemax', String(n));
+  el.strip.setAttribute('aria-valuenow', String(idx + 1));
+  el.strip.setAttribute('aria-valuetext', `Frame ${idx + 1} of ${n}, ${fmtTime(t)}`);
+  document.body.dataset.skimming = String(state.skim !== null);
+  stripDirty = true;
+}
+
+function frameUpdate() {
+  const idx = displayIndex();
+  U.cur.value = idx;
+  U.focus.value = state.focus;
+  U.loaded.value = state.loaded;
+  // camera position along the time axis, in slice units: drives draw order and front fading
+  const ci = U.spacing.value > 0 ? (U.z0.value - camera.position.z) / U.spacing.value : -1e4;
+  U.camIdx.value = ci;
+  U.split.value = clamp(Math.floor(ci) + 1, 0, state.N);
+  updateGhostUniforms();
+
+  current.visible = tick.visible = state.loaded > 0;
+  current.position.set(0, liftY(), zOf(idx));
+  tick.position.z = zOf(idx);
+  positionTag(idx);
+  updateReadouts(idx);
+  if (stripDirty) drawStrip();
+}
+
+// ---------------------------------------------------------------- filmstrip scrubber
+
+const stripCtx = el.stripCanvas.getContext('2d');
+el.stripCanvas.addEventListener('contextrestored', () => { stripDirty = true; invalidate(); });
+let stripW = 0, stripH = 0, stripDpr = 1, scrubbing = false;
+
+function sizeStrip() {
+  stripDpr = Math.min(devicePixelRatio, 2);
+  stripW = Math.round(el.strip.clientWidth * stripDpr);
+  stripH = Math.round(el.strip.clientHeight * stripDpr);
+  el.stripCanvas.width = stripW;
+  el.stripCanvas.height = stripH;
+  stripDirty = true;
+  invalidate();
+}
+
+function drawStrip() {
+  stripDirty = false;
+  const ctx = stripCtx, w = stripW, h = stripH, N = state.N;
+  if (!w || !h) return;
+  ctx.clearRect(0, 0, w, h);
+  if (!N) return;
+  const tw = Math.max(8, Math.round(h * state.aspect));
+  const gap = Math.max(1, Math.round(stripDpr));
+  for (let x = 0; x < w; x += tw) {
+    const i = Math.min(N - 1, Math.floor(((x + tw / 2) / w) * N));
+    if (i >= state.loaded) continue;
+    ctx.drawImage(atlas, (i % cell.cols) * cell.w, Math.floor(i / cell.cols) * cell.h, cell.w, cell.h, x, 0, tw - gap, h);
+  }
+  const xAt = (i) => ((i + 0.5) / N) * w;
+  const mark = (x, color, width) => {
+    ctx.fillStyle = colors.stage;
+    ctx.fillRect(Math.round(x - width / 2 - stripDpr), 0, Math.round(width + 2 * stripDpr), h);
+    ctx.fillStyle = color;
+    ctx.fillRect(Math.round(x - width / 2), 0, Math.round(width), h);
+  };
+  if (state.skim !== null) mark(xAt(Math.floor(state.playhead)), colors.text, stripDpr);
+  mark(xAt(displayIndex()), colors.text, 2 * stripDpr);
+}
+
+const stripIndex = (e) => {
+  const r = el.strip.getBoundingClientRect();
+  return clamp(Math.floor(((e.clientX - r.left) / r.width) * state.N), 0, state.N - 1);
+};
+el.strip.addEventListener('pointerdown', (e) => {
+  if (state.loaded < state.N) return;
+  scrubbing = true;
+  el.strip.setPointerCapture(e.pointerId);
+  setPlaying(false);
+  state.skim = null;
+  state.playhead = stripIndex(e);
+});
+el.strip.addEventListener('pointermove', (e) => {
+  if (state.loaded < state.N) return;
+  if (scrubbing) { state.playhead = stripIndex(e); invalidate(); return; }
+  if (e.pointerType === 'mouse' && state.hoverSkim) { state.skim = stripIndex(e); invalidate(); }
+});
+const endScrub = () => { scrubbing = false; };
+el.strip.addEventListener('pointerup', endScrub);
+el.strip.addEventListener('pointercancel', endScrub);
+el.strip.addEventListener('pointerleave', () => {
+  if (!scrubbing && state.skim !== null) { state.skim = null; invalidate(); }
+});
+
+// ---------------------------------------------------------------- 3D skim + pick
+
+const raycaster = new THREE.Raycaster();
+const ndc = new THREE.Vector2();
+const hit = new THREE.Vector3(), onAxis = new THREE.Vector3(), axisA = new THREE.Vector3(), axisB = new THREE.Vector3();
+const canvas = renderer.domElement;
+
+// Nearest point on the stack's time axis to the pointer ray: skims along the length from any face.
+function pickSlice(e) {
+  if (state.loaded < state.N) return null;
+  const r = canvas.getBoundingClientRect();
+  ndc.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  raycaster.setFromCamera(ndc, camera);
+  const ray = raycaster.ray;
+  if (!ray.intersectBox(box3, hit) || Math.abs(ray.direction.z) > 0.92) return null;
+  axisA.set(0, 0, U.z0.value);
+  axisB.set(0, 0, -U.z0.value);
+  ray.distanceSqToSegment(axisA, axisB, undefined, onAxis);
+  return clamp(Math.round((U.z0.value - onAxis.z) / Math.max(U.spacing.value, 1e-6)), 0, state.N - 1);
+}
+
+let press = null;
+canvas.addEventListener('pointerdown', (e) => {
+  press = { x: e.clientX, y: e.clientY };
+  if (state.skim !== null) { state.skim = null; invalidate(); }
+});
+canvas.addEventListener('pointerup', (e) => {
+  if (!press) return;
+  const moved = Math.hypot(e.clientX - press.x, e.clientY - press.y);
+  press = null;
+  const i = moved < 6 ? pickSlice(e) : null;
+  if (i === null) return;
+  setPlaying(false);
+  state.playhead = i;
+});
+canvas.addEventListener('pointermove', (e) => {
+  if (e.pointerType !== 'mouse' || e.buttons !== 0 || !state.hoverSkim || tween) return;
+  const i = pickSlice(e);
+  if (i !== state.skim) { state.skim = i; invalidate(); }
+});
+canvas.addEventListener('pointerleave', () => {
+  if (state.skim !== null) { state.skim = null; invalidate(); }
+});
+
+// ---------------------------------------------------------------- controls
+
+function bindRange(input, out, format, apply) {
+  const sync = () => {
+    const v = parseFloat(input.value);
+    out.textContent = format(v);
+    input.style.setProperty('--fill', `${((v - input.min) / (input.max - input.min)) * 100}%`);
+    apply(v);
+    invalidate();
+  };
+  input.addEventListener('input', sync);
+  sync();
+}
+bindRange(el.ghost, el.ghostOut, (v) => (v === 0 ? 'Off' : `${Math.round(v * 100)}%`), (v) => { state.ghost = v; });
+bindRange(el.trail, el.trailOut, (v) => (v === 0 ? 'Off' : `${v} frame${v === 1 ? '' : 's'}`), (v) => { state.trail = v; });
+bindRange(el.length, el.lengthOut, (v) => `${+v.toFixed(2)}×`, (v) => { state.length = v; layout(); });
+bindRange(el.lift, el.liftOut, (v) => (v === 0 ? 'Off' : `${Math.round(v * 100)}%`), (v) => { state.lift = v; });
+bindRange(el.feather, el.featherOut, (v) => (v === 0 ? 'Off' : `${Math.round(v * 100)}%`), (v) => {
+  state.feather = v;
+  U.feather.value = v;
+});
+bindRange(el.glow, el.glowOut, (v) => (v === 0 ? 'Off' : `${Math.round(v * 100)}%`), (v) => {
+  state.glow = v;
+  U.glow.value = v;
+  bloomPass.strength.value = v * 2.1;
+});
+
+for (const b of document.querySelectorAll('[data-view]')) {
+  b.addEventListener('click', () => flyTo(b.dataset.view));
+}
+el.rate.addEventListener('change', () => { state.rate = Number(el.rate.value); rebuild(); });
+el.skimToggle.addEventListener('change', () => {
+  state.hoverSkim = el.skimToggle.checked;
+  if (!state.hoverSkim) { state.skim = null; invalidate(); }
+});
+el.play.addEventListener('click', togglePlay);
+el.speed.addEventListener('click', () => {
+  const speeds = [0.5, 1, 2, 4];
+  state.speed = speeds[(speeds.indexOf(state.speed) + 1) % speeds.length];
+  el.speed.textContent = `${state.speed}×`;
+  el.speed.setAttribute('aria-label', `Playback speed, ${state.speed}×`);
+});
+el.panelToggle.addEventListener('click', () => {
+  const open = el.panel.dataset.open !== 'true';
+  el.panel.dataset.open = String(open);
+  el.panelToggle.setAttribute('aria-expanded', String(open));
+});
+el.loadBtn.addEventListener('click', () => el.file.click());
+el.file.addEventListener('change', () => {
+  const f = el.file.files[0];
+  el.file.value = '';
+  if (f) openVideo(f);
+});
+
+addEventListener('keydown', (e) => {
+  const tag = e.target.tagName;
+  if (tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || e.metaKey || e.ctrlKey || e.altKey) return;
+  const jump = e.shiftKey ? 10 : 1;
+  if (e.key === ' ') {
+    if (tag === 'BUTTON') return; // let the focused button handle its own activation
+    e.preventDefault();
+    togglePlay();
+  } else if (e.key === 'ArrowRight' || e.key === 'ArrowUp') {
+    e.preventDefault();
+    stepFrames(jump);
+  } else if (e.key === 'ArrowLeft' || e.key === 'ArrowDown') {
+    e.preventDefault();
+    stepFrames(-jump);
+  } else if (e.key === 'Home') {
+    e.preventDefault();
+    stepFrames(-Infinity);
+  } else if (e.key === 'End') {
+    e.preventDefault();
+    stepFrames(Infinity);
+  }
+});
+
+let dragDepth = 0;
+const hasFiles = (e) => [...(e.dataTransfer?.types ?? [])].includes('Files');
+addEventListener('dragenter', (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  dragDepth++;
+  el.drop.hidden = false;
+});
+addEventListener('dragover', (e) => { if (hasFiles(e)) e.preventDefault(); });
+addEventListener('dragleave', (e) => {
+  if (!hasFiles(e)) return;
+  dragDepth = Math.max(0, dragDepth - 1);
+  if (!dragDepth) el.drop.hidden = true;
+});
+addEventListener('drop', (e) => {
+  if (!hasFiles(e)) return;
+  e.preventDefault();
+  dragDepth = 0;
+  el.drop.hidden = true;
+  const files = [...e.dataTransfer.files];
+  const f = files.find((x) => x.type.startsWith('video/')) ?? files[0];
+  if (f) openVideo(f);
+});
+
+let toastTimer;
+function toast(msg, { sticky = false } = {}) {
+  el.toast.textContent = msg;
+  el.toast.hidden = false;
+  clearTimeout(toastTimer);
+  if (!sticky) toastTimer = setTimeout(() => { el.toast.hidden = true; }, 6500);
+}
+
+// ---------------------------------------------------------------- resize, theme, loop
+
+function resize() {
+  stageW = el.stage.clientWidth;
+  stageH = el.stage.clientHeight;
+  if (!stageW || !stageH) return;
+  renderer.setSize(stageW, stageH, false);
+  camera.aspect = stageW / stageH;
+  camera.updateProjectionMatrix();
+  invalidate();
+}
+new ResizeObserver(resize).observe(el.stage);
+new ResizeObserver(sizeStrip).observe(el.strip);
+matchMedia('(prefers-color-scheme: dark)').addEventListener('change', applyTheme);
+new MutationObserver(applyTheme).observe(document.documentElement, { attributes: true, attributeFilter: ['data-theme'] });
+if (coarsePointer.matches) el.hint.textContent = 'Drag to orbit, pinch to zoom, tap the stack to pick a frame.';
+
+// Drop resolution under sustained load instead of dropping frames.
+const perf = {
+  n: 0, sum: 0, after: performance.now() + 3000,
+  reset() { this.n = 0; this.sum = 0; },
+  sample(dt, now) {
+    if (now < this.after) return;
+    this.n++;
+    this.sum += dt;
+    if (this.n < 45) return;
+    const avg = this.sum / this.n;
+    this.reset();
+    const pr = renderer.getPixelRatio();
+    if (avg > 1 / 38 && pr > 1) {
+      renderer.setPixelRatio(Math.max(1, pr - 0.25));
+      resize();
+    }
+  },
+};
+
+let lastTime = performance.now();
+let lastUpload = 0;
+renderer.setAnimationLoop((now) => {
+  const dt = Math.min(0.1, (now - lastTime) / 1000);
+  lastTime = now;
+  let active = needsRender;
+
+  if (tween) { stepTween(now); active = true; }
+  else if (controls.update()) active = true;
+
+  if (state.playing) {
+    state.playhead = (state.playhead + dt * (state.N / state.duration) * state.speed) % state.N;
+    active = true;
+  }
+
+  const target = displayIndex();
+  if (state.focus !== target) {
+    const jump = Math.abs(target - state.focus);
+    state.focus = reduceMotion.matches || jump > state.N / 2 ? target : state.focus + (target - state.focus) * (1 - Math.exp(-dt * 16));
+    if (Math.abs(target - state.focus) < 0.01) state.focus = target;
+    active = true;
+  }
+
+  if (texDirty && now - lastUpload > 90) { // batch per-layer uploads while slicing
+    frames.value.needsUpdate = true;
+    texDirty = false;
+    lastUpload = now;
+    active = true;
+  }
+
+  if (!active) { perf.reset(); return; }
+  needsRender = false;
+  frameUpdate();
+  pipeline.render();
+  perf.sample(dt, now);
+});
+
+el.rate.value = String(state.rate);
+applyTheme();
+resize();
+sizeStrip();
+build(demoSource());
+</script>
+</body>
+</html>

@@ -1,0 +1,38 @@
+{
+  "version": "iwsdk.scene.v1",
+  "units": "meters",
+  "components": {},
+  "resources": {},
+  "nodes": [
+    {
+      "id": "frame-stack",
+      "name": "Frame stack",
+      "metadata": {
+        "iwsdk.validation": {
+          "allowFloating": true
+        }
+      },
+      "content": {
+        "type": "group"
+      },
+      "transform": {
+        "position": [
+          0,
+          0.74,
+          -0.42
+        ]
+      },
+      "components": {
+        "FrameStack": {
+          "ghost": 1,
+          "trail": 16,
+          "length": 2,
+          "lift": 0.15,
+          "feather": 0.4,
+          "glow": 1
+        }
+      },
+      "children": []
+    }
+  ]
+}

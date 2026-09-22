@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <title>Frame stack</title>
+    <link rel="icon" href="data:," />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Recursive:slnt,wght,CASL,CRSV,MONO@-15..0,300..1000,0..1,0..1,0..1&display=swap"
+    />
+    <style>
+      :root {
+        --stage: #000000;
+        --surface: #141822;
+        --well: #1c212c;
+        --line: #242a37;
+        --text: #e5e8ee;
+        --muted: #8b92a3;
+        --blue: #6e96ff;
+        --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+        color-scheme: dark;
+      }
+      *, *::before, *::after { box-sizing: border-box; }
+      [hidden] { display: none !important; }
+      html, body { height: 100%; margin: 0; }
+      body {
+        overflow: hidden;
+        background: var(--stage);
+        color: var(--text);
+        font-family: "Recursive", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        font-variation-settings: "CASL" 0, "MONO" 0, "CRSV" 0.5;
+        font-size: 14px;
+        line-height: 1.45;
+        -webkit-font-smoothing: antialiased;
+      }
+      button, select { font: inherit; color: inherit; }
+      :focus-visible { outline: 2px solid var(--text); outline-offset: 2px; }
+      #scene-container { position: fixed; inset: 0; }
+
+      .launch {
+        position: fixed; z-index: 2;
+        left: max(20px, env(safe-area-inset-left, 0px));
+        bottom: max(20px, env(safe-area-inset-bottom, 0px));
+        width: min(372px, calc(100vw - 40px));
+        padding: 18px 18px 16px;
+        border: 1px solid var(--line); border-radius: 14px;
+        background: rgba(20, 24, 34, 0.82);
+        -webkit-backdrop-filter: blur(18px) saturate(150%);
+        backdrop-filter: blur(18px) saturate(150%);
+      }
+      h1 {
+        margin: 0; font-size: 22px; line-height: 1.1; font-weight: 820; letter-spacing: -0.01em;
+        font-variation-settings: "CASL" 1, "MONO" 0, "CRSV" 1;
+      }
+      .source { margin: 4px 0 0; color: var(--muted); font-size: 13px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .progress { height: 2px; margin-top: 12px; border-radius: 1px; background: var(--well); overflow: hidden; }
+      .progress-bar { height: 100%; background: var(--blue); transform-origin: left center; transform: scaleX(0); }
+      .samples { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 14px; }
+      .samples label { font-size: 13px; font-weight: 600; }
+      select { height: 32px; padding: 0 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+      .note { margin: 6px 0 0; color: var(--muted); font-size: 12px; font-variation-settings: "CASL" 0, "MONO" 1; }
+      .actions { display: flex; gap: 8px; margin-top: 16px; }
+      .btn {
+        flex: 1; height: 38px; padding: 0 14px;
+        border: 1px solid var(--line); border-radius: 9px; background: var(--surface);
+        font-size: 13px; font-weight: 600; white-space: nowrap; cursor: pointer;
+        transition: transform 140ms var(--ease-out), background-color 160ms ease;
+      }
+      .btn:active { transform: scale(0.97); }
+      .btn.primary { border-color: var(--text); background: var(--text); color: var(--stage); }
+      .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+      .hint { margin: 12px 0 0; color: var(--muted); font-size: 12.5px; }
+      .toast {
+        position: fixed; z-index: 3; top: max(20px, env(safe-area-inset-top, 0px)); left: 50%;
+        transform: translateX(-50%); max-width: min(520px, calc(100vw - 40px));
+        padding: 10px 14px; border: 1px solid var(--line); border-radius: 10px;
+        background: var(--surface); font-size: 13px;
+      }
+      .decoder { position: fixed; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+      @media (hover: hover) {
+        .btn:not(:disabled):hover { background: var(--well); }
+        .btn.primary:not(:disabled):hover { background: var(--text); opacity: 0.88; }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .btn { transition: none; }
+        .btn:active { transform: none; }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="scene-container"></div>
+    <section class="launch" id="launch" aria-labelledby="title">
+      <h1 id="title">Frame stack</h1>
+      <p class="source" id="source">Opening the clip</p>
+      <div class="progress" id="progress"><div class="progress-bar" id="progressBar"></div></div>
+      <div class="samples">
+        <label for="rate">Samples</label>
+        <select id="rate">
+          <option value="1">1 per second</option>
+          <option value="2">2 per second</option>
+          <option value="4">4 per second</option>
+          <option value="8" selected>8 per second</option>
+          <option value="15">15 per second</option>
+          <option value="30">30 per second</option>
+        </select>
+      </div>
+      <p class="note" id="rateNote"></p>
+      <div class="actions">
+        <button class="btn" id="loadBtn" type="button">Load video</button>
+        <button class="btn primary" id="enterBtn" type="button" disabled>Enter passthrough</button>
+      </div>
+      <p class="hint" id="hint">In the headset, rest a fingertip on a table and hold still. The slider appears under your finger.</p>
+      <input id="file" type="file" accept="video/*" hidden />
+    </section>
+    <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    <script type="module" src="/src/index.ts"></script>
+  </body>
+</html>
