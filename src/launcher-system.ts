@@ -20,9 +20,9 @@ import { TableTouchSystem } from './table-touch-system.js';
 const NO_PASSTHROUGH = 'Open this page in the Meta Quest browser to use passthrough.';
 const DEPTH_WAIT = 'Downloading the depth model. Passthrough unlocks when it’s ready.';
 const DEPTH_FAIL = 'The depth model didn’t load. Reload the page to try again.';
-const STRETCH_HINT = 'Point at the room, pinch, and pull. The mesh around your hand stretches.';
-const STRETCH_CAMERA = 'Camera on. Pinch, and the room in front of you stretches.';
-const STRETCH_BLOCKED = 'Camera blocked, so the pull uses a stand-in grain. Point, pinch, and pull.';
+const STRETCH_HINT = 'Pinch the room and pull, with one hand or both.';
+const STRETCH_CAMERA = 'Camera on. Pinch the room and pull, one hand or both.';
+const STRETCH_BLOCKED = 'Camera blocked. The pull still bends the room, in a plain tint.';
 
 /** Wires the 2D launch card in index.html: pick a clip and a sample rate, then enter passthrough. */
 export class LauncherSystem extends createSystem({}) {

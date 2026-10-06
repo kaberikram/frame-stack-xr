@@ -85,12 +85,24 @@ export class PassthroughPhoto {
   readonly meshToClip = new Matrix4();
   /** World-space points into the live camera's clip space. Updated by `projectLive`, not by a frozen capture. */
   readonly worldToClip = new Matrix4();
+  readonly liveCam = new Vector3();
+  /** Frozen snapshot, world space. A second grab reuses whatever the first one stored. */
+  readonly frozenToClip = new Matrix4();
+  readonly frozenCam = new Vector3();
   readonly camMesh = new Vector3();
   ready = false;
 
   private readonly canvas = document.createElement('canvas');
   private readonly ctx: CanvasRenderingContext2D;
   private readonly canvasTex: CanvasTexture;
+  private readonly cleanCanvas = document.createElement('canvas');
+  private readonly cleanCtx: CanvasRenderingContext2D;
+  private readonly cleanTex: CanvasTexture;
+  private readonly cleanToClip = new Matrix4();
+  private readonly cleanCam = new Vector3();
+  private cleanAt = -Infinity;
+  private cleanReady = false;
+  private frozenIsClean = false;
   private readonly rt: WebGLRenderTarget;
   private readonly blitScene = new Scene();
   private readonly blitCam = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
@@ -132,6 +144,18 @@ export class PassthroughPhoto {
     this.canvasTex.generateMipmaps = false;
     this.canvasTex.wrapS = ClampToEdgeWrapping;
     this.canvasTex.wrapT = ClampToEdgeWrapping;
+    this.cleanCanvas.width = 2;
+    this.cleanCanvas.height = 2;
+    const cleanCtx = this.cleanCanvas.getContext('2d');
+    if (!cleanCtx) throw new Error('2D canvas is unavailable');
+    this.cleanCtx = cleanCtx;
+    this.cleanTex = new CanvasTexture(this.cleanCanvas);
+    this.cleanTex.colorSpace = SRGBColorSpace;
+    this.cleanTex.minFilter = LinearFilter;
+    this.cleanTex.magFilter = LinearFilter;
+    this.cleanTex.generateMipmaps = false;
+    this.cleanTex.wrapS = ClampToEdgeWrapping;
+    this.cleanTex.wrapT = ClampToEdgeWrapping;
     this.rt = new WebGLRenderTarget(4, 4, { depthBuffer: false, stencilBuffer: false });
     this.rt.texture.colorSpace = SRGBColorSpace;
     this.rt.texture.minFilter = LinearFilter;
@@ -144,6 +168,11 @@ export class PassthroughPhoto {
 
   get texture(): Texture {
     return this.showingRT ? this.rt.texture : this.canvasTex;
+  }
+
+  /** The snapshot a grab is showing. The clean frame when hands were out of view, otherwise the pinch frame. */
+  get frozenTexture(): Texture {
+    return this.frozenIsClean ? this.cleanTex : this.texture;
   }
 
   invalidate(): void {
@@ -160,6 +189,60 @@ export class PassthroughPhoto {
     if (req.presenting) this.fitLens(req, video.videoWidth, video.videoHeight);
     else this.fitView(req.viewCamera);
     this.worldToClip.copy(this.vp);
+    this.liveCam.copy(this.camPos);
+    return true;
+  }
+
+  /** True when any joint lands inside the live camera, so that frame would smear a hand onto the room. */
+  jointsInFrame(points: ArrayLike<number>, count: number): boolean {
+    for (let i = 0; i < count; i++) {
+      if (this.contains(points[i * 3], points[i * 3 + 1], points[i * 3 + 2], this.worldToClip)) return true;
+    }
+    return false;
+  }
+
+  /**
+   * Keeps one spare frame from a moment when the hands were out of the camera.
+   * Call after `projectLive`. `allow` is false while a joint is inside the frame.
+   */
+  keepClean(video: HTMLVideoElement | null, allow: boolean): void {
+    if (!allow || !video) return;
+    const now = performance.now() / 1000;
+    if (this.cleanReady && now - this.cleanAt < 0.25) return;
+    if (!this.drawInto(this.cleanCanvas, this.cleanCtx, this.cleanTex, video)) return;
+    this.cleanToClip.copy(this.worldToClip);
+    this.cleanCam.copy(this.camPos);
+    this.cleanAt = now;
+    this.cleanReady = true;
+  }
+
+  /**
+   * Freezes a world-space snapshot for a grab at `point`.
+   * Uses the spare frame when it is recent and contains the point, so raised hands
+   * are not painted onto the table. `reuse` keeps the snapshot the other hand already took.
+   */
+  freezeWorld(video: HTMLVideoElement | null, point: Vector3 | null, reuse: boolean): boolean {
+    if (reuse && this.ready) return true;
+    const now = performance.now() / 1000;
+    if (
+      this.cleanReady &&
+      now - this.cleanAt < 2 &&
+      point &&
+      this.contains(point.x, point.y, point.z, this.cleanToClip)
+    ) {
+      this.frozenIsClean = true;
+      this.frozenToClip.copy(this.cleanToClip);
+      this.frozenCam.copy(this.cleanCam);
+      this.showingRT = false;
+      this.ready = true;
+      return true;
+    }
+    if (!video || !this.drawInto(this.canvas, this.ctx, this.canvasTex, video)) return false;
+    this.frozenIsClean = false;
+    this.frozenToClip.copy(this.worldToClip);
+    this.frozenCam.copy(this.camPos);
+    this.showingRT = false;
+    this.ready = true;
     return true;
   }
 
@@ -178,6 +261,7 @@ export class PassthroughPhoto {
 
   dispose(): void {
     this.canvasTex.dispose();
+    this.cleanTex.dispose();
     this.rt.dispose();
     this.blitMat.dispose();
     this.blitScene.traverse((object) => {
@@ -187,16 +271,34 @@ export class PassthroughPhoto {
   }
 
   private drawVideo(video: HTMLVideoElement): boolean {
+    return this.drawInto(this.canvas, this.ctx, this.canvasTex, video);
+  }
+
+  private drawInto(
+    canvas: HTMLCanvasElement,
+    ctx: CanvasRenderingContext2D,
+    tex: CanvasTexture,
+    video: HTMLVideoElement,
+  ): boolean {
     if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) return false;
     const w = video.videoWidth;
     const h = video.videoHeight;
-    if (this.canvas.width !== w || this.canvas.height !== h) {
-      this.canvas.width = w;
-      this.canvas.height = h;
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
     }
-    this.ctx.drawImage(video, 0, 0, w, h);
-    this.canvasTex.needsUpdate = true;
+    ctx.drawImage(video, 0, 0, w, h);
+    tex.needsUpdate = true;
     return true;
+  }
+
+  private contains(x: number, y: number, z: number, clip: Matrix4): boolean {
+    const e = clip.elements;
+    const w = e[3] * x + e[7] * y + e[11] * z + e[15];
+    if (w <= 1e-4) return false;
+    const u = ((e[0] * x + e[4] * y + e[8] * z + e[12]) / w) * 0.5 + 0.5;
+    const v = ((e[1] * x + e[5] * y + e[9] * z + e[13]) / w) * 0.5 + 0.5;
+    return u > 0.02 && u < 0.98 && v > 0.02 && v < 0.98;
   }
 
   private fitView(cam: PerspectiveCamera): void {

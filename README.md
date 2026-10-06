@@ -4,7 +4,7 @@ Two passthrough modes in one page.
 
 **Frame stack** cuts a video into slices and stacks them along a time axis on a real table, with a filmstrip you scrub by touch.
 
-**Jonze stretch** pulls a chunk of the scanned room like taffy. The pinch freezes a passthrough snapshot across that mesh — a couch and the wall behind it together — and the pull widens it into stripes. Let go and it springs back.
+**Jonze stretch** pinches the scanned room and pulls. The spot under your fingers follows your hand, the mesh around it bends, and a long pull turns into stripes of the column you grabbed. One hand or both. Let go and it springs back.
 
 ## Run
 
@@ -26,17 +26,18 @@ Rest an index fingertip on a table and hold still for about a second. The slider
 
 ### Jonze stretch
 
-Finish **Space Setup** on the headset first, allow the camera when the browser asks, then point anywhere in the scan and pinch.
+Finish **Space Setup** on the headset first, allow the camera when the browser asks, then pinch the room and pull, with one hand or both.
 
-- In the headset the scanned triangles stay visible, tinted cooler than the passthrough, so you can check that the mesh sits on the room. Flat plane boxes stay hidden.
-- The face you grab decides the stretch direction.
-- The snapshot is what the passthrough camera saw at the pinch. The whole chunk's pixels widen into stripes along the pull.
-- Let go and it springs back, wobbling.
-- Without a headset the same motion runs on two stand-in boxes. A webcam snapshot stands in for passthrough so the smear can be tuned on a laptop.
+- The scanned room is drawn as a denser copy of the global mesh, tinted cooler than the camera until you pinch. Furniture boxes stay hidden.
+- Each pinch grabs the surface behind that hand. The spot follows your fingers, and the mesh around it bends like rubber.
+- A small pull looks stretched. A long pull turns the stretched part into stripes of the column you grabbed. Two hands blend in the middle.
+- The snapshot is a frame from before your hands covered the camera, when one is available.
+- Let go and that hand springs back. When both are at rest, the snapshot fades back to the idle tint.
+- Without a headset the same material runs on a stand-in room. The wardrobe pulls apart on its own, and a webcam stands in for passthrough.
 
 ## Tuning
 
 - `src/layout.ts`: stack size, strip length, touch and hover heights.
 - The `FrameStack` component (scene JSON or the editor inspector): ghost, trail, length, lift, feather, glow.
-- The `StretchLook` component: pull gain, stretch cover (1 stretches the whole chunk), wobble, rings, glow, grain, spring stiffness and damping.
+- The `StretchLook` component: pull gain, sideways reach, stretch ramp, where stripes start, photo feather, wobble, spring stiffness and damping, and the idle tint (0 hides the mesh until you pull).
 - `MAX_LAYERS` in `src/frame-stack-system.ts`: raise it if the headset holds frame rate.

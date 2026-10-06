@@ -1,232 +1,193 @@
-import { BackSide, Color, FrontSide, Matrix4, NormalBlending, ShaderMaterial, Vector3, type Texture } from '@iwsdk/core';
-// three compiles these as GLSL ES 3.00 with its own defines, which also keeps its
-// multiview prefix (one draw for both eyes) working on the headset.
+import { Color, DoubleSide, Matrix4, ShaderMaterial, Vector3, type Texture } from '@iwsdk/core';
 
-export interface StretchUniforms {
+export interface RubberUniforms {
   [name: string]: { value: unknown };
 }
 
-/** Uniforms shared between the slab and its outline. */
-export function createStretchUniforms(photo: Texture) {
+/** Two grabs, in world space. The room mesh bends by both, then the photo is looked up. */
+export function createRubberUniforms(photo: Texture) {
   return {
-    uSize: { value: new Vector3(1, 1, 1) },
-    uAxis: { value: new Vector3(1, 0, 0) },
-    uDir: { value: 1 },
-    uBand: { value: 1 },
-    uStretch: { value: 0 },
-    uWobble: { value: 0 },
+    uG0: { value: new Vector3() },
+    uD0: { value: new Vector3() },
+    uAxis0: { value: new Vector3(0, 1, 0) },
+    uA0: { value: 0.1 },
+    uOn0: { value: 0 },
+    uG1: { value: new Vector3() },
+    uD1: { value: new Vector3() },
+    uAxis1: { value: new Vector3(0, 1, 0) },
+    uA1: { value: 0.1 },
+    uOn1: { value: 0 },
+    uReach: { value: 0.45 },
+    uRamp: { value: 0.35 },
+    uStripes: { value: 0.5 },
+    uFeather: { value: 0.06 },
+    uWobble: { value: 0.04 },
     uWaveK: { value: 1 / 0.45 },
     uWaveSpeed: { value: 7 },
     uTime: { value: 0 },
-    uRings: { value: 0 },
-    uRingSpacing: { value: 0.22 },
-    uRingSpeed: { value: 0.5 },
-    uGlow: { value: 0.8 },
-    uGrain: { value: 16 },
     uReveal: { value: 0 },
-    uColor: { value: new Color('#2A2F3A') },
-    uRingColor: { value: new Color('#9FC2FF') },
+    uMeshTint: { value: 0.85 },
     uHasPhoto: { value: 0 },
-    uMeshToClip: { value: new Matrix4() },
-    uCamMesh: { value: new Vector3() },
+    uHasLive: { value: 0 },
+    uWorldToClip: { value: new Matrix4() },
+    uLiveToClip: { value: new Matrix4() },
+    uCamPos: { value: new Vector3() },
     uPhoto: { value: photo },
+    uLive: { value: photo },
+    uTint: { value: new Color('#73B4E8') },
   };
 }
-export type StretchUniformSet = ReturnType<typeof createStretchUniforms>;
 
-/**
- * Stretch, in the object's own space.
- *
- * The whole covered length elongates away from the anchored end, and the snapshot
- * stays pinned to the rest pose, so every column of the photo widens into a stripe.
- * `uBand` is how much of that length takes the extra distance (1 = the whole mesh).
- * A travelling wave shoves the cross-section sideways, strongest at the end you're
- * pulling. Light rings run along the new length, and only show where the photo missed.
- */
-const COMMON = /* glsl */ `
-uniform vec3 uSize;
-uniform vec3 uAxis;
-uniform float uDir;
-uniform float uBand;
-uniform float uStretch;
+export type RubberUniformSet = ReturnType<typeof createRubberUniforms>;
+
+const VERTEX = /* glsl */ `
+uniform vec3 uG0;
+uniform vec3 uD0;
+uniform vec3 uAxis0;
+uniform float uA0;
+uniform float uOn0;
+uniform vec3 uG1;
+uniform vec3 uD1;
+uniform vec3 uAxis1;
+uniform float uA1;
+uniform float uOn1;
+uniform float uReach;
+uniform float uRamp;
 uniform float uWobble;
 uniform float uWaveK;
 uniform float uWaveSpeed;
 uniform float uTime;
-uniform float uHasPhoto;
-uniform mat4 uMeshToClip;
-uniform vec3 uCamMesh;
 
-varying vec2 vGrainUv;
-varying float vAlong;
-varying float vSmear;
-varying vec3 vNormalW;
-varying vec3 vViewW;
-varying vec2 vPhotoUv;
-varying float vPhoto;
+varying vec3 vWorld;
+varying vec3 vRest;
 
-void stretchPoint(in vec3 unit, in vec3 nrm, out vec3 posL, out vec3 normalL) {
-  vec3 p = unit * uSize;
-  float len = max(dot(uSize, abs(uAxis)), 1e-4);
-  float s = dot(p, uAxis);
-  float along01 = s / len + 0.5;                      // 0..1 along +axis
-  float uu = uDir > 0.0 ? along01 : 1.0 - along01;    // 0 at the anchored end
-  float cover = clamp(uBand, 0.02, 1.0);
-  float hold = 1.0 - cover;
-  float moved;                                        // metres from the anchored end
-  float smear = 0.0;
-  if (uu <= hold) {
-    moved = uu * len;
-  } else {
-    float k = (uu - hold) / max(cover, 1e-5);
-    moved = hold * len + k * (cover * len + uStretch);
-    smear = 1.0;
-  }
-  float sNew = uDir > 0.0 ? moved - len * 0.5 : len * 0.5 - moved;
-  vec3 sampleP = p;                                   // rest pose: the photo widens instead of sliding
-  p += uAxis * (sNew - s);
-
-  // The snapshot was taken in the unstretched pose. Faces the camera couldn't
-  // see keep the grain, so the back of a wardrobe doesn't wear the front's pixels.
-  vec4 clip = uMeshToClip * vec4(sampleP, 1.0);
-  float ok = uHasPhoto;
-  vec2 uv = clip.xy / max(clip.w, 1e-4) * 0.5 + 0.5;
-  if (clip.w <= 1e-4) ok = 0.0;
-  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) ok = 0.0;
-  if (dot(nrm, uCamMesh - sampleP) <= 0.0) ok = 0.0;
-  vPhotoUv = uv;
-  vPhoto = ok;
-
-  // sideways wobble, growing toward the end being pulled
-  vec3 side = normalize(abs(uAxis.y) < 0.9 ? cross(uAxis, vec3(0.0, 1.0, 0.0)) : cross(uAxis, vec3(1.0, 0.0, 0.0)));
-  vec3 side2 = cross(uAxis, side);
-  float phase = moved * uWaveK * 6.2831853 - uTime * uWaveSpeed;
-  float ramp = smoothstep(0.0, 1.0, uu);
-  p += (side * sin(phase) + side2 * sin(phase * 0.83 + 1.7)) * uWobble * ramp;
-
-  posL = p;
-  normalL = nrm;
-  vGrainUv = vec2(uu * len, dot(unit, side2) * dot(uSize, abs(side2)));
-  vAlong = moved;
-  vSmear = smear;
+vec3 bendSide(vec3 axis) {
+  vec3 side = cross(axis, vec3(0.0, 1.0, 0.0));
+  if (dot(side, side) < 1e-6) side = cross(axis, vec3(1.0, 0.0, 0.0));
+  return normalize(side);
 }
-`;
 
-const NOISE = /* glsl */ `
-float hash12(vec2 p) {
-  return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453123);
+vec3 rubber(vec3 p, vec3 G, vec3 D, vec3 axis, float A, float on) {
+  if (on < 0.5) return vec3(0.0);
+  float t = dot(p - G, axis);
+  vec3 radial = p - G - axis * t;
+  float side = 1.0 - smoothstep(0.4 * uReach, max(uReach, 1e-3), length(radial));
+  float fade = 0.15 + length(D) * 0.45;
+  float along = t < 0.0
+    ? 1.0 - smoothstep(0.0, max(uRamp, 1e-3), -t)
+    : 1.0 - smoothstep(A, A + fade, t);
+  return D * side * along;
 }
-float valueNoise(vec2 p) {
-  vec2 i = floor(p);
-  vec2 f = fract(p);
-  vec2 u = f * f * (3.0 - 2.0 * f);
-  return mix(
-    mix(hash12(i), hash12(i + vec2(1.0, 0.0)), u.x),
-    mix(hash12(i + vec2(0.0, 1.0)), hash12(i + vec2(1.0, 1.0)), u.x),
-    u.y);
-}
-`;
 
-const VERTEX = /* glsl */ `
-${COMMON}
 void main() {
-  vec3 posL;
-  vec3 normalL;
-  stretchPoint(position, normal, posL, normalL);
-  vec4 world = modelMatrix * vec4(posL, 1.0);
-  vNormalW = normalize(mat3(modelMatrix) * normalL);
-  vViewW = cameraPosition - world.xyz;
-  gl_Position = projectionMatrix * viewMatrix * world;
+  vec3 rest = (modelMatrix * vec4(position, 1.0)).xyz;
+  vec3 d0 = rubber(rest, uG0, uD0, uAxis0, uA0, uOn0);
+  vec3 d1 = rubber(rest, uG1, uD1, uAxis1, uA1, uOn1);
+  vec3 p = rest + d0 + d1;
+  float pull = length(d0) + length(d1);
+  vec3 axis = uOn0 > 0.5 ? uAxis0 : uAxis1;
+  float wave = sin(dot(rest, axis) * uWaveK + uTime * uWaveSpeed);
+  p += bendSide(axis) * wave * uWobble * min(pull * 4.0, 1.0);
+  vRest = rest;
+  vWorld = p;
+  gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
 }
 `;
 
 const FRAGMENT = /* glsl */ `
-uniform float uRings;
-uniform float uRingSpacing;
-uniform float uRingSpeed;
-uniform float uGlow;
-uniform float uGrain;
+uniform vec3 uG0;
+uniform vec3 uD0;
+uniform vec3 uAxis0;
+uniform float uOn0;
+uniform vec3 uG1;
+uniform vec3 uD1;
+uniform vec3 uAxis1;
+uniform float uOn1;
+uniform float uReach;
+uniform float uRamp;
+uniform float uStripes;
+uniform float uFeather;
 uniform float uReveal;
-uniform float uTime;
-uniform vec3 uColor;
-uniform vec3 uRingColor;
+uniform float uMeshTint;
+uniform float uHasPhoto;
+uniform float uHasLive;
+uniform mat4 uWorldToClip;
+uniform mat4 uLiveToClip;
+uniform vec3 uCamPos;
 uniform sampler2D uPhoto;
+uniform sampler2D uLive;
+uniform vec3 uTint;
 
-varying vec2 vGrainUv;
-varying float vAlong;
-varying float vSmear;
-varying vec3 vNormalW;
-varying vec3 vViewW;
-varying vec2 vPhotoUv;
-varying float vPhoto;
-${NOISE}
+varying vec3 vWorld;
+varying vec3 vRest;
+
+float grabStretch(vec3 rest, vec3 G, vec3 D, vec3 axis, float on) {
+  if (on < 0.5) return 0.0;
+  float t = dot(rest - G, axis);
+  float ramp = max(uRamp, 1e-3);
+  if (t >= 0.0 || t <= -ramp) return 0.0;
+  float r = length(rest - G - axis * t);
+  float side = 1.0 - smoothstep(0.4 * uReach, max(uReach, 1e-3), r);
+  float u = clamp(-t / ramp, 0.0, 1.0);
+  float slope = 6.0 * u * (1.0 - u) / ramp;
+  return length(D) * side * slope;
+}
+
+vec3 grabSample(vec3 rest, vec3 G, vec3 axis, float stretch) {
+  float t = dot(rest - G, axis);
+  float s = smoothstep(uStripes, uStripes + 1.1, stretch);
+  return rest - axis * t * s;
+}
+
+float frameCover(vec2 uv, float w) {
+  float inside = step(1e-4, w);
+  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) inside = 0.0;
+  float edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+  return inside * smoothstep(0.0, max(uFeather, 1e-4), edge);
+}
 
 void main() {
-  // Grain stands in wherever the snapshot doesn't cover: the back of the object,
-  // and the whole thing when the camera never opened.
-  vec2 grainUv = vGrainUv * uGrain * vec2(1.0, 0.45);
-  float g = valueNoise(grainUv);
-  float fine = valueNoise(grainUv * 3.5 + 11.0);
-  vec3 grain = uColor * (0.5 + 0.85 * g + 0.4 * fine);
-  vec3 base = vPhoto > 0.5 ? texture(uPhoto, vPhotoUv).rgb : grain;
+  float stretch0 = grabStretch(vRest, uG0, uD0, uAxis0, uOn0);
+  float stretch1 = grabStretch(vRest, uG1, uD1, uAxis1, uOn1);
+  vec3 sample0 = grabSample(vRest, uG0, uAxis0, stretch0);
+  vec3 sample1 = grabSample(vRest, uG1, uAxis1, stretch1);
+  float weight = stretch0 + stretch1;
+  vec3 samplePos = weight < 1e-4 ? vRest : (sample0 * stretch0 + sample1 * stretch1) / weight;
 
-  vec3 n = normalize(vNormalW);
-  vec3 v = normalize(vViewW);
-  float lambert = 0.35 + 0.65 * clamp(dot(n, normalize(vec3(0.3, 1.0, 0.45))), 0.0, 1.0);
-  // The photo already carries the room's light. A little shade keeps the box from going flat.
-  vec3 col = base * (vPhoto > 0.5 ? mix(0.82, 1.0, lambert) : lambert);
+  vec3 bare = uTint;
+  vec4 liveClip = uLiveToClip * vec4(vRest, 1.0);
+  vec2 liveUv = liveClip.xy / max(liveClip.w, 1e-4) * 0.5 + 0.5;
+  float liveCover = uHasLive * frameCover(liveUv, liveClip.w);
+  vec3 liveSrc = texture(uLive, liveUv).rgb;
+  vec3 liveTint = vec3(liveSrc.r * 0.72, liveSrc.g * 0.94, min(1.0, liveSrc.b * 1.16 + 0.05));
+  vec3 idle = mix(bare, liveTint, liveCover);
 
-  // The snapshot is the look. Rings and the rim stay on the grain fallback.
-  float stylize = 1.0 - step(0.5, vPhoto);
-  float rim = pow(1.0 - clamp(abs(dot(n, v)), 0.0, 1.0), 3.0);
-  col += uRingColor * rim * uGlow * (0.3 + 0.7 * uRings) * stylize;
+  vec4 clip = uWorldToClip * vec4(samplePos, 1.0);
+  vec2 uv = clip.xy / max(clip.w, 1e-4) * 0.5 + 0.5;
+  float cover = uHasPhoto * frameCover(uv, clip.w);
+  vec3 n = cross(dFdx(vWorld), dFdy(vWorld));
+  if (dot(n, uCamPos - samplePos) < 0.0) cover = 0.0;
+  vec3 photo = texture(uPhoto, uv).rgb;
+  vec3 pulled = mix(bare, photo, cover);
+  vec3 col = mix(idle, pulled, uReveal);
 
-  float ring = pow(0.5 + 0.5 * cos(6.2831853 * (vAlong / max(uRingSpacing, 0.01) - uTime * uRingSpeed)), 24.0);
-  col += uRingColor * ring * uRings * (0.5 + 0.9 * vSmear) * uGlow * stylize;
-
-  if (uReveal < 0.003) discard;
-  gl_FragColor = vec4(col, uReveal);
+  float alpha = mix(uMeshTint * mix(0.55, 0.92, liveCover), mix(0.78, 0.96, cover), uReveal);
+  if (alpha < 0.02) discard;
+  gl_FragColor = vec4(col, alpha);
   #include <colorspace_fragment>
 }
 `;
 
-/** The stretched object itself. Front faces only, so the box stays solid while it fades in. */
-export function stretchMaterial(u: StretchUniformSet): ShaderMaterial {
+/** The scanned room, deformed in world space. Depth writes so a hand occluder can punch through. */
+export function rubberMaterial(uniforms: RubberUniformSet): ShaderMaterial {
   return new ShaderMaterial({
-    uniforms: u,
+    uniforms,
     vertexShader: VERTEX,
     fragmentShader: FRAGMENT,
     transparent: true,
+    depthTest: true,
     depthWrite: true,
-    side: FrontSide,
-    blending: NormalBlending,
-  });
-}
-
-/** A dark shell behind the slab so the real object never peeks out from under it. */
-export function shellMaterial(u: StretchUniformSet): ShaderMaterial {
-  return new ShaderMaterial({
-    uniforms: u,
-    vertexShader: VERTEX,
-    fragmentShader: /* glsl */ `
-      uniform float uReveal;
-      uniform vec3 uColor;
-      varying vec2 vGrainUv;
-      varying float vAlong;
-      varying float vSmear;
-      varying vec3 vNormalW;
-      varying vec3 vViewW;
-      varying vec2 vPhotoUv;
-      varying float vPhoto;
-      void main() {
-        if (uReveal < 0.003) discard;
-        gl_FragColor = vec4(uColor * 0.45, uReveal);
-        #include <colorspace_fragment>
-      }
-    `,
-    transparent: true,
-    depthWrite: true,
-    side: BackSide,
-    blending: NormalBlending,
+    side: DoubleSide,
+    toneMapped: false,
   });
 }

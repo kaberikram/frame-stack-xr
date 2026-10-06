@@ -32,47 +32,16 @@ export function rayBox(
   return near >= 0 ? near : far; // inside the box counts as a hit at the exit
 }
 
-export interface Pull {
-  axis: 0 | 1 | 2;
-  /** Where the grab landed along that axis, 0 at the -axis end and 1 at the +axis end. */
-  along: number;
-}
-
-/**
- * Picks the axis to stretch from where the object was grabbed. Axes thinner than
- * `minSize` are skipped, so a wall never stretches through its own thickness, and the
- * axis you hit dead-on is skipped too: that one points at your face, so stretching
- * along it would only shove the object at you. Direction is left to the pull itself.
- */
-export function pickPull(
-  px: number, py: number, pz: number,
-  sx: number, sy: number, sz: number,
-  minSize = 0.15,
-): Pull {
-  const p = [px, py, pz];
-  const s = [sx, sy, sz];
-  const reach = [0, 0, 0];
-  const biggest = Math.max(sx, sy, sz);
-  const eligible: number[] = [];
-  for (let i = 0; i < 3; i++) {
-    reach[i] = Math.abs(p[i]) / Math.max(s[i] / 2, 1e-4);
-    if (s[i] >= minSize || biggest < minSize) eligible.push(i);
-  }
-  if (!eligible.length) eligible.push(0, 1, 2);
-  let face = eligible[0];
-  for (const i of eligible) if (reach[i] > reach[face]) face = i;
-  const candidates = eligible.length > 1 && reach[face] > 0.9 ? eligible.filter((i) => i !== face) : eligible;
-  let axis = candidates[0];
-  for (const i of candidates) if (reach[i] > reach[axis]) axis = i;
-  const half = Math.max(s[axis] / 2, 1e-4);
-  const along = Math.min(1, Math.max(0, (p[axis] / half) * 0.5 + 0.5));
-  return { axis: axis as 0 | 1 | 2, along };
+/** A ray hit. `t` is the distance along the ray; `tri` is the triangle number. */
+export interface RayHit {
+  t: number;
+  tri: number;
 }
 
 /**
  * Closest hit against a subset of an indexed triangle soup. `tris[from..to)` are
- * triangle numbers. The direction must be normalized. Returns the distance, or -1.
- * Two-sided, so a room mesh is grabbable from inside the scan.
+ * triangle numbers. The direction must be normalized. Writes into `hit` when closer
+ * than `hit.t`. Two-sided, so a room mesh is grabbable from inside the scan.
  */
 export function rayTriangleRange(
   positions: ArrayLike<number>,
@@ -82,17 +51,49 @@ export function rayTriangleRange(
   to: number,
   ox: number, oy: number, oz: number,
   dx: number, dy: number, dz: number,
-): number {
-  let best = Infinity;
+  hit: RayHit,
+): void {
   for (let i = from; i < to; i++) {
-    const tri = tris[i] * 3;
+    const tri = tris[i];
+    const base = tri * 3;
     const t = rayTriangle(
       ox, oy, oz, dx, dy, dz,
-      positions, index[tri] * 3, index[tri + 1] * 3, index[tri + 2] * 3,
+      positions, index[base] * 3, index[base + 1] * 3, index[base + 2] * 3,
     );
-    if (t >= 0 && t < best) best = t;
+    if (t >= 0 && t < hit.t) {
+      hit.t = t;
+      hit.tri = tri;
+    }
   }
-  return best === Infinity ? -1 : best;
+}
+
+/** Outward unit normal of one triangle. False when the triangle is degenerate. */
+export function triangleNormal(
+  positions: ArrayLike<number>,
+  index: ArrayLike<number>,
+  tri: number,
+  out: { set(x: number, y: number, z: number): void },
+): boolean {
+  const base = tri * 3;
+  const ia = index[base] * 3;
+  const ib = index[base + 1] * 3;
+  const ic = index[base + 2] * 3;
+  const e1x = positions[ib] - positions[ia];
+  const e1y = positions[ib + 1] - positions[ia + 1];
+  const e1z = positions[ib + 2] - positions[ia + 2];
+  const e2x = positions[ic] - positions[ia];
+  const e2y = positions[ic + 1] - positions[ia + 1];
+  const e2z = positions[ic + 2] - positions[ia + 2];
+  const nx = e1y * e2z - e1z * e2y;
+  const ny = e1z * e2x - e1x * e2z;
+  const nz = e1x * e2y - e1y * e2x;
+  const len = Math.hypot(nx, ny, nz);
+  if (len < 1e-8) {
+    out.set(0, 1, 0);
+    return false;
+  }
+  out.set(nx / len, ny / len, nz / len);
+  return true;
 }
 
 export interface TriGrid {
@@ -184,8 +185,8 @@ export function buildTriGrid(
 
 /**
  * Ray through a triangle grid, in the same space as the vertices. Direction must
- * be normalized. Returns the distance, or -1. A miss of the grid bounds is -1,
- * and a ray that starts inside begins in its own cell.
+ * be normalized. Writes the closest hit into `hit` and returns false on a miss.
+ * A ray that starts inside begins in its own cell.
  */
 export function rayTriGrid(
   positions: ArrayLike<number>,
@@ -193,7 +194,10 @@ export function rayTriGrid(
   grid: TriGrid,
   ox: number, oy: number, oz: number,
   dx: number, dy: number, dz: number,
-): number {
+  hit: RayHit,
+): boolean {
+  hit.t = Infinity;
+  hit.tri = -1;
   const { minX, minY, minZ, cell, dimX, dimY, dimZ, starts, tris } = grid;
   const maxX = minX + dimX * cell;
   const maxY = minY + dimY * cell;
@@ -206,7 +210,7 @@ export function rayTriGrid(
       (minX + maxX) / 2, (minY + maxY) / 2, (minZ + maxZ) / 2,
       (maxX - minX) / 2, (maxY - minY) / 2, (maxZ - minZ) / 2,
     );
-    if (t < 0) return -1;
+    if (t < 0) return false;
   }
   const clamp = (v: number, hi: number) => Math.min(hi - 1, Math.max(0, v));
   let ix = clamp(Math.floor((ox + dx * t - minX) / cell), dimX);
@@ -226,42 +230,28 @@ export function rayTriGrid(
   let tMaxX = boundary(ix, minX, stepX, ox, dx);
   let tMaxY = boundary(iy, minY, stepY, oy, dy);
   let tMaxZ = boundary(iz, minZ, stepZ, oz, dz);
-  let best = Infinity;
   const maxSteps = dimX + dimY + dimZ + 3;
   for (let n = 0; n < maxSteps; n++) {
     const id = ix + dimX * (iy + dimY * iz);
-    const hit = rayTriangleRange(positions, index, tris, starts[id], starts[id + 1], ox, oy, oz, dx, dy, dz);
-    if (hit >= 0 && hit < best) best = hit;
+    rayTriangleRange(positions, index, tris, starts[id], starts[id + 1], ox, oy, oz, dx, dy, dz, hit);
     if (tMaxX <= tMaxY && tMaxX <= tMaxZ) {
-      if (best <= tMaxX) break;
+      if (hit.t <= tMaxX) break;
       ix += stepX;
       if (ix < 0 || ix >= dimX) break;
       tMaxX += tDeltaX;
     } else if (tMaxY <= tMaxZ) {
-      if (best <= tMaxY) break;
+      if (hit.t <= tMaxY) break;
       iy += stepY;
       if (iy < 0 || iy >= dimY) break;
       tMaxY += tDeltaY;
     } else {
-      if (best <= tMaxZ) break;
+      if (hit.t <= tMaxZ) break;
       iz += stepZ;
       if (iz < 0 || iz >= dimZ) break;
       tMaxZ += tDeltaZ;
     }
   }
-  return best === Infinity ? -1 : best;
-}
-
-/** Distance from a point to an AABB. Zero when the point is inside. */
-export function pointAabbGap(
-  px: number, py: number, pz: number,
-  minX: number, minY: number, minZ: number,
-  maxX: number, maxY: number, maxZ: number,
-): number {
-  const dx = px < minX ? minX - px : px > maxX ? px - maxX : 0;
-  const dy = py < minY ? minY - py : py > maxY ? py - maxY : 0;
-  const dz = pz < minZ ? minZ - pz : pz > maxZ ? pz - maxZ : 0;
-  return Math.hypot(dx, dy, dz);
+  return hit.tri >= 0;
 }
 
 function rayTriangle(
