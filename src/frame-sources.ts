@@ -4,6 +4,8 @@ export const DEMO_SECONDS = 16;
 export const DEFAULT_CLIP_NAME = 'WhatsApp Video 2026-09-20 at 5.59.52 PM.mp4';
 /** Served from `public/`. Spaces stay encoded so the request matches the filename. */
 export const DEFAULT_CLIP_URL = `/${encodeURIComponent(DEFAULT_CLIP_NAME)}`;
+/** Baked by `scripts/bake-depth`; re-run it if the default clip changes. */
+export const DEFAULT_CLIP_DEPTH = '/depth/default-clip';
 export const RATES = [1, 2, 4, 8, 15, 30] as const;
 
 export interface FrameSource {
@@ -11,6 +13,8 @@ export interface FrameSource {
   name: string;
   duration: number;
   aspect: number;
+  /** Base URL of precomputed depth frames; without it depth comes from the in-browser model. */
+  bakedDepth?: string;
   draw(ctx: CanvasRenderingContext2D, w: number, h: number, t: number, i: number): void | Promise<void>;
 }
 
@@ -112,6 +116,7 @@ export interface LoadedVideo {
   el: HTMLVideoElement;
   url: string;
   name: string;
+  bakedDepth?: string;
 }
 
 function loadVideo(src: string): Promise<HTMLVideoElement> {
@@ -190,9 +195,9 @@ const readAsDataURL = (file: File): Promise<string> =>
   });
 
 /** Opens a video already on the server, such as the default clip in `public/`. */
-export async function loadVideoUrl(url: string, name: string): Promise<LoadedVideo | null> {
+export async function loadVideoUrl(url: string, name: string, bakedDepth?: string): Promise<LoadedVideo | null> {
   const el = await loadVideo(url).catch(() => null);
-  return el ? { el, url, name } : null;
+  return el ? { el, url, name, bakedDepth } : null;
 }
 
 /** Opens a local video. Some hosts allow data: media but not blob:, so it falls back. */
@@ -214,9 +219,10 @@ export function disposeVideo(video: LoadedVideo): void {
   if (video.url.startsWith('blob:')) URL.revokeObjectURL(video.url);
 }
 
-export const videoSource = ({ el, name }: LoadedVideo): FrameSource => ({
+export const videoSource = ({ el, name, bakedDepth }: LoadedVideo): FrameSource => ({
   kind: 'video',
   name,
+  bakedDepth,
   duration: el.duration,
   aspect: el.videoWidth / el.videoHeight,
   draw: async (ctx, w, h, t) => {

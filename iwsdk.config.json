@@ -13,7 +13,10 @@
       "mode": "ar",
       "offer": "always",
       "features": {
-        "handTracking": true
+        "handTracking": true,
+        "anchors": true,
+        "planeDetection": true,
+        "meshDetection": true
       }
     },
     "input": {
@@ -21,7 +24,7 @@
     },
     "render": {
       "near": 0.01,
-      "far": 50,
+      "far": 80,
       "camera": {
         "position": [
           0.02,
@@ -39,7 +42,8 @@
       "locomotion": false,
       "grabbing": false,
       "physics": false,
-      "sceneUnderstanding": false,
+      "sceneUnderstanding": true,
+      "camera": true,
       "environmentRaycast": false,
       "spatialUI": {
         "kit": "horizon"

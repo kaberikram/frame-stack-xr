@@ -20,6 +20,8 @@ import {
   type Object3D,
 } from '@iwsdk/core';
 import { DepthCard } from './depth-card.js';
+import { getMode } from './experience.js';
+import { loadBakedDepth } from './baked-depth.js';
 import { cancelDepth, estimateDepth } from './depth-model.js';
 import { FrameStack } from './frame-stack-component.js';
 import { DEMO_SECONDS, type FrameSource } from './frame-sources.js';
@@ -247,6 +249,11 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     return this.N > 0 && this.loaded >= this.N;
   }
 
+  /** False while the clip has baked depth, so the in-browser model never has to load. */
+  get needsDepthModel(): boolean {
+    return !!this.source && !this.source.bakedDepth;
+  }
+
   displayIndex(): number {
     if (!this.loaded) return 0;
     if (this.loaded < this.N) return this.loaded - 1; // follow the slicing head while loading
@@ -313,8 +320,8 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     return this.card.occupied;
   }
 
-  /** Pinch: lift the frame under the playhead and turn it to face the head. */
-  openRelief(headPos: Vector3, headQuat: Quaternion): void {
+  /** Pinch: stand the frame under the playhead up above the film strip, facing the viewer. */
+  openRelief(): void {
     if (!this.ready || this.card.occupied) return;
     const index = this.displayIndex();
     const photo = this.sliceImage(index);
@@ -323,7 +330,12 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     this.skim = null;
     this.playhead = index;
     this.setPlaying(false);
-    const gen = this.card.begin(this.current, headPos, headQuat, photo, this.aspect);
+    this.root.updateWorldMatrix(true, false);
+    this.touchPoint.set(0, 0, -(STRIP_DEPTH / 2 + 0.012));
+    this.root.localToWorld(this.touchPoint);
+    this.root.getWorldQuaternion(this.camQuat);
+    this.root.getWorldScale(this.dockScale);
+    const gen = this.card.begin(this.current, this.touchPoint, this.camQuat, photo, this.aspect, this.dockScale.x);
     void this.finishRelief(index, gen);
   }
 
@@ -335,16 +347,6 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     this.skim = null;
     this.framePose(this.reliefIndex, this.dockPos, this.dockQuat, this.dockScale);
     this.card.close(this.dockPos, this.dockQuat, this.dockScale);
-  }
-
-  /** A pinch aimed at the selected slice, with the hand close to it. */
-  hitCurrent(head: Vector3, pinch: Vector3): boolean {
-    return this.loaded > 0 && this.card.aimHit(this.current, head, pinch, 0.045, 0.14);
-  }
-
-  /** A pinch aimed at the enlarged card. The hand can sit well in front of it. */
-  hitRelief(head: Vector3, pinch: Vector3): boolean {
-    return this.card.occupied && this.card.aimHit(this.card.mesh, head, pinch, 0.08, 0.4);
   }
 
   /** Slices rise out of the table after placement. */
@@ -455,6 +457,13 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
 
   update(delta: number): void {
     const dt = Math.min(0.1, delta);
+    const active = getMode() === 'stack';
+    this.root.visible = active;
+    if (!active) {
+      if (this.card.occupied) this.closeRelief();
+      this.card.update(dt);
+      return;
+    }
     this.card.update(dt);
     if (!this.rig) return;
     const now = performance.now();
@@ -463,11 +472,7 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
     if (!this.card.occupied && this.playing) this.playhead = (this.playhead + dt * (this.N / this.duration) * this.speed) % this.N;
     if (!this.renderer.xr.isPresenting && this.ready && this.input.keyboard.getKeyDown('KeyP')) {
       if (this.card.occupied) this.closeRelief();
-      else {
-        this.viewer(this.eye);
-        this.camera.getWorldQuaternion(this.camQuat);
-        this.openRelief(this.eye, this.camQuat);
-      }
+      else this.openRelief();
     }
     const target = this.displayIndex();
     if (this.focus !== target) {
@@ -543,11 +548,19 @@ export class FrameStackSystem extends createSystem({ stacks: { required: [FrameS
   }
 
   private async finishRelief(index: number, gen: number): Promise<void> {
+    const baked = this.source?.bakedDepth;
+    const time = (index / Math.max(1, this.N)) * this.duration;
+    const bakedDepth = baked ? loadBakedDepth(baked, time) : null;
     const still = await this.captureStill(index);
     if (!still || gen !== this.card.generation) return;
     this.card.setPhoto(still);
     try {
-      const depth = await estimateDepth(still);
+      const depth = bakedDepth
+        ? await bakedDepth.catch((err: unknown) => {
+            console.warn('Baked depth unavailable, estimating instead', err);
+            return estimateDepth(still);
+          })
+        : await estimateDepth(still);
       if (gen !== this.card.generation) return;
       this.card.setDepth(depth);
     } catch (err) {

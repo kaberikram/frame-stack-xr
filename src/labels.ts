@@ -116,6 +116,30 @@ export interface Atlas {
   cols: number;
 }
 
+/** The label that rides above whatever you're pointing at: what the scan thinks it is, and how big. */
+export function drawTag({ canvas, ctx }: Canvas2D, label: string, size: string): void {
+  const w = canvas.width;
+  const h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  ctx.beginPath();
+  ctx.roundRect(4, 4, w - 8, h - 8, (h - 8) / 2);
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.55)';
+  ctx.fill();
+  ctx.lineWidth = 3;
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.85)';
+  ctx.stroke();
+  ctx.textBaseline = 'middle';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = '#ffffff';
+  ctx.font = `700 46px ${SANS}`;
+  ctx.fillText(label, 36, h / 2 + 2);
+  const used = ctx.measureText(label).width;
+  ctx.globalAlpha = 0.75;
+  ctx.font = `450 38px ${MONO}`;
+  ctx.fillText(size, 36 + used + 26, h / 2 + 2);
+  ctx.globalAlpha = 1;
+}
+
 /** The filmstrip: thumbnails at strip height, one per tile, as in the browser version's scrubber. */
 export function drawStrip({ canvas, ctx }: Canvas2D, atlas: Atlas, N: number, loaded: number, aspect: number): void {
   const w = canvas.width;

@@ -1,6 +1,8 @@
-import { createSystem, VisibilityState } from '@iwsdk/core';
+import { Quaternion, Vector3, VisibilityState, createSystem } from '@iwsdk/core';
 import { prepareDepthModel } from './depth-model.js';
+import { getMode, launchSession, setMode, type ExperienceMode } from './experience.js';
 import {
+  DEFAULT_CLIP_DEPTH,
   DEFAULT_CLIP_NAME,
   DEFAULT_CLIP_URL,
   autoRate,
@@ -12,11 +14,15 @@ import {
   type LoadedVideo,
 } from './frame-sources.js';
 import { FrameStackSystem } from './frame-stack-system.js';
+import { RoomStretchSystem } from './room-stretch-system.js';
 import { TableTouchSystem } from './table-touch-system.js';
 
 const NO_PASSTHROUGH = 'Open this page in the Meta Quest browser to use passthrough.';
 const DEPTH_WAIT = 'Downloading the depth model. Passthrough unlocks when it’s ready.';
 const DEPTH_FAIL = 'The depth model didn’t load. Reload the page to try again.';
+const STRETCH_HINT = 'Point at the room, pinch, and pull. The mesh around your hand stretches.';
+const STRETCH_CAMERA = 'Camera on. Pinch, and the room in front of you stretches.';
+const STRETCH_BLOCKED = 'Camera blocked, so the pull uses a stand-in grain. Point, pinch, and pull.';
 
 /** Wires the 2D launch card in index.html: pick a clip and a sample rate, then enter passthrough. */
 export class LauncherSystem extends createSystem({}) {
@@ -24,6 +30,10 @@ export class LauncherSystem extends createSystem({}) {
   private toastTimer = 0;
   /** Bumped on every open so a slower load can't replace a newer clip. */
   private loadGen = 0;
+  private stretchHint = STRETCH_HINT;
+  private readonly previewPos = new Vector3();
+  private readonly previewQuat = new Quaternion();
+  private previewSaved = false;
 
   init(): void {
     const stack = this.world.getSystem(FrameStackSystem)!;
@@ -37,17 +47,77 @@ export class LauncherSystem extends createSystem({}) {
     const enter = document.getElementById('enterBtn') as HTMLButtonElement | null;
     const file = document.getElementById('file') as HTMLInputElement | null;
     const hint = document.getElementById('hint');
-    if (!launch || !source || !progress || !bar || !rate || !rateNote || !load || !enter || !file || !hint) {
+    const modeStack = document.getElementById('modeStack');
+    const modeStretch = document.getElementById('modeStretch');
+    const stackPanel = document.getElementById('stackPanel');
+    const stretchPanel = document.getElementById('stretchPanel');
+    if (!launch || !source || !progress || !bar || !rate || !rateNote || !load || !enter || !file || !hint || !modeStack || !modeStretch || !stackPanel || !stretchPanel) {
       void stack.build(demoSource());
       return;
     }
     const touch = this.world.getSystem(TableTouchSystem)!;
+    const stretch = this.world.getSystem(RoomStretchSystem)!;
+
+    enter.disabled = true;
+    const placeHint = hint.textContent ?? '';
+    let xrKnown = false;
+    let xrOk = false;
+    let depthRequested = false;
+    let depthReady = false;
+    let depthNote = DEPTH_WAIT;
+    const syncEnter = () => {
+      const stackMode = getMode() === 'stack';
+      const depthOk = !stackMode || depthReady || !stack.needsDepthModel;
+      enter.disabled = !(xrOk && depthOk);
+      if (!xrKnown) return;
+      if (!xrOk) hint.textContent = NO_PASSTHROUGH;
+      else if (stackMode && !depthOk) hint.textContent = depthNote;
+      else hint.textContent = stackMode ? placeHint : this.stretchHint;
+    };
+    const applyMode = (mode: ExperienceMode) => {
+      setMode(mode);
+      const stackMode = mode === 'stack';
+      document.title = stackMode ? 'Frame stack' : 'Jonze stretch';
+      const title = document.getElementById('title');
+      if (title) title.textContent = stackMode ? 'Frame stack' : 'Jonze stretch';
+      stackPanel.hidden = !stackMode;
+      stretchPanel.hidden = stackMode;
+      load.hidden = !stackMode;
+      modeStack.setAttribute('aria-selected', stackMode ? 'true' : 'false');
+      modeStretch.setAttribute('aria-selected', stackMode ? 'false' : 'true');
+      this.applyPreview(mode);
+      if (!stackMode) {
+        void stretch.armCamera().then((ok) => {
+          this.stretchHint = ok ? STRETCH_CAMERA : STRETCH_BLOCKED;
+          syncEnter();
+        });
+      }
+      if (stackMode) requestDepthModel();
+      syncEnter();
+    };
+    const requestDepthModel = () => {
+      if (depthRequested || !stack.needsDepthModel) return;
+      depthRequested = true;
+      void prepareDepthModel().then(
+        () => {
+          depthReady = true;
+          syncEnter();
+        },
+        () => {
+          depthRequested = false;
+          depthNote = DEPTH_FAIL;
+          syncEnter();
+        },
+      );
+    };
 
     const render = () => {
       source.textContent = stack.describe();
       progress.hidden = stack.ready;
       bar.style.transform = `scaleX(${stack.N ? stack.loaded / stack.N : 0})`;
       rateNote.textContent = stack.rateNote();
+      requestDepthModel();
+      syncEnter();
     };
     stack.name = DEFAULT_CLIP_NAME;
     rate.value = String(stack.rate);
@@ -65,26 +135,19 @@ export class LauncherSystem extends createSystem({}) {
     };
     const onEnter = () => {
       touch.unlockAudio(); // this click is the gesture that lets scrub ticks play in the headset
-      this.world.launchXR();
+      const stretchMode = getMode() === 'stretch';
+      if (stretchMode) void stretch.armCamera();
+      launchSession(() => this.world.launchXR(), stretchMode);
     };
+    const onStack = () => applyMode('stack');
+    const onStretch = () => applyMode('stretch');
     rate.addEventListener('change', onRate);
     load.addEventListener('click', onLoad);
     file.addEventListener('change', onFile);
     enter.addEventListener('click', onEnter);
+    modeStack.addEventListener('click', onStack);
+    modeStretch.addEventListener('click', onStretch);
 
-    enter.disabled = true;
-    const placeHint = hint.textContent ?? '';
-    let xrKnown = false;
-    let xrOk = false;
-    let depthReady = false;
-    let depthNote = DEPTH_WAIT;
-    const syncEnter = () => {
-      enter.disabled = !(xrOk && depthReady);
-      if (!xrKnown) return;
-      if (!xrOk) hint.textContent = NO_PASSTHROUGH;
-      else if (!depthReady) hint.textContent = depthNote;
-      else hint.textContent = placeHint;
-    };
     if (this.world.xrEnabled && navigator.xr) {
       navigator.xr.isSessionSupported('immersive-ar').then(
         (ok) => {
@@ -102,17 +165,6 @@ export class LauncherSystem extends createSystem({}) {
       syncEnter();
     }
 
-    void prepareDepthModel().then(
-      () => {
-        depthReady = true;
-        syncEnter();
-      },
-      () => {
-        depthNote = DEPTH_FAIL;
-        syncEnter();
-      },
-    );
-
     void this.openDefault(stack, rate, source);
 
     this.cleanupFuncs.push(
@@ -125,6 +177,8 @@ export class LauncherSystem extends createSystem({}) {
         load.removeEventListener('click', onLoad);
         file.removeEventListener('change', onFile);
         enter.removeEventListener('click', onEnter);
+        modeStack.removeEventListener('click', onStack);
+        modeStretch.removeEventListener('click', onStretch);
         if (this.video) disposeVideo(this.video);
       },
     );
@@ -133,7 +187,7 @@ export class LauncherSystem extends createSystem({}) {
   private async openDefault(stack: FrameStackSystem, rate: HTMLSelectElement, source: HTMLElement): Promise<void> {
     const gen = ++this.loadGen;
     source.textContent = `Opening ${DEFAULT_CLIP_NAME}`;
-    const video = await loadVideoUrl(DEFAULT_CLIP_URL, DEFAULT_CLIP_NAME);
+    const video = await loadVideoUrl(DEFAULT_CLIP_URL, DEFAULT_CLIP_NAME, DEFAULT_CLIP_DEPTH);
     if (gen !== this.loadGen) {
       if (video) disposeVideo(video);
       return;
@@ -172,6 +226,23 @@ export class LauncherSystem extends createSystem({}) {
     stack.rate = autoRate(video.el.duration);
     rate.value = String(stack.rate);
     void stack.build(videoSource(video));
+  }
+
+  private applyPreview(mode: ExperienceMode): void {
+    if (this.renderer.xr.isPresenting) return;
+    const cam = this.camera;
+    if (!this.previewSaved) {
+      this.previewPos.copy(cam.position);
+      this.previewQuat.copy(cam.quaternion);
+      this.previewSaved = true;
+    }
+    if (mode === 'stretch') {
+      cam.position.set(0.25, 1.6, 2.5);
+      cam.lookAt(0, 1, -1.7);
+      return;
+    }
+    cam.position.copy(this.previewPos);
+    cam.quaternion.copy(this.previewQuat);
   }
 
   private toast(message: string): void {

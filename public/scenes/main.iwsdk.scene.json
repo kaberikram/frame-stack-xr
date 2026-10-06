@@ -33,6 +33,29 @@
         }
       },
       "children": []
+    },
+    {
+      "id": "stretch-settings",
+      "name": "Stretch settings",
+      "metadata": {
+        "iwsdk.validation": {
+          "allowFloating": true
+        }
+      },
+      "content": {
+        "type": "group"
+      },
+      "transform": {
+        "position": [
+          0,
+          0,
+          0
+        ]
+      },
+      "components": {
+        "StretchLook": {}
+      },
+      "children": []
     }
   ]
 }

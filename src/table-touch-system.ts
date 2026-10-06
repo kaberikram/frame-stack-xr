@@ -13,6 +13,7 @@ import {
   type ShaderMaterial,
 } from '@iwsdk/core';
 import { InputComponent } from '@iwsdk/xr-input';
+import { getMode } from './experience.js';
 import { FrameStack } from './frame-stack-component.js';
 import { FrameStackSystem } from './frame-stack-system.js';
 import { INK, drawHint, makeCanvas, type Canvas2D } from './labels.js';
@@ -24,6 +25,13 @@ import { Contact, OneEuro, Stillness, hitTest, inZone, stripU, type Target } fro
 type Side = 'left' | 'right';
 const SIDES: readonly Side[] = ['left', 'right'];
 const UP = new Vector3(0, 1, 0);
+const SCALE_MIN = 0.5;
+const SCALE_MAX = 2.5;
+/** A one-hand pinch shorter than this toggles the depth view. Longer, and the other hand can join a resize. */
+const PINCH_TAP_MS = 500;
+/** Beyond this, a hand is too far away (often the one at the bottom of the camera) to pinch or resize. */
+const PINCH_REACH = 0.62;
+/** After a hand reappears, ignore pinches until the fingers have been seen apart. */
 const clamp01 = (v: number) => Math.min(1, Math.max(0, v));
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t;
 
@@ -74,8 +82,22 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
   private capture: { side: Side; target: Target | 'stack' } | null = null;
   private fingers!: Record<Side, Finger>;
   private pinched = { left: false, right: false };
+  /** Seconds a hand has been untracked, so a dropped joint doesn't count as letting go. */
+  private pinchLost = { left: 0, right: 0 };
+  /** When the current pinch started, and whether a short release should toggle the depth view. */
+  private pinchAt = { left: 0, right: 0 };
+  private pinchTap = { left: false, right: false };
+  /** Meters from the head. Infinity while that hand isn't tracked. */
+  private pinchReach = { left: Infinity, right: Infinity };
+  /** False until the fingers open after tracking returns, so re-entry isn't a pinch. */
+  private pinchOpen = { left: false, right: false };
   private pinchArm = 0;
-  private readonly pinchPos = new Vector3();
+  /** Two-hand pinch in progress. `d0` is the starting distance between the hands, `s0` the scale then. */
+  private scaleGesture: { d0: number; s0: number } | null = null;
+  private readonly scaleHold = { d0: 0, s0: 1 };
+  private tableScale = 1;
+  private scaleTarget = 1;
+  private readonly pinchMid = { left: new Vector3(), right: new Vector3() };
   private readonly thumbPos = new Vector3();
   private readonly indexPos = new Vector3();
   private readonly sound = new TickSound();
@@ -159,6 +181,7 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
         if (entity === this.rig) this.rig = null;
       }),
       this.visibilityState.subscribe((state) => {
+        if (getMode() !== 'stack') return;
         if (state === VisibilityState.NonImmersive) this.exitXR();
         else if (this.mode === 'idle') this.startPlacing();
       }),
@@ -176,6 +199,12 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
   }
 
   update(delta: number): void {
+    if (getMode() !== 'stack') {
+      if (this.mode !== 'idle') this.exitXR();
+      this.hint.visible = false;
+      this.ring.visible = false;
+      return;
+    }
     if (this.mode === 'idle' || !this.rig?.object3D) return;
     const dt = Math.min(0.1, delta);
     this.player.head.getWorldPosition(this.head);
@@ -212,7 +241,7 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
       if (f.tracked) {
         f.local.copy(f.world);
         rig.worldToLocal(f.local);
-        f.height = f.local.y - this.restY;
+        f.height = f.local.y * this.tableScale - this.restY;
         f.sx = f.filter.filter(f.local.x, dt);
       } else {
         f.filter.reset();
@@ -293,9 +322,21 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
     this.ring.visible = false;
     this.hintOpacity = 0;
     const rig = this.rig?.object3D;
+    this.tableScale = 1;
+    this.scaleTarget = 1;
+    this.scaleGesture = null;
+    this.pinched.left = false;
+    this.pinched.right = false;
+    this.pinchTap.left = false;
+    this.pinchTap.right = false;
+    this.pinchOpen.left = false;
+    this.pinchOpen.right = false;
+    this.pinchReach.left = Infinity;
+    this.pinchReach.right = Infinity;
     if (rig) {
       rig.position.copy(this.homePos);
       rig.quaternion.copy(this.homeQuat);
+      rig.scale.setScalar(1);
       rig.visible = true;
     }
   }
@@ -304,6 +345,8 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
 
   private updateTouch(dt: number): void {
     this.sampleStack();
+    this.updatePinch(dt);
+    if (this.scaleGesture) return;
     for (let i = 0; i < SIDES.length; i++) {
       const side = SIDES[i];
       const f = this.fingers[side];
@@ -311,8 +354,6 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
       if (edge === 'down') this.onDown(side, f);
       else if (edge === 'up') this.onUp(side, f);
     }
-
-    this.updatePinch(dt);
 
     const cap = this.capture;
     if (cap?.target === 'stack') {
@@ -336,29 +377,102 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
     }
   }
 
-  /** Thumb-to-index pinch on the selected frame. Table touches stay index-tip scrubs. */
+  /** One-hand pinch toggles the depth card on release. Both hands pinched, and close, pull the table scale. */
   private updatePinch(dt: number): void {
+    this.easeScale(dt);
     if (this.pinchArm > 0) this.pinchArm = Math.max(0, this.pinchArm - dt);
     if (!this.stack.ready) return;
+    let releasedLeft = false;
+    let releasedRight = false;
     for (let i = 0; i < SIDES.length; i++) {
       const side = SIDES[i];
       const dist = this.pinchSpan(side);
       const was = this.pinched[side];
       if (dist === null) {
-        this.pinched[side] = false;
+        this.pinchLost[side] += dt;
+        this.pinchReach[side] = Infinity;
+        this.pinchOpen[side] = false;
+        if (this.pinchLost[side] > 0.15 && was) {
+          this.pinched[side] = false;
+          this.pinchTap[side] = false;
+        }
         continue;
       }
-      const trigger = this.input.xr.gamepads[side]?.getButtonDown(InputComponent.Trigger) ?? false;
-      if (!was && (dist < 0.032 || (trigger && dist < 0.05))) {
+      this.pinchLost[side] = 0;
+      this.pinchReach[side] = this.pinchMid[side].distanceTo(this.head);
+      if (dist > 0.05) this.pinchOpen[side] = true;
+      const inReach = this.pinchReach[side] <= PINCH_REACH;
+      const trigger = this.input.xr.gamepads[side]?.getButtonPressed(InputComponent.Trigger) ?? false;
+      const closed = this.pinchOpen[side] && inReach && (dist < 0.03 || (trigger && dist < 0.045));
+      if (closed && !was) {
         this.pinched[side] = true;
-        if (this.pinchArm === 0) this.onPinch();
-      } else if (was && dist > 0.045) {
+        this.pinchAt[side] = performance.now();
+        this.pinchTap[side] = true;
+      } else if (was && !inReach) {
         this.pinched[side] = false;
+        this.pinchTap[side] = false;
+      } else if (was && !closed && dist > 0.05) {
+        this.pinched[side] = false;
+        if (side === 'left') releasedLeft = true;
+        else releasedRight = true;
       }
     }
+    const bothClose = this.pinched.left && this.pinched.right && this.pinchReach.left <= PINCH_REACH && this.pinchReach.right <= PINCH_REACH;
+    if (bothClose) this.pullScale();
+    else if (this.scaleGesture) {
+      this.scaleGesture = null;
+      this.sound.select();
+    }
+    if (this.scaleGesture) return;
+    if (releasedLeft) this.finishPinch('left');
+    if (releasedRight) this.finishPinch('right');
   }
 
-  /** Distance between thumb tip and index tip, in meters. The midpoint is left in `pinchPos`. */
+  /** Grow or shrink about the rig origin, which sits on the table under the strip. */
+  private pullScale(): void {
+    const d = this.pinchMid.left.distanceTo(this.pinchMid.right);
+    if (!this.scaleGesture) {
+      if (d < 0.04) return;
+      this.scaleHold.d0 = d;
+      this.scaleHold.s0 = this.tableScale;
+      this.scaleGesture = this.scaleHold;
+      this.pinchTap.left = false;
+      this.pinchTap.right = false;
+      this.release();
+      this.sound.select();
+    }
+    const gesture = this.scaleGesture;
+    if (!gesture || gesture.d0 < 1e-4) return;
+    const next = (gesture.s0 * d) / gesture.d0;
+    this.scaleTarget = Math.min(SCALE_MAX, Math.max(SCALE_MIN, next));
+  }
+
+  private easeScale(dt: number): void {
+    const rig = this.rig?.object3D;
+    if (!rig) return;
+    this.tableScale += (this.scaleTarget - this.tableScale) * (1 - Math.exp(-dt * 14));
+    if (Math.abs(this.scaleTarget - this.tableScale) < 0.0005) this.tableScale = this.scaleTarget;
+    rig.scale.setScalar(this.tableScale);
+  }
+
+  /** The tracked hand nearer the head. A farther hand, even in frame, doesn't open the depth view. */
+  private isMainHand(side: Side): boolean {
+    const other: Side = side === 'left' ? 'right' : 'left';
+    return this.pinchReach[side] <= this.pinchReach[other];
+  }
+
+  /** A short pinch from the nearer hand, released, toggles the depth view. */
+  private finishPinch(side: Side): void {
+    const tap = this.pinchTap[side];
+    this.pinchTap[side] = false;
+    if (!tap || this.scaleGesture || !this.isMainHand(side)) return;
+    if (this.pinchReach[side] > PINCH_REACH) return;
+    if (performance.now() - this.pinchAt[side] > PINCH_TAP_MS) return;
+    if (this.pinchArm !== 0) return;
+    this.onPinch();
+  }
+
+  /** Distance between thumb tip and index tip, in meters. The midpoint is left in `pinchMid`. */
   private pinchSpan(side: Side): number | null {
     const frame = this.world.xrFrame;
     const ref = this.world.xrReferenceSpace;
@@ -375,24 +489,21 @@ export class TableTouchSystem extends createSystem({ stacks: { required: [FrameS
     this.player.updateWorldMatrix(true, false);
     this.thumbPos.set(tp.x, tp.y, tp.z).applyMatrix4(this.player.matrixWorld);
     this.indexPos.set(ip.x, ip.y, ip.z).applyMatrix4(this.player.matrixWorld);
-    this.pinchPos.copy(this.thumbPos).add(this.indexPos).multiplyScalar(0.5);
+    this.pinchMid[side].copy(this.thumbPos).add(this.indexPos).multiplyScalar(0.5);
     return this.thumbPos.distanceTo(this.indexPos);
   }
 
   private onPinch(): void {
-    const scrubbing = this.capture?.target === 'strip' || this.capture?.target === 'stack';
-    if (scrubbing) return;
-    const open = this.stack.reliefOccupied;
-    const hit = open ? this.stack.hitRelief(this.head, this.pinchPos) : this.stack.hitCurrent(this.head, this.pinchPos);
-    if (!hit) return;
     this.pinchArm = 0.45;
-    if (open) {
+    this.capture = null;
+    this.stack.setPressed(null);
+    if (this.stack.reliefOccupied) {
       this.stack.closeRelief();
       this.sound.select();
-    } else {
-      this.stack.openRelief(this.head, this.headQuat);
-      this.sound.appear();
+      return;
     }
+    this.stack.openRelief();
+    this.sound.appear();
   }
 
   /** One stack probe per finger, so later checks don't transform the point again. */

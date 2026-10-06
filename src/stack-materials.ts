@@ -235,7 +235,7 @@ export function reliefMaterial(): ShaderMaterial {
       uTexel: { value: new Vector2(1, 1) },
       uRelief: { value: 0 },
       uHasDepth: { value: 0 },
-      uDepthAmt: { value: 0.62 },
+      uDepthAmt: { value: 0.32 },
       uFeather: { value: 0.08 },
     },
     vertexShader: /* glsl */ `

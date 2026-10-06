@@ -3,7 +3,6 @@ import {
   DataTexture,
   LinearFilter,
   LinearSRGBColorSpace,
-  Matrix4,
   Mesh,
   PlaneGeometry,
   Quaternion,
@@ -19,36 +18,33 @@ import { reliefMaterial } from './stack-materials.js';
 
 type Mode = 'idle' | 'opening' | 'open' | 'closing';
 
-const UP = new Vector3(0, 1, 0);
-const LONG_SIDE = 0.62;
+const AXIS_X = new Vector3(1, 0, 0);
+/** Landscape width. The film strip is 0.4 m, so the screen sits inside it. */
+const LONG_SIDE = 0.32;
 const SEGMENTS = 144;
+/** Near-to-far push, as a fraction of the screen's long side. Same punch as the large card, on the smaller one. */
+const RELIEF = 1;
+/** Lean back so the screen faces someone looking down at the table. */
+const TV_PITCH = 0.24;
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
 
 /**
- * One enlarged frame in front of the viewer. It flies out flat, then eases into
- * relief when a depth map arrives. A second pinch flies it back into the stack.
+ * The selected frame, stood up above the film strip like a tabletop screen.
+ * It flies out of the stack, then eases into relief when a depth map arrives.
+ * A second pinch flies it back into the stack.
  */
 export class DepthCard {
   readonly mesh: Mesh;
   private readonly mat: ShaderMaterial;
   private readonly fallbackDepth: Texture;
-  private readonly pose = new Matrix4();
   private readonly fromPos = new Vector3();
   private readonly toPos = new Vector3();
   private readonly fromQuat = new Quaternion();
   private readonly toQuat = new Quaternion();
-  private readonly hitQuat = new Quaternion();
+  private readonly tilt = new Quaternion();
   private readonly fromScale = new Vector3();
   private readonly toScale = new Vector3();
-  private readonly axisX = new Vector3();
-  private readonly axisY = new Vector3();
-  private readonly axisZ = new Vector3();
-  private readonly center = new Vector3();
-  private readonly normal = new Vector3();
   private readonly dir = new Vector3();
-  private readonly hitPoint = new Vector3();
-  private readonly local = new Vector3();
-  private readonly worldScale = new Vector3();
   private photo: CanvasTexture | null = null;
   private depthTex: DataTexture | null = null;
   private geo: PlaneGeometry;
@@ -75,22 +71,33 @@ export class DepthCard {
   }
 
   /**
-   * Start the flight from the slice's current world pose toward a spot in front
-   * of the head. `photo` is the low-res slice, shown until the sharp frame lands.
+   * Fly the slice up to a screen standing on `anchorPos`. `anchorQuat` is the
+   * table's facing: the screen shares that yaw and leans back a little.
+   * `tableScale` matches the rig, so the screen stays proportional to the strip.
+   * `photo` is the low-res slice, shown until the sharp frame lands.
    */
-  begin(frame: Mesh, headPos: Vector3, headQuat: Quaternion, photo: HTMLCanvasElement, aspect: number): number {
+  begin(
+    frame: Mesh,
+    anchorPos: Vector3,
+    anchorQuat: Quaternion,
+    photo: HTMLCanvasElement,
+    aspect: number,
+    tableScale = 1,
+  ): number {
     this.generation += 1;
     this.resetLook();
     frame.getWorldPosition(this.fromPos);
     frame.getWorldQuaternion(this.fromQuat);
     frame.getWorldScale(this.fromScale);
-    this.dir.set(0, 0, -1).applyQuaternion(headQuat);
-    this.toPos.copy(headPos).addScaledVector(this.dir, 0.48);
-    this.toPos.y -= 0.04;
-    this.faceHead(headPos);
-    const width = aspect >= 1 ? LONG_SIDE : LONG_SIDE * aspect;
-    const height = aspect >= 1 ? LONG_SIDE / aspect : LONG_SIDE;
+    const fit = Math.max(0.05, tableScale);
+    const width = (aspect >= 1 ? LONG_SIDE : LONG_SIDE * aspect) * fit;
+    const height = (aspect >= 1 ? LONG_SIDE / aspect : LONG_SIDE) * fit;
     this.toScale.set(width, height, 1);
+    this.mat.uniforms.uDepthAmt.value = Math.max(width, height) * RELIEF;
+    this.dir.set(0, height / 2 + 0.03 * fit, 0).applyQuaternion(anchorQuat);
+    this.toPos.copy(anchorPos).add(this.dir);
+    this.tilt.setFromAxisAngle(AXIS_X, -TV_PITCH);
+    this.toQuat.copy(anchorQuat).multiply(this.tilt);
     this.rebuild(aspect);
     this.setPhoto(photo);
     this.mode = 'opening';
@@ -160,31 +167,6 @@ export class DepthCard {
     this.reliefTarget = 1;
   }
 
-  /** True when a pinch between the head and `pinch` is aimed at this plane and the hand is close. */
-  aimHit(mesh: Mesh, head: Vector3, pinch: Vector3, pad: number, reach: number): boolean {
-    mesh.updateWorldMatrix(true, false);
-    mesh.getWorldPosition(this.center);
-    mesh.getWorldQuaternion(this.hitQuat);
-    mesh.getWorldScale(this.worldScale);
-    this.normal.set(0, 0, 1).applyQuaternion(this.hitQuat);
-    this.dir.copy(pinch).sub(head);
-    const span = this.dir.length();
-    if (span < 1e-4) return false;
-    this.dir.multiplyScalar(1 / span);
-    const denom = this.normal.dot(this.dir);
-    if (Math.abs(denom) < 1e-4) return false;
-    this.hitPoint.copy(this.center).sub(head);
-    const t = this.normal.dot(this.hitPoint) / denom;
-    if (t < 0) return false;
-    this.hitPoint.copy(head).addScaledVector(this.dir, t);
-    if (this.hitPoint.distanceTo(pinch) > reach) return false;
-    this.local.copy(this.hitPoint);
-    mesh.worldToLocal(this.local);
-    const px = pad / Math.max(this.worldScale.x, 1e-4);
-    const py = pad / Math.max(this.worldScale.y, 1e-4);
-    return Math.abs(this.local.x) <= 0.5 + px && Math.abs(this.local.y) <= 0.5 + py;
-  }
-
   update(dt: number): void {
     if (this.mode === 'idle') return;
     if (this.anim < 1) {
@@ -219,19 +201,6 @@ export class DepthCard {
     this.mesh.position.lerpVectors(this.fromPos, this.toPos, t);
     this.mesh.quaternion.copy(this.fromQuat).slerp(this.toQuat, t);
     this.mesh.scale.lerpVectors(this.fromScale, this.toScale, t);
-  }
-
-  /** Local +Z points at the head, local +X points to the viewer's right. */
-  private faceHead(headPos: Vector3): void {
-    this.axisZ.copy(headPos).sub(this.toPos);
-    if (this.axisZ.lengthSq() < 1e-8) this.axisZ.set(0, 0, 1);
-    this.axisZ.normalize();
-    this.axisX.crossVectors(UP, this.axisZ);
-    if (this.axisX.lengthSq() < 1e-8) this.axisX.set(1, 0, 0);
-    this.axisX.normalize();
-    this.axisY.crossVectors(this.axisZ, this.axisX);
-    this.pose.makeBasis(this.axisX, this.axisY, this.axisZ);
-    this.toQuat.setFromRotationMatrix(this.pose);
   }
 
   private rebuild(aspect: number): void {

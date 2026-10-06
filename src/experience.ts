@@ -1,0 +1,46 @@
+export type ExperienceMode = 'stack' | 'stretch';
+
+let mode: ExperienceMode = 'stack';
+
+export function getMode(): ExperienceMode {
+  return mode;
+}
+
+export function setMode(next: ExperienceMode): void {
+  mode = next;
+}
+
+/**
+ * `camera-access` is optional: Quest Browser still rejects it when required, and
+ * ignores it when the feature is missing. If a build rejects the whole session
+ * over that token, start again without it.
+ */
+export function launchSession(launch: () => void, requestCamera: boolean): void {
+  const xr = navigator.xr;
+  if (!requestCamera || !xr) {
+    launch();
+    return;
+  }
+  const original = xr.requestSession.bind(xr);
+  let restored = false;
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    xr.requestSession = original;
+  };
+  xr.requestSession = ((sessionMode, init) => {
+    restore();
+    const optional = [...(init?.optionalFeatures ?? [])];
+    if (!optional.includes('camera-access')) optional.push('camera-access');
+    return original(sessionMode, { ...init, optionalFeatures: optional }).catch((error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      if (!/camera-access/i.test(message)) throw error;
+      return original(sessionMode, init);
+    });
+  }) as typeof xr.requestSession;
+  try {
+    launch();
+  } finally {
+    restore();
+  }
+}
