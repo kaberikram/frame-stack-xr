@@ -44,8 +44,10 @@ export class RoomMeshOverlay {
   private requestId = 0;
   private source: Mesh | null = null;
   private sourceKey: object | null = null;
-  private saved: Material | Material[] | null = null;
   private dense: Mesh | null = null;
+  private readonly painted = new Map<Mesh, Material | Material[]>();
+  private readonly keep = new Set<Mesh>();
+  private readonly dropList: Mesh[] = [];
   private video: HTMLVideoElement | null = null;
   private videoTex: VideoTexture | null = null;
 
@@ -57,31 +59,57 @@ export class RoomMeshOverlay {
     this.material = rubberMaterial(this.uniforms);
   }
 
-  /** Show the dense copy of `source`, or the coarse mesh until the worker answers. */
-  sync(source: Mesh | null): void {
-    if (!source) {
-      this.hide(false);
+  /**
+   * Draw every scanned mesh. The largest one is subdivided in the worker;
+   * the others stay coarse so a room made of separate objects is still visible.
+   */
+  sync(sources: readonly Mesh[]): void {
+    this.keep.clear();
+    for (let i = 0; i < sources.length; i++) this.keep.add(sources[i]);
+    const drop = this.dropList;
+    drop.length = 0;
+    for (const mesh of this.painted.keys()) {
+      if (!this.keep.has(mesh)) drop.push(mesh);
+    }
+    for (let i = 0; i < drop.length; i++) this.release(drop[i]);
+
+    let primary: Mesh | null = null;
+    let primaryCount = -1;
+    for (let i = 0; i < sources.length; i++) {
+      const mesh = sources[i];
+      this.paint(mesh);
+      const count = mesh.geometry.getAttribute('position')?.count ?? 0;
+      if (count > primaryCount) {
+        primary = mesh;
+        primaryCount = count;
+      }
+    }
+    if (!primary) {
+      if (this.dense) this.dense.visible = false;
+      this.source = null;
+      this.sourceKey = null;
+      this.ready = false;
+      this.triangles = 0;
       return;
     }
-    if (source !== this.source) this.adopt(source);
-    else if (!this.ready && source.material !== this.material && !this.saved) {
-      this.saved = source.material;
-      source.material = this.material;
+    if (primary !== this.source) {
+      if (this.source) this.source.visible = true;
+      this.source = primary;
+      this.sourceKey = null;
+      this.ready = false;
+      this.triangles = 0;
+      if (this.dense) this.dense.visible = false;
     }
-    const position = source.geometry?.getAttribute('position');
-    if (position && position !== this.sourceKey) this.submit(source, position);
+    const position = primary.geometry.getAttribute('position');
+    if (position && position !== this.sourceKey) this.submit(primary, position);
     if (this.dense && this.ready) {
-      source.updateWorldMatrix(true, false);
+      primary.updateWorldMatrix(true, false);
       this.dense.visible = true;
       this.dense.matrixAutoUpdate = false;
-      this.dense.matrix.copy(source.matrixWorld);
+      this.dense.matrix.copy(primary.matrixWorld);
       this.dense.updateMatrixWorld(true);
-      source.visible = false;
-      return;
+      primary.visible = false;
     }
-    source.frustumCulled = false;
-    source.renderOrder = 2;
-    source.visible = true;
   }
 
   setLive(video: HTMLVideoElement | null, hasLive: boolean, liveToClip: Matrix4): void {
@@ -93,8 +121,17 @@ export class RoomMeshOverlay {
 
   hide(restore: boolean): void {
     if (this.dense) this.dense.visible = false;
-    if (this.source) this.source.visible = false;
-    if (restore) this.restoreSource();
+    if (!restore) {
+      for (const mesh of this.painted.keys()) mesh.visible = false;
+      return;
+    }
+    const drop = this.dropList;
+    drop.length = 0;
+    for (const mesh of this.painted.keys()) drop.push(mesh);
+    for (let i = 0; i < drop.length; i++) this.release(drop[i]);
+    this.source = null;
+    this.sourceKey = null;
+    this.ready = false;
   }
 
   dispose(): void {
@@ -106,18 +143,26 @@ export class RoomMeshOverlay {
     this.material.dispose();
   }
 
-  private adopt(source: Mesh): void {
-    this.restoreSource();
-    if (this.dense) this.dense.visible = false;
-    this.source = source;
-    this.sourceKey = null;
-    this.ready = false;
-    this.triangles = 0;
-    this.saved = source.material;
-    source.material = this.material;
-    source.frustumCulled = false;
-    source.renderOrder = 2;
-    source.visible = true;
+  private paint(mesh: Mesh): void {
+    if (!this.painted.has(mesh)) this.painted.set(mesh, mesh.material);
+    if (mesh.material !== this.material) mesh.material = this.material;
+    mesh.frustumCulled = false;
+    mesh.renderOrder = 2;
+    if (mesh !== this.source || !this.ready) mesh.visible = true;
+  }
+
+  private release(mesh: Mesh): void {
+    const saved = this.painted.get(mesh);
+    if (saved && mesh.material === this.material) mesh.material = saved;
+    this.painted.delete(mesh);
+    mesh.visible = false;
+    if (mesh === this.source) {
+      this.source = null;
+      this.sourceKey = null;
+      this.ready = false;
+      this.triangles = 0;
+      if (this.dense) this.dense.visible = false;
+    }
   }
 
   private submit(source: Mesh, position: BufferAttribute | InterleavedBufferAttribute): void {
@@ -173,18 +218,11 @@ export class RoomMeshOverlay {
     this.dense.matrix.copy(this.source.matrixWorld);
     this.dense.updateMatrixWorld(true);
     this.dense.visible = true;
-    this.restoreSource();
     this.source.visible = false;
     this.ready = true;
     this.triangles = reply.triangles;
     const edge = reply.edge >= 0.1 ? reply.edge.toFixed(2) : reply.edge.toFixed(3);
     console.info(`[jonze] dense room: ${reply.triangles} triangles, ${edge} m edges`);
-  }
-
-  private restoreSource(): void {
-    if (!this.source || !this.saved) return;
-    if (this.source.material === this.material) this.source.material = this.saved;
-    this.saved = null;
   }
 
   private attachVideo(video: HTMLVideoElement | null): void {

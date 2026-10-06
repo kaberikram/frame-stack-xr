@@ -54,6 +54,7 @@ interface Grab {
   holding: boolean;
   on: boolean;
   locked: boolean;
+  mesh: Mesh | null;
   worldG: Vector3;
   localG: Vector3;
   axis: Vector3;
@@ -82,7 +83,6 @@ interface Copy {
 const CARD = {
   point: { title: 'Pinch the room', body: 'Pull with one hand or both.' },
   scan: { title: 'No room mesh yet', body: 'Finish Space Setup and enter again.' },
-  meshing: { title: 'Room mesh', body: 'Building a denser copy.' },
 };
 
 const WARDROBE = { x: -0.75, y: 1, z: -1.7, sx: 0.9, sy: 2, sz: 0.55 };
@@ -93,6 +93,7 @@ function makeGrab(): Grab {
     holding: false,
     on: false,
     locked: false,
+    mesh: null,
     worldG: new Vector3(),
     localG: new Vector3(),
     axis: new Vector3(0, 1, 0),
@@ -124,8 +125,17 @@ export class RoomStretchSystem extends createSystem({
   private readonly right = makeGrab();
   private readonly demoL = makeGrab();
   private readonly demoR = makeGrab();
-  private scan: Scan | null = null;
+  private readonly scans: Scan[] = [];
+  private readonly globalMeshes: Mesh[] = [];
+  private readonly objects: Mesh[] = [];
+  private readonly shown: Mesh[] = [];
   private readonly hit: RayHit = { t: Infinity, tri: -1 };
+  private hitMesh: Mesh | null = null;
+  private scanSig = '';
+  private meshLog = '';
+  private coarseTriangles = 0;
+  /** Desk-only stand-in. A headset that can enter passthrough must not show it. */
+  private previewRoom = typeof navigator === 'undefined' || !navigator.xr;
   private reveal = 0;
   private demoT = 0;
   private session: XRSession | null = null;
@@ -163,12 +173,19 @@ export class RoomStretchSystem extends createSystem({
   private readonly localD = new Vector3();
   private readonly localHit = new Vector3();
   private readonly localN = new Vector3();
+  private readonly bestO = new Vector3();
+  private readonly bestD = new Vector3();
   private readonly inv = new Matrix4();
 
   init(): void {
     this.overlay = new RoomMeshOverlay(this.photo, this.scene);
     this.hands = new HandOccluder(this.scene);
     this.buildRoom();
+    if (navigator.xr) {
+      void navigator.xr.isSessionSupported('immersive-ar').then((ok) => {
+        this.previewRoom = !ok;
+      });
+    }
 
     this.hud = new Group();
     this.hud.visible = false;
@@ -242,9 +259,9 @@ export class RoomStretchSystem extends createSystem({
       this.player.head.getWorldPosition(this.head);
       this.player.head.getWorldQuaternion(this.headQuat);
       this.refreshHands();
-      const source = this.findGlobal();
-      this.overlay.sync(source);
-      this.syncGrid(source);
+      const meshes = this.findMeshes();
+      this.overlay.sync(meshes);
+      this.syncGrids(meshes);
       const handsInFrame = this.hands.jointCount > 0 && this.photo.jointsInFrame(this.hands.points, this.hands.jointCount);
       this.photo.keepClean(video, !handsInFrame);
       this.poseGrab(this.left);
@@ -252,6 +269,12 @@ export class RoomStretchSystem extends createSystem({
       this.stepHand(this.left, dt, 'left');
       this.stepHand(this.right, dt, 'right');
       this.publish(this.left, this.right, dt, time);
+    } else if (!this.previewRoom) {
+      this.room.visible = false;
+      this.overlay.hide(false);
+      this.hands.setActive(false);
+      this.hud.visible = false;
+      return;
     } else {
       this.overlay.hide(false);
       this.hands.setActive(false);
@@ -292,60 +315,103 @@ export class RoomStretchSystem extends createSystem({
     this.scene.add(this.room);
   }
 
-  private findGlobal(): Mesh | null {
-    let found: Mesh | null = null;
+  /**
+   * Quest often delivers the room as separate object meshes, and only labels one
+   * of them "global mesh". Hiding the rest left the headset with nothing to draw
+   * and a "finish Space Setup" card. Prefer the global mesh when it is actually
+   * there; otherwise draw every scanned mesh.
+   */
+  private findMeshes(): readonly Mesh[] {
+    const globals = this.globalMeshes;
+    const objects = this.objects;
+    globals.length = 0;
+    objects.length = 0;
     for (const entity of this.queries.meshes.entities) {
-      const object = entity.object3D;
-      if (!object) continue;
-      if (entity.getValue(XRMesh, 'isBounded3D')) {
-        object.visible = false;
-        continue;
-      }
-      const mesh = object as Mesh;
-      if (mesh.isMesh && mesh.geometry) found = mesh;
+      const mesh = entity.object3D as Mesh | null;
+      const position = mesh?.geometry?.getAttribute('position');
+      if (!mesh?.isMesh || !position || position.count < 3) continue;
+      if (this.isGlobal(entity)) globals.push(mesh);
+      else objects.push(mesh);
     }
-    return found;
+    const useGlobals = globals.length > 0;
+    const chosen = useGlobals ? globals : objects;
+    const hidden = useGlobals ? objects : globals;
+    for (let i = 0; i < hidden.length; i++) hidden[i].visible = false;
+    const shown = this.shown;
+    shown.length = 0;
+    for (let i = 0; i < chosen.length; i++) shown.push(chosen[i]);
+    this.noteMeshes(globals.length, objects.length, shown.length);
+    return shown;
   }
 
-  private syncGrid(mesh: Mesh | null): void {
-    const position = mesh?.geometry?.getAttribute('position');
-    const index = mesh?.geometry?.getIndex();
-    if (!mesh || !position || !index) {
-      this.scan = null;
-      return;
+  private isGlobal(entity: Entity): boolean {
+    if (entity.getValue(XRMesh, 'isBounded3D') !== true) return true;
+    const stored = entity.getValue(XRMesh, 'semanticLabel');
+    const raw = entity.getValue(XRMesh, '_mesh') as { semanticLabel?: string } | null;
+    const label = `${typeof stored === 'string' ? stored : ''} ${raw?.semanticLabel ?? ''}`.toLowerCase();
+    return label.replace(/[_-]+/g, ' ').includes('global');
+  }
+
+  private noteMeshes(globals: number, objects: number, shown: number): void {
+    const key = `${globals}/${objects}/${shown}`;
+    if (key === this.meshLog) return;
+    this.meshLog = key;
+    console.info(`[jonze] room meshes: ${shown} shown, ${globals} global, ${objects} objects`);
+  }
+
+  private syncGrids(meshes: readonly Mesh[]): void {
+    let sig = '';
+    for (let i = 0; i < meshes.length; i++) {
+      const mesh = meshes[i];
+      const position = mesh.geometry.getAttribute('position');
+      const index = mesh.geometry.getIndex();
+      sig += `${mesh.id}:${position?.count ?? 0}:${index?.count ?? 0};`;
     }
-    if (this.scan && this.scan.mesh === mesh && this.scan.posCount === position.count && this.scan.indexCount === index.count) return;
-    const positions = this.packed(position);
-    const indices = index.array;
-    let minX = Infinity;
-    let minY = Infinity;
-    let minZ = Infinity;
-    let maxX = -Infinity;
-    let maxY = -Infinity;
-    let maxZ = -Infinity;
-    for (let i = 0; i < positions.length; i += 3) {
-      const x = positions[i];
-      const y = positions[i + 1];
-      const z = positions[i + 2];
-      if (x < minX) minX = x;
-      if (y < minY) minY = y;
-      if (z < minZ) minZ = z;
-      if (x > maxX) maxX = x;
-      if (y > maxY) maxY = y;
-      if (z > maxZ) maxZ = z;
+    if (sig === this.scanSig) return;
+    this.scanSig = sig;
+    this.scans.length = 0;
+    this.coarseTriangles = 0;
+    for (let i = 0; i < meshes.length; i++) {
+      const mesh = meshes[i];
+      const position = mesh.geometry.getAttribute('position');
+      if (!position || position.count < 3) continue;
+      const positions = this.packed(position);
+      const index = mesh.geometry.getIndex();
+      const indices = index ? index.array : this.sequence(position.count);
+      let minX = Infinity;
+      let minY = Infinity;
+      let minZ = Infinity;
+      let maxX = -Infinity;
+      let maxY = -Infinity;
+      let maxZ = -Infinity;
+      for (let v = 0; v < positions.length; v += 3) {
+        const x = positions[v];
+        const y = positions[v + 1];
+        const z = positions[v + 2];
+        if (x < minX) minX = x;
+        if (y < minY) minY = y;
+        if (z < minZ) minZ = z;
+        if (x > maxX) maxX = x;
+        if (y > maxY) maxY = y;
+        if (z > maxZ) maxZ = z;
+      }
+      if (!Number.isFinite(minX)) continue;
+      this.coarseTriangles += Math.floor((index ? index.count : position.count) / 3);
+      this.scans.push({
+        mesh,
+        positions,
+        index: indices,
+        grid: buildTriGrid(positions, indices, minX, minY, minZ, maxX, maxY, maxZ),
+        posCount: position.count,
+        indexCount: index ? index.count : position.count,
+      });
     }
-    if (!Number.isFinite(minX)) {
-      this.scan = null;
-      return;
-    }
-    this.scan = {
-      mesh,
-      positions,
-      index: indices,
-      grid: buildTriGrid(positions, indices, minX, minY, minZ, maxX, maxY, maxZ),
-      posCount: position.count,
-      indexCount: index.count,
-    };
+  }
+
+  private sequence(count: number): Uint32Array {
+    const out = new Uint32Array(count);
+    for (let i = 0; i < count; i++) out[i] = i;
+    return out;
   }
 
   private packed(position: { count: number; array: ArrayLike<number>; getX(i: number): number; getY(i: number): number; getZ(i: number): number }): ArrayLike<number> {
@@ -381,6 +447,7 @@ export class RoomStretchSystem extends createSystem({
     this.player.head.getWorldPosition(this.head);
     if (!this.pinchPoint(side, this.pinch)) return;
     if (!this.raycast(this.head, this.pinch)) return;
+    grab.mesh = this.hitMesh;
     grab.holding = true;
     grab.locked = false;
     grab.localG.copy(this.localHit);
@@ -424,32 +491,46 @@ export class RoomStretchSystem extends createSystem({
   }
 
   private raycast(origin: Vector3, through: Vector3): boolean {
-    const scan = this.scan;
-    if (!scan) return false;
-    const mesh = scan.mesh;
-    mesh.updateWorldMatrix(true, false);
-    this.inv.copy(mesh.matrixWorld).invert();
-    this.localO.copy(origin).applyMatrix4(this.inv);
-    this.localD.copy(through).applyMatrix4(this.inv).sub(this.localO);
-    const len = this.localD.length();
-    if (len < 1e-5) return false;
-    this.localD.multiplyScalar(1 / len);
-    if (!rayTriGrid(
-      scan.positions, scan.index, scan.grid,
-      this.localO.x, this.localO.y, this.localO.z,
-      this.localD.x, this.localD.y, this.localD.z,
-      this.hit,
-    )) return false;
-    if (this.hit.t > 12) return false;
-    this.localHit.copy(this.localO).addScaledVector(this.localD, this.hit.t);
-    triangleNormal(scan.positions, scan.index, this.hit.tri, this.localN);
-    if (this.localN.dot(this.localD) > 0) this.localN.negate();
+    let bestT = Infinity;
+    let bestTri = -1;
+    let bestScan: Scan | null = null;
+    for (let i = 0; i < this.scans.length; i++) {
+      const scan = this.scans[i];
+      const mesh = scan.mesh;
+      if (!mesh.parent) continue;
+      mesh.updateWorldMatrix(true, false);
+      this.inv.copy(mesh.matrixWorld).invert();
+      this.localO.copy(origin).applyMatrix4(this.inv);
+      this.localD.copy(through).applyMatrix4(this.inv).sub(this.localO);
+      const len = this.localD.length();
+      if (len < 1e-5) continue;
+      this.localD.multiplyScalar(1 / len);
+      if (!rayTriGrid(
+        scan.positions, scan.index, scan.grid,
+        this.localO.x, this.localO.y, this.localO.z,
+        this.localD.x, this.localD.y, this.localD.z,
+        this.hit,
+      )) continue;
+      if (this.hit.t >= bestT || this.hit.t > 12) continue;
+      bestT = this.hit.t;
+      bestTri = this.hit.tri;
+      bestScan = scan;
+      this.bestO.copy(this.localO);
+      this.bestD.copy(this.localD);
+    }
+    if (!bestScan) return false;
+    this.hit.t = bestT;
+    this.hit.tri = bestTri;
+    this.hitMesh = bestScan.mesh;
+    this.localHit.copy(this.bestO).addScaledVector(this.bestD, bestT);
+    triangleNormal(bestScan.positions, bestScan.index, bestTri, this.localN);
+    if (this.localN.dot(this.bestD) > 0) this.localN.negate();
     return true;
   }
 
   private poseGrab(grab: Grab): void {
-    const mesh = this.scan?.mesh;
-    if (!mesh || (!grab.holding && !grab.on)) return;
+    const mesh = grab.mesh;
+    if (!mesh?.parent || (!grab.holding && !grab.on)) return;
     mesh.updateWorldMatrix(true, false);
     grab.worldG.copy(grab.localG).applyMatrix4(mesh.matrixWorld);
     grab.normal.copy(grab.localNormal).transformDirection(mesh.matrixWorld);
@@ -499,6 +580,7 @@ export class RoomStretchSystem extends createSystem({
     grab.holding = false;
     grab.on = false;
     grab.locked = false;
+    grab.mesh = null;
     grab.target.set(0, 0, 0);
     grab.D.set(0, 0, 0);
     for (let i = 0; i < grab.springs.length; i++) grab.springs[i].reset(0);
@@ -599,9 +681,8 @@ export class RoomStretchSystem extends createSystem({
 
   private meshCopy(presenting: boolean): Copy {
     if (!presenting) return CARD.point;
-    if (!this.scan) return CARD.scan;
-    if (!this.overlay.ready) return CARD.meshing;
-    const triangles = this.overlay.triangles;
+    if (!this.scans.length) return CARD.scan;
+    const triangles = Math.max(this.coarseTriangles, this.overlay.ready ? this.overlay.triangles : 0);
     const count = triangles > 1000 ? `${Math.round(triangles / 1000)}k` : String(triangles);
     return { title: 'Room mesh', body: `${count} tris. Pinch and pull.` };
   }

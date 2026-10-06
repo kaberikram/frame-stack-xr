@@ -86,12 +86,7 @@ export class LauncherSystem extends createSystem({}) {
       modeStack.setAttribute('aria-selected', stackMode ? 'true' : 'false');
       modeStretch.setAttribute('aria-selected', stackMode ? 'false' : 'true');
       this.applyPreview(mode);
-      if (!stackMode) {
-        void stretch.armCamera().then((ok) => {
-          this.stretchHint = ok ? STRETCH_CAMERA : STRETCH_BLOCKED;
-          syncEnter();
-        });
-      }
+      if (!stackMode) this.armStretchCamera(stretch, syncEnter);
       if (stackMode) requestDepthModel();
       syncEnter();
     };
@@ -226,6 +221,27 @@ export class LauncherSystem extends createSystem({}) {
     stack.rate = autoRate(video.el.duration);
     rate.value = String(stack.rate);
     void stack.build(videoSource(video));
+  }
+
+  /**
+   * The desk preview needs a webcam. A headset already has passthrough, and
+   * opening the camera here paints that feed across the browser page.
+   */
+  private armStretchCamera(stretch: RoomStretchSystem, syncEnter: () => void): void {
+    const arm = () => {
+      void stretch.armCamera().then((ok) => {
+        this.stretchHint = ok ? STRETCH_CAMERA : STRETCH_BLOCKED;
+        syncEnter();
+      });
+    };
+    const xr = navigator.xr;
+    if (!xr) {
+      arm();
+      return;
+    }
+    void xr.isSessionSupported('immersive-ar').then((ok) => {
+      if (!ok && getMode() === 'stretch') arm();
+    });
   }
 
   private applyPreview(mode: ExperienceMode): void {
