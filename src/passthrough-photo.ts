@@ -83,6 +83,8 @@ export function cameraMount(label: string, facing: 'back' | 'front' | 'unknown')
  */
 export class PassthroughPhoto {
   readonly meshToClip = new Matrix4();
+  /** World-space points into the live camera's clip space. Updated by `projectLive`, not by a frozen capture. */
+  readonly worldToClip = new Matrix4();
   readonly camMesh = new Vector3();
   ready = false;
 
@@ -148,6 +150,19 @@ export class PassthroughPhoto {
     this.ready = false;
   }
 
+  /**
+   * Updates `worldToClip` for the camera that is playing right now.
+   * Leaves the frozen snapshot alone, so a pinch and this overlay can share one photo helper.
+   */
+  projectLive(req: Omit<PhotoCapture, 'objectWorld' | 'center'>): boolean {
+    const video = req.video;
+    if (!video || video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) return false;
+    if (req.presenting) this.fitLens(req, video.videoWidth, video.videoHeight);
+    else this.fitView(req.viewCamera);
+    this.worldToClip.copy(this.vp);
+    return true;
+  }
+
   /** Copies the current frame and bakes object-local points into that frame's clip space. */
   capture(req: PhotoCapture): boolean {
     if (req.video && this.drawVideo(req.video)) {
@@ -191,8 +206,10 @@ export class PassthroughPhoto {
   }
 
   private fitQuest(req: PhotoCapture): void {
-    const w = this.canvas.width;
-    const h = this.canvas.height;
+    this.fitLens(req, this.canvas.width, this.canvas.height);
+  }
+
+  private fitLens(req: Omit<PhotoCapture, 'objectWorld' | 'center'>, w: number, h: number): void {
     this.readLens(req.track, w, h);
     const xrCam = req.renderer.xr.getCamera() as ArrayCamera;
     xrCam.updateMatrixWorld(true);

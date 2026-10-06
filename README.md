@@ -28,7 +28,7 @@ Rest an index fingertip on a table and hold still for about a second. The slider
 
 Finish **Space Setup** on the headset first, allow the camera when the browser asks, then point anywhere in the scan and pinch.
 
-- The chunk is the mesh around your hand, not one labeled object. A couch pull includes the wall behind it.
+- In the headset the scanned triangles stay visible, tinted cooler than the passthrough, so you can check that the mesh sits on the room. Flat plane boxes stay hidden.
 - The face you grab decides the stretch direction.
 - The snapshot is what the passthrough camera saw at the pinch. The whole chunk's pixels widen into stripes along the pull.
 - Let go and it springs back, wobbling.

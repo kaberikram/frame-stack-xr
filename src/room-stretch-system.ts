@@ -24,8 +24,9 @@ import {
   type Object3D,
 } from '@iwsdk/core';
 import { getMode } from './experience.js';
-import { INK, drawHint, drawTag, makeCanvas, type Canvas2D } from './labels.js';
+import { INK, drawHint, makeCanvas, type Canvas2D } from './labels.js';
 import { cameraMount, PassthroughPhoto, type CameraMount } from './passthrough-photo.js';
+import { RoomMeshOverlay, type RoomMeshStats } from './room-mesh-overlay.js';
 import { StretchLook } from './stretch-component.js';
 import { Spring, buildTriGrid, pickPull, pointAabbGap, rayBox, rayTriGrid, type TriGrid } from './stretch-math.js';
 import { createStretchUniforms, shellMaterial, stretchMaterial, type StretchUniformSet } from './stretch-material.js';
@@ -89,7 +90,7 @@ const LOOK_KEYS = [
 
 const CARD = {
   point: { title: 'Point at the room', body: 'Pinch and pull. The mesh around your hand stretches, then springs back.' },
-  scan: { title: 'Finish Space Setup first', body: 'The headset needs its room scan before anything can stretch.' },
+  scan: { title: 'No room mesh yet', body: 'Finish Space Setup, then enter again.' },
 };
 
 /**
@@ -139,6 +140,9 @@ export class RoomStretchSystem extends createSystem({
   };
 
   private readonly photo = new PassthroughPhoto();
+  private readonly roomMesh = new RoomMeshOverlay(this.photo);
+  private roomStats: RoomMeshStats = { meshes: 0, triangles: 0, hasPhoto: false };
+  private cardKey = '';
   private cameraEntity: Entity | null = null;
   private mount: CameraMount = 'view';
   private arming: Promise<boolean> | null = null;
@@ -259,6 +263,7 @@ export class RoomStretchSystem extends createSystem({
   update(delta: number, time: number): void {
     if (getMode() !== 'stretch') {
       this.hud.visible = false;
+      this.roomMesh.hide();
       this.stopCamera();
       if (this.grab) this.release();
       this.active = null;
@@ -275,6 +280,19 @@ export class RoomStretchSystem extends createSystem({
     if (presenting) {
       this.player.head.getWorldPosition(this.head);
       this.player.head.getWorldQuaternion(this.headQuat);
+      const video = this.cameraVideo();
+      this.roomStats = this.roomMesh.show(this.queries.meshes.entities, {
+        renderer: this.renderer,
+        presenting: true,
+        frame: this.world.xrFrame,
+        refSpace: this.world.xrReferenceSpace,
+        video,
+        track: this.cameraTrack(video),
+        mount: this.mount,
+        viewCamera: this.camera,
+      });
+    } else {
+      this.roomMesh.hide();
     }
     if (time > this.nextScan) {
       this.collectTargets(presenting);
@@ -761,48 +779,18 @@ export class RoomStretchSystem extends createSystem({
   // ---------------------------------------------------------------- hint card and label
 
   private updateHud(dt: number, presenting: boolean): void {
-    const hover = this.hover;
-    const showTag = presenting && !!hover && !this.grab;
-    this.tag.visible = showTag;
-    if (showTag && hover) {
-      const t = hover.target;
-      const key = `${t.label}|${t.size.x.toFixed(2)}`;
-      if (key !== this.tagKey) {
-        this.tagKey = key;
-        drawTag(this.tagPaint, t.label, `${t.size.x.toFixed(2)} × ${t.size.y.toFixed(2)} × ${t.size.z.toFixed(2)} m`);
-        this.tagTex.needsUpdate = true;
-      }
-      t.object.updateWorldMatrix(true, false);
-      this.tmpA.copy(t.center);
-      this.tmpA.y += t.size.y / 2 + 0.07;
-      t.object.localToWorld(this.tmpA);
-      this.tag.position.copy(this.tmpA);
-      this.tag.lookAt(this.head);
-      // outline whatever is under the ray, so you can see what you're about to grab
-      t.object.matrixWorld.decompose(this.tmpB, this.tmpQ, this.tmpC);
-      if (!this.rig.visible) {
-        this.rig.visible = true;
-        this.slab.visible = false;
-        this.shell.visible = false;
-      }
-      if (!this.active) {
-        this.rig.position.copy(this.tmpB);
-        this.rig.quaternion.copy(this.tmpQ);
-        this.rig.scale.copy(this.tmpC);
-        this.outline.position.copy(t.center);
-        this.outline.scale.copy(t.size);
-        this.outline.visible = true;
-      }
-    } else if (!this.active) {
-      this.outline.visible = false;
-      this.rig.visible = false;
-    }
+    // The box outline was the unmapped square. The scan's own triangles are the thing to look at.
+    this.tag.visible = false;
+    this.outline.visible = false;
+    if (!this.active) this.rig.visible = false;
     this.slab.visible = true;
     this.shell.visible = true;
 
     const wantCard = presenting && !this.active && this.cardOpacity < 1.01;
-    const copy = presenting && !this.sawTargets ? CARD.scan : CARD.point;
-    if (copy !== this.cardShown) {
+    const copy = this.meshCopy(presenting);
+    const key = `${copy.title}|${copy.body}`;
+    if (key !== this.cardKey) {
+      this.cardKey = key;
       this.cardShown = copy;
       drawHint(this.cardPaint, copy.title, copy.body);
       this.cardTex.needsUpdate = true;
@@ -826,6 +814,17 @@ export class RoomStretchSystem extends createSystem({
       this.card.position.lerp(this.tmpA, 1 - Math.exp(-dt * 3));
     }
     this.card.lookAt(this.head);
+  }
+
+  private meshCopy(presenting: boolean): { title: string; body: string } {
+    if (!presenting || this.roomStats.meshes === 0) return presenting ? CARD.scan : CARD.point;
+    const triangles = this.roomStats.triangles;
+    const count = triangles > 1000 ? `${Math.round(triangles / 1000)}k` : String(triangles);
+    const tint = this.roomStats.hasPhoto ? 'cooler than the camera' : 'blue until the camera starts';
+    return {
+      title: 'Room mesh',
+      body: `${count} triangles, ${tint}.`,
+    };
   }
 
   private readLook(): void {
@@ -893,6 +892,7 @@ export class RoomStretchSystem extends createSystem({
     this.session?.removeEventListener('selectstart', this.onSelectStart);
     this.session?.removeEventListener('selectend', this.onSelectEnd);
     this.stopCamera();
+    this.roomMesh.dispose();
     this.photo.dispose();
     this.slab.geometry.dispose();
     (this.slab.material as { dispose(): void }).dispose();
