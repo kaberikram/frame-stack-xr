@@ -26,18 +26,20 @@ Rest an index fingertip on a table and hold still for about a second. The slider
 
 ### Jonze stretch
 
-Finish **Space Setup** on the headset first, allow the camera when the browser asks, then pinch the room and pull, with one hand or both.
+Finish **Space Setup** on the headset first, allow the camera when the page asks, then pinch the room and pull, with one hand or both.
 
-- The scanned room is drawn as a denser copy of the global mesh, tinted cooler than the camera until you pinch. Furniture boxes stay hidden.
-- Each pinch grabs the surface behind that hand. The spot follows your fingers, and the mesh around it bends like rubber.
-- A small pull looks stretched. A long pull turns the stretched part into stripes of the column you grabbed. Two hands blend in the middle.
-- The snapshot is a frame from before your hands covered the camera, when one is available.
-- Let go and that hand springs back. When both are at rest, the snapshot fades back to the idle tint.
-- Without a headset the same material runs on a stand-in room. The wardrobe pulls apart on its own, and a webcam stands in for passthrough.
+- At rest nothing is drawn: you see plain passthrough. Only the surface you pull is drawn, and it feathers back into the real room at its edges.
+- Pull sideways, up or down and the spot under your fingers slides along the surface. What's behind it stretches like taffy, and a longer pull turns into streaks of the column you grabbed.
+- Pull toward yourself and the surface bursts outward from your fingers in streaks, with a slight lift toward you.
+- Let go and that hand springs back with a wobble. Two hands work together: the second one grabs what you see after the first one has stretched it.
+- The pull plays notes. A pinch strums a chord, pulling climbs a pentatonic scale, streaks add a sparkle, and letting go falls back and lands on a home chord. Each hand's notes come from the spot it grabbed.
+- The picture comes from a small bank of camera frames taken while your head was steady, with your hands boxed out. A grab picks the cleanest recent frame that covers the spot, so your own hand doesn't end up in the streaks. Look around for a second after entering.
+- Without a headset, `?preview=1` (or any browser without passthrough) runs the same material on a stand-in room. The wardrobe pulls apart on its own, and a webcam stands in for passthrough.
 
 ## Tuning
 
 - `src/layout.ts`: stack size, strip length, touch and hover heights.
 - The `FrameStack` component (scene JSON or the editor inspector): ghost, trail, length, lift, feather, glow.
-- The `StretchLook` component: pull gain, sideways reach, stretch ramp, where stripes start, photo feather, wobble, spring stiffness and damping, and the idle tint (0 hides the mesh until you pull).
+- The `StretchLook` component: pull gain, sideways reach, stretch ramp, where stripes start, photo feather, wobble, spring stiffness and damping, the toward-you burst and lift, and the pinch ripple.
+- Matching the camera to passthrough, also in `StretchLook`: photo exposure and warmth, camera focal scale and pitch, and camera latency. Turn on **Calibrate** to checker the live camera over the room, then adjust until the squares line up with the real room and match its colour.
 - `MAX_LAYERS` in `src/frame-stack-system.ts`: raise it if the headset holds frame rate.

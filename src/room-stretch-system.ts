@@ -4,6 +4,7 @@ import {
   CameraSource,
   CameraState,
   CameraUtils,
+  CanvasTexture,
   Group,
   Matrix4,
   Mesh,
@@ -12,25 +13,67 @@ import {
   Quaternion,
   SRGBColorSpace,
   Vector3,
+  VisibilityState,
   XRMesh,
-  CanvasTexture,
   createSystem,
+  outlineMaterial,
+  type ArrayCamera,
   type CameraDeviceInfo,
   type Entity,
 } from '@iwsdk/core';
-import { getMode } from './experience.js';
+import { PREVIEW_FORCED, getMode } from './experience.js';
 import { HandOccluder } from './hand-occluder.js';
 import { drawHint, makeCanvas, type Canvas2D } from './labels.js';
-import { cameraMount, PassthroughPhoto, type CameraMount, type PhotoCapture } from './passthrough-photo.js';
+import { cameraMount, PassthroughPhoto, type CameraMount, type HandJoints } from './passthrough-photo.js';
 import { RoomMeshOverlay } from './room-mesh-overlay.js';
 import { StretchLook } from './stretch-component.js';
-import { Spring, buildTriGrid, rayTriGrid, triangleNormal, type RayHit, type TriGrid } from './stretch-math.js';
+import { Spring, averageNormal, buildTriGrid, rayTriGrid, triangleNormal, type RayHit, type TriGrid } from './stretch-math.js';
 import type { RubberUniformSet } from './stretch-material.js';
+import { StretchSound } from './stretch-sound.js';
 
 type Side = 'left' | 'right';
-/** Hand motion below this does not pull. The axis locks once the hand has moved this far. */
+const SIDES: readonly Side[] = ['left', 'right'];
+
+/** Hand travel below half of this does nothing; full response at one and a half. */
 const DEAD = 0.03;
-const LOCK = 0.06;
+/** Rigid chunk that rides ahead of the pinch, metres. */
+const AHEAD = 0.3;
+/** Slides beyond SLIDE_SOFT ease into SLIDE_MAX. */
+const SLIDE_SOFT = 1;
+const SLIDE_MAX = 1.5;
+/** The pinch ray must meet the grabbed plane within ~78° of its normal to slide. */
+const GRAZE = 0.2;
+/** Toward-you travel ignored, and how much sideways travel cancels it (a shoulder sweep shortens reach too). */
+const TOWARD_DEAD = 0.02;
+const LATERAL_SHARE = 0.35;
+const EXPLODE_MAX = 0.8;
+const LIFT_MAX = 0.08;
+/** The burst's rim stays inside ~25° of the grab point, so a full pull never fills the view. */
+const BURST_ANGLE = Math.tan((25 * Math.PI) / 180);
+/** Slide plus burst. Past this, scan triangles start to sliver. */
+const PULL_MAX = 1.8;
+/** While held, the surface follows the fingers with this time constant (s): direct, minus jitter. */
+const FOLLOW = 0.025;
+/** The slide stops before the grab point leaves its photo by less than this uv margin. */
+const SLIDE_MARGIN = 0.1;
+const RIPPLE_SECONDS = 0.8;
+/** Scan normals are averaged over this radius around the hit. */
+const NORMAL_RADIUS = 0.12;
+/** A hand that loses tracking while holding keeps its pull this long, then lets go. */
+const LOST_RELEASE = 0.5;
+/** A pinch waits this long for the hand joints before it is dropped. */
+const PENDING_GIVEUP = 0.3;
+/** Re-pinching a surface that is still springing settles it this fast first. */
+const SETTLE_STIFF = 1200;
+const SETTLE_DAMP = 70;
+const SETTLE_MAX = 0.12;
+const FADE_IN = 0.12;
+const FOOTPRINT = 9;
+/** Matches the shader's streak ramp and burst core. */
+const STRIPE_WIDTH = 0.6;
+const CORE = 0.12;
+const CARD_DISTANCE = 1.2;
+const CARD_RISE = Math.sin((10 * Math.PI) / 180);
 
 interface Look {
   gain: number;
@@ -43,67 +86,116 @@ interface Look {
   waveSpeed: number;
   stiffness: number;
   damping: number;
-  meshTint: number;
+  depthPull: number;
+  radial: number;
+  ripple: number;
+  exposure: number;
+  warmth: number;
+  lensScale: number;
+  lensPitch: number;
+  cameraLatency: number;
+  calibrate: boolean;
+  linearBlend: boolean;
 }
-const LOOK_KEYS = [
+const NUMBER_KEYS = [
   'gain', 'reach', 'ramp', 'stripes', 'feather', 'wobble', 'waveLength', 'waveSpeed',
-  'stiffness', 'damping', 'meshTint',
+  'stiffness', 'damping', 'depthPull', 'radial', 'ripple', 'exposure', 'warmth',
+  'lensScale', 'lensPitch', 'cameraLatency',
 ] as const;
 
 interface Grab {
+  side: Side;
+  /** Photo slot and sound voice. Left is 0. */
+  slot: 0 | 1;
+  /** Pinched, waiting for the next frame's hand joints to resolve where. */
+  pending: boolean;
+  pendingAt: number;
   holding: boolean;
   on: boolean;
-  locked: boolean;
+  /** Order of grabbing. The earlier grab bends first, so the later one grabs what you see. */
+  seq: number;
   mesh: Mesh | null;
-  worldG: Vector3;
   localG: Vector3;
-  axis: Vector3;
-  normal: Vector3;
+  worldG: Vector3;
   localNormal: Vector3;
+  normal: Vector3;
   hand0: Vector3;
+  /** Head-to-hand direction at the pinch. Travel across it is sideways, not toward you. */
+  ray0: Vector3;
+  reach0: number;
+  lift: Vector3;
   target: Vector3;
   D: Vector3;
-  springs: [Spring, Spring, Spring];
+  Dprev: Vector3;
+  Dvel: Vector3;
+  axis: Vector3;
+  axisRel: Vector3;
+  E: number;
+  Evel: number;
+  B: number;
+  Bvel: number;
+  explodeTo: number;
+  liftTo: number;
+  springs: [Spring, Spring, Spring, Spring, Spring];
   A: number;
+  rippleT: number;
+  lostT: number;
+  fade: number;
 }
 
-interface Scan {
-  mesh: Mesh;
-  positions: ArrayLike<number>;
-  index: ArrayLike<number>;
-  grid: TriGrid;
-  posCount: number;
-  indexCount: number;
+const enum Card {
+  None,
+  Pinch,
+  Scan,
+  Spatial,
+  Camera,
 }
-
-interface Copy {
-  title: string;
-  body: string;
-}
-const CARD = {
-  point: { title: 'Pinch the room', body: 'Pull with one hand or both.' },
-  scan: { title: 'No room mesh yet', body: 'Finish Space Setup and enter again.' },
+const COPY: Record<Card, { title: string; body: string }> = {
+  [Card.None]: { title: '', body: '' },
+  [Card.Pinch]: { title: 'Pinch anything and pull', body: 'Sideways stretches. Toward you bursts.' },
+  [Card.Scan]: { title: 'No room mesh yet', body: 'Finish Space Setup, then enter again.' },
+  [Card.Spatial]: { title: 'Room scan is off', body: 'Allow spatial data, then enter again.' },
+  [Card.Camera]: { title: 'Camera is off', body: 'Allow the camera, then enter again.' },
 };
 
 const WARDROBE = { x: -0.75, y: 1, z: -1.7, sx: 0.9, sy: 2, sz: 0.55 };
 const FRONT_Z = WARDROBE.z + WARDROBE.sz / 2;
 
-function makeGrab(): Grab {
+function makeGrab(side: Side): Grab {
   return {
+    side,
+    slot: side === 'left' ? 0 : 1,
+    pending: false,
+    pendingAt: 0,
     holding: false,
     on: false,
-    locked: false,
+    seq: 0,
     mesh: null,
-    worldG: new Vector3(),
     localG: new Vector3(),
-    axis: new Vector3(0, 1, 0),
-    normal: new Vector3(0, 0, 1),
+    worldG: new Vector3(),
     localNormal: new Vector3(0, 0, 1),
+    normal: new Vector3(0, 0, 1),
     hand0: new Vector3(),
+    ray0: new Vector3(0, 0, -1),
+    reach0: 0.45,
+    lift: new Vector3(0, 0, 1),
     target: new Vector3(),
     D: new Vector3(),
-    springs: [new Spring(), new Spring(), new Spring()],
-    A: 0.1,
+    Dprev: new Vector3(),
+    Dvel: new Vector3(),
+    axis: new Vector3(1, 0, 0),
+    axisRel: new Vector3(1, 0, 0),
+    E: 0,
+    Evel: 0,
+    B: 0,
+    Bvel: 0,
+    explodeTo: 0,
+    liftTo: 0,
+    springs: [new Spring(), new Spring(), new Spring(), new Spring(), new Spring()],
+    A: AHEAD,
+    rippleT: 10,
+    lostT: 0,
+    fade: 0,
   };
 }
 
@@ -113,45 +205,58 @@ function smooth(t: number): number {
 }
 
 /**
- * Pinch the scanned room and pull. Each hand grabs the surface behind the pinch,
- * that spot follows the hand, and the mesh around it bends. A long pull turns the
- * stretched part into stripes of the column that was grabbed.
+ * Pinch the scanned room and pull. Each hand grabs the surface behind the pinch. Sideways pulls
+ * slide that spot along the surface and stretch what is behind it into streaks; pulling toward
+ * you bursts the surface outward from the pinch. At rest nothing is drawn: plain passthrough.
  */
 export class RoomStretchSystem extends createSystem({
   settings: { required: [StretchLook] },
   meshes: { required: [XRMesh] },
 }) {
-  private readonly left = makeGrab();
-  private readonly right = makeGrab();
-  private readonly demoL = makeGrab();
-  private readonly demoR = makeGrab();
-  private readonly scans: Scan[] = [];
+  private readonly left = makeGrab('left');
+  private readonly right = makeGrab('right');
+  private readonly demoL = makeGrab('left');
+  private readonly demoR = makeGrab('right');
+  private readonly scans: TriScan[] = [];
+  private readonly scanIds: number[] = [];
   private readonly globalMeshes: Mesh[] = [];
   private readonly objects: Mesh[] = [];
   private readonly shown: Mesh[] = [];
+  private readonly globalCache = new WeakMap<Entity, boolean>();
   private readonly hit: RayHit = { t: Infinity, tri: -1 };
   private hitMesh: Mesh | null = null;
-  private scanSig = '';
-  private meshLog = '';
-  private coarseTriangles = 0;
+  private meshLog = -1;
   /** Desk-only stand-in. A headset that can enter passthrough must not show it. */
-  private previewRoom = typeof navigator === 'undefined' || !navigator.xr;
-  private reveal = 0;
+  private previewRoom = PREVIEW_FORCED || typeof navigator === 'undefined' || !navigator.xr;
+  private wasPresenting = false;
+  private presentedAt = 0;
   private demoT = 0;
+  private grabSeq = 0;
   private session: XRSession | null = null;
+  private refSpace: XRReferenceSpace | null = null;
+  private outlineShown = true;
   private readonly look: Look = {
-    gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.5, feather: 0.06, wobble: 0.04,
-    waveLength: 0.45, waveSpeed: 7, stiffness: 90, damping: 9, meshTint: 0.85,
+    gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.2, feather: 0.12, wobble: 0.035,
+    waveLength: 0.45, waveSpeed: 7, stiffness: 90, damping: 9, depthPull: 0.35, radial: 2.5,
+    ripple: 0.015, exposure: 1.1, warmth: -0.1, lensScale: 1, lensPitch: -15, cameraLatency: 0.07,
+    calibrate: false, linearBlend: true,
   };
 
   private readonly photo = new PassthroughPhoto();
+  private readonly sound = new StretchSound();
   private overlay!: RoomMeshOverlay;
   private hands!: HandOccluder;
   private readonly handMap: { left: XRHand | null; right: XRHand | null } = { left: null, right: null };
+  private readonly joints: HandJoints = { points: new Float32Array(0), leftStart: 0, leftCount: 0, rightStart: 0, rightCount: 0 };
   private room!: Group;
   private cameraEntity: Entity | null = null;
+  private cameraWanted = false;
+  private rearmAt = 0;
+  private rearmTries = 0;
   private mount: CameraMount = 'view';
   private arming: Promise<boolean> | null = null;
+  private trackVideo: HTMLVideoElement | null = null;
+  private track: MediaStreamTrack | null = null;
 
   private hud!: Group;
   private hudEntity!: Entity;
@@ -159,16 +264,21 @@ export class RoomStretchSystem extends createSystem({
   private cardMat!: MeshBasicMaterial;
   private cardPaint!: Canvas2D;
   private cardTex!: CanvasTexture;
-  private cardKey = '';
-  private cardShown: Copy = CARD.point;
+  private cardShown = Card.None;
   private cardOpacity = 0;
   private cardSettled = false;
+  private pinched = false;
 
+  private readonly footprint = new Float32Array(FOOTPRINT * 3);
   private readonly head = new Vector3();
   private readonly headQuat = new Quaternion();
   private readonly pinch = new Vector3();
   private readonly raw = new Vector3();
   private readonly unit = new Vector3();
+  private readonly tmp = new Vector3();
+  private readonly tmp2 = new Vector3();
+  private readonly tanU = new Vector3();
+  private readonly tanV = new Vector3();
   private readonly localO = new Vector3();
   private readonly localD = new Vector3();
   private readonly localHit = new Vector3();
@@ -178,10 +288,11 @@ export class RoomStretchSystem extends createSystem({
   private readonly inv = new Matrix4();
 
   init(): void {
-    this.overlay = new RoomMeshOverlay(this.photo, this.scene);
+    this.overlay = new RoomMeshOverlay(this.scene);
     this.hands = new HandOccluder(this.scene);
+    this.joints.points = this.hands.points;
     this.buildRoom();
-    if (navigator.xr) {
+    if (navigator.xr && !PREVIEW_FORCED) {
       void navigator.xr.isSessionSupported('immersive-ar').then((ok) => {
         this.previewRoom = !ok;
       });
@@ -192,7 +303,8 @@ export class RoomStretchSystem extends createSystem({
     this.cardPaint = makeCanvas(1024, 256);
     this.cardTex = new CanvasTexture(this.cardPaint.canvas);
     this.cardTex.colorSpace = SRGBColorSpace;
-    this.cardMat = new MeshBasicMaterial({ map: this.cardTex, transparent: true, depthWrite: false, depthTest: false, opacity: 0 });
+    // Depth-tested so the depth-only hand spheres hide it behind your fingers.
+    this.cardMat = new MeshBasicMaterial({ map: this.cardTex, transparent: true, depthWrite: false, depthTest: true, opacity: 0 });
     this.card = new Mesh(new PlaneGeometry(0.46, 0.115), this.cardMat);
     this.card.renderOrder = 10;
     this.card.visible = false;
@@ -200,20 +312,25 @@ export class RoomStretchSystem extends createSystem({
     this.hudEntity = this.world.createTransformEntity(this.hud);
 
     this.demoL.worldG.set(WARDROBE.x - 0.18, 1.2, FRONT_Z);
-    this.demoL.axis.set(-1, 0, 0);
-    this.demoL.A = 3;
     this.demoR.worldG.set(WARDROBE.x + 0.18, 1.2, FRONT_Z);
-    this.demoR.axis.set(1, 0, 0);
-    this.demoR.A = 3;
+    this.demoL.seq = 1;
+    this.demoR.seq = 2;
 
-    this.cleanupFuncs.push(() => this.dispose());
+    this.cleanupFuncs.push(
+      () => this.dispose(),
+      this.queries.meshes.subscribe('qualify', (entity) => {
+        this.globalCache.set(entity, this.isGlobal(entity));
+      }),
+      this.queries.meshes.subscribe('disqualify', (entity) => {
+        this.globalCache.delete(entity);
+      }),
+      this.visibilityState.subscribe((state) => {
+        if (state !== VisibilityState.Visible) this.pause();
+      }),
+    );
     void document.fonts.ready.then(() => {
-      this.cardKey = '';
-      drawHint(this.cardPaint, this.cardShown.title, this.cardShown.body);
-      this.cardTex.needsUpdate = true;
+      if (this.cardShown !== Card.None) this.paintCard(this.cardShown);
     });
-    drawHint(this.cardPaint, CARD.point.title, CARD.point.body);
-    this.cardTex.needsUpdate = true;
   }
 
   /**
@@ -221,6 +338,7 @@ export class RoomStretchSystem extends createSystem({
    * prompt keeps the user gesture. Safe to call again.
    */
   armCamera(): Promise<boolean> {
+    this.cameraWanted = true;
     if (this.cameraEntity) return Promise.resolve(true);
     if (this.arming) return this.arming;
     this.arming = CameraUtils.getDevices()
@@ -235,62 +353,90 @@ export class RoomStretchSystem extends createSystem({
     return this.arming;
   }
 
+  /** Call from the Enter click so the pull can sing in the headset. */
+  unlockAudio(): void {
+    this.sound.unlock();
+  }
+
   update(delta: number, time: number): void {
-    if (getMode() !== 'stretch') {
+    const stretch = getMode() === 'stretch';
+    this.syncOutline(stretch);
+    if (!stretch) {
       this.hud.visible = false;
       this.room.visible = false;
       this.overlay.hide(true);
       this.hands.setActive(false);
       this.stopCamera();
       this.clearGrabs();
+      this.sound.stop();
       return;
     }
     const dt = Math.min(0.1, delta);
-    if (this.cameraEntity && this.cameraEntity.getValue(CameraSource, 'state') === CameraState.Error) this.stopCamera();
+    const now = performance.now() / 1000;
     this.readLook();
-    this.syncSession();
+    this.syncSession(now);
     const presenting = this.renderer.xr.isPresenting;
     const video = this.cameraVideo();
-    const req = this.captureReq(video);
-    const live = this.photo.projectLive(req);
-    this.overlay.setLive(video, live, this.photo.worldToClip);
+    const hasVideo = this.photo.watch(video, this.cameraTrack(video), now);
+    this.applyLook();
     if (presenting) {
+      this.wasPresenting = true;
       this.room.visible = false;
       this.player.head.getWorldPosition(this.head);
       this.player.head.getWorldQuaternion(this.headQuat);
+      this.photo.recordHead(this.player.head, now);
+      this.photo.measureMount(this.mount, this.player.head, (this.renderer.xr.getCamera() as ArrayCamera).cameras);
       this.refreshHands();
       const meshes = this.findMeshes();
-      this.overlay.sync(meshes);
       this.syncGrids(meshes);
-      const handsInFrame = this.hands.jointCount > 0 && this.photo.jointsInFrame(this.hands.points, this.hands.jointCount);
-      this.photo.keepClean(video, !handsInFrame);
-      this.poseGrab(this.left);
-      this.poseGrab(this.right);
-      this.stepHand(this.left, dt, 'left');
-      this.stepHand(this.right, dt, 'right');
-      this.publish(this.left, this.right, dt, time);
+      this.photo.capture(true, this.camera, this.handJoints(), this.handsKnown(), now);
+      this.resolvePending(this.left, dt, now);
+      this.resolvePending(this.right, dt, now);
+      this.stepHand(this.left, dt);
+      this.stepHand(this.right, dt);
+      if (this.look.calibrate) this.photo.refreshLive(0, true, this.camera, now);
+      const active = this.left.on || this.right.on || this.look.calibrate;
+      this.overlay.setActive(active);
+      this.overlay.sync(meshes);
+      this.hands.inflate = this.left.holding || this.right.holding ? 1.3 : 1;
+      this.publish(this.left, this.right, time, hasVideo);
+      this.sing(this.left);
+      this.sing(this.right);
+      this.rearmCamera(now);
     } else if (!this.previewRoom) {
+      // A headset back on the launch page. Leaving a session stops the camera; the frames
+      // between the Enter click and the session starting must not.
       this.room.visible = false;
       this.overlay.hide(false);
       this.hands.setActive(false);
       this.hud.visible = false;
+      this.sound.stop();
+      if (this.wasPresenting) {
+        this.wasPresenting = false;
+        this.stopCamera();
+        this.clearGrabs();
+      }
       return;
     } else {
       this.overlay.hide(false);
       this.hands.setActive(false);
       this.room.visible = true;
-      this.photo.keepClean(video, true);
-      this.updateDemo(dt, video);
-      this.publish(this.demoL, this.demoR, dt, time);
+      this.sound.stop();
+      const live = this.photo.projectLive(false, this.camera, now);
+      this.photo.capture(false, this.camera, null, true, now);
+      this.updateDemo(dt, now);
+      if (this.look.calibrate) this.photo.refreshLive(0, false, this.camera, now);
+      this.overlay.setPreviewLive(video, live, this.photo.worldToClip);
+      this.publish(this.demoL, this.demoR, time, hasVideo);
     }
     this.hud.visible = true;
-    this.updateHud(dt, presenting);
+    this.updateHud(dt, presenting, hasVideo, now);
   }
 
   // ---------------------------------------------------------------- room
 
   private buildRoom(): void {
-    const mat = this.overlay.material;
+    const mat = this.overlay.previewMaterial;
     this.room = new Group();
     this.room.name = 'stretch-stand-in';
     const add = (mesh: Mesh) => {
@@ -317,9 +463,8 @@ export class RoomStretchSystem extends createSystem({
 
   /**
    * Quest often delivers the room as separate object meshes, and only labels one
-   * of them "global mesh". Hiding the rest left the headset with nothing to draw
-   * and a "finish Space Setup" card. Prefer the global mesh when it is actually
-   * there; otherwise draw every scanned mesh.
+   * of them "global mesh". Prefer the global mesh when it is actually there;
+   * otherwise draw every scanned mesh.
    */
   private findMeshes(): readonly Mesh[] {
     const globals = this.globalMeshes;
@@ -330,13 +475,20 @@ export class RoomStretchSystem extends createSystem({
       const mesh = entity.object3D as Mesh | null;
       const position = mesh?.geometry?.getAttribute('position');
       if (!mesh?.isMesh || !position || position.count < 3) continue;
-      if (this.isGlobal(entity)) globals.push(mesh);
+      let global = this.globalCache.get(entity);
+      if (global === undefined) {
+        global = this.isGlobal(entity);
+        this.globalCache.set(entity, global);
+      }
+      if (global) globals.push(mesh);
       else objects.push(mesh);
     }
     const useGlobals = globals.length > 0;
     const chosen = useGlobals ? globals : objects;
     const hidden = useGlobals ? objects : globals;
-    for (let i = 0; i < hidden.length; i++) hidden[i].visible = false;
+    for (let i = 0; i < hidden.length; i++) {
+      if (hidden[i].visible) hidden[i].visible = false;
+    }
     const shown = this.shown;
     shown.length = 0;
     for (let i = 0; i < chosen.length; i++) shown.push(chosen[i]);
@@ -353,30 +505,32 @@ export class RoomStretchSystem extends createSystem({
   }
 
   private noteMeshes(globals: number, objects: number, shown: number): void {
-    const key = `${globals}/${objects}/${shown}`;
+    const key = globals * 1e6 + objects * 1e3 + shown;
     if (key === this.meshLog) return;
     this.meshLog = key;
     console.info(`[jonze] room meshes: ${shown} shown, ${globals} global, ${objects} objects`);
   }
 
   private syncGrids(meshes: readonly Mesh[]): void {
-    let sig = '';
+    const ids = this.scanIds;
+    let same = ids.length === meshes.length * 3;
+    for (let i = 0; same && i < meshes.length; i++) {
+      const mesh = meshes[i];
+      same =
+        ids[i * 3] === mesh.id &&
+        ids[i * 3 + 1] === (mesh.geometry.getAttribute('position')?.count ?? 0) &&
+        ids[i * 3 + 2] === (mesh.geometry.getIndex()?.count ?? 0);
+    }
+    if (same) return;
+    ids.length = 0;
+    this.scans.length = 0;
     for (let i = 0; i < meshes.length; i++) {
       const mesh = meshes[i];
       const position = mesh.geometry.getAttribute('position');
       const index = mesh.geometry.getIndex();
-      sig += `${mesh.id}:${position?.count ?? 0}:${index?.count ?? 0};`;
-    }
-    if (sig === this.scanSig) return;
-    this.scanSig = sig;
-    this.scans.length = 0;
-    this.coarseTriangles = 0;
-    for (let i = 0; i < meshes.length; i++) {
-      const mesh = meshes[i];
-      const position = mesh.geometry.getAttribute('position');
+      ids.push(mesh.id, position?.count ?? 0, index?.count ?? 0);
       if (!position || position.count < 3) continue;
       const positions = this.packed(position);
-      const index = mesh.geometry.getIndex();
       const indices = index ? index.array : this.sequence(position.count);
       let minX = Infinity;
       let minY = Infinity;
@@ -396,14 +550,11 @@ export class RoomStretchSystem extends createSystem({
         if (z > maxZ) maxZ = z;
       }
       if (!Number.isFinite(minX)) continue;
-      this.coarseTriangles += Math.floor((index ? index.count : position.count) / 3);
       this.scans.push({
         mesh,
         positions,
         index: indices,
         grid: buildTriGrid(positions, indices, minX, minY, minZ, maxX, maxY, maxZ),
-        posCount: position.count,
-        indexCount: index ? index.count : position.count,
       });
     }
   }
@@ -425,50 +576,73 @@ export class RoomStretchSystem extends createSystem({
     return out;
   }
 
-  // ---------------------------------------------------------------- hands and grabs
+  // ---------------------------------------------------------------- session and lifecycle
 
-  private syncSession(): void {
+  private syncSession(now: number): void {
     const session = this.xrManager.getSession() ?? null;
-    if (session === this.session) return;
-    this.session?.removeEventListener('selectstart', this.onSelectStart);
-    this.session?.removeEventListener('selectend', this.onSelectEnd);
-    session?.addEventListener('selectstart', this.onSelectStart);
-    session?.addEventListener('selectend', this.onSelectEnd);
-    this.session = session;
+    if (session !== this.session) {
+      this.session?.removeEventListener('selectstart', this.onSelectStart);
+      this.session?.removeEventListener('selectend', this.onSelectEnd);
+      session?.addEventListener('selectstart', this.onSelectStart);
+      session?.addEventListener('selectend', this.onSelectEnd);
+      this.session = session;
+      this.clearGrabs();
+      this.photo.clear();
+      this.pinched = false;
+      this.presentedAt = now;
+      this.rearmTries = 0;
+    }
+    const space = this.world.xrReferenceSpace ?? null;
+    if (space !== this.refSpace) {
+      this.refSpace?.removeEventListener('reset', this.onReset);
+      space?.addEventListener('reset', this.onReset);
+      this.refSpace = space;
+    }
   }
 
+  /** Recentring moves the world under every stored photo. */
+  private readonly onReset = (): void => {
+    this.clearGrabs();
+    this.photo.clear();
+  };
+
+  /** The system menu, a blur, or the headset coming off: let go and go quiet. */
+  private pause(): void {
+    this.left.pending = false;
+    this.right.pending = false;
+    if (this.left.holding) this.release(this.left);
+    if (this.right.holding) this.release(this.right);
+    this.sound.stop();
+  }
+
+  private syncOutline(stretch: boolean): void {
+    // IWSDK's white hand outline is shared by every mode; in stretch mode the real hands are enough.
+    const want = !stretch;
+    if (this.outlineShown === want) return;
+    this.outlineShown = want;
+    outlineMaterial.visible = want;
+  }
+
+  // ---------------------------------------------------------------- hands and grabs
+
+  /** Select events arrive outside the XR frame, where hand joints can't be read. Resolve them next update. */
   private readonly onSelectStart = (event: Event): void => {
-    if (getMode() !== 'stretch' || !this.renderer.xr.isPresenting) return;
+    if (getMode() !== 'stretch' || !this.renderer.xr.isPresenting || this.look.calibrate) return;
     const side = (event as XRInputSourceEvent).inputSource?.handedness;
     if (side !== 'left' && side !== 'right') return;
     const grab = side === 'left' ? this.left : this.right;
-    if (grab.holding) return;
-    this.refreshHands();
-    this.player.head.getWorldPosition(this.head);
-    if (!this.pinchPoint(side, this.pinch)) return;
-    if (!this.raycast(this.head, this.pinch)) return;
-    grab.mesh = this.hitMesh;
-    grab.holding = true;
-    grab.locked = false;
-    grab.localG.copy(this.localHit);
-    grab.localNormal.copy(this.localN);
-    grab.hand0.copy(this.pinch);
-    grab.target.set(0, 0, 0);
-    grab.D.set(0, 0, 0);
-    grab.A = 0.1;
-    for (let i = 0; i < grab.springs.length; i++) grab.springs[i].reset(0);
-    this.poseGrab(grab);
-    const other = side === 'left' ? this.right : this.left;
-    const video = this.cameraVideo();
-    this.photo.projectLive(this.captureReq(video));
-    this.photo.freezeWorld(video, grab.worldG, this.photo.ready && (other.holding || other.on));
+    if (grab.holding || grab.pending) return;
+    this.sound.unlock();
+    grab.pending = true;
+    grab.pendingAt = performance.now() / 1000;
   };
 
   private readonly onSelectEnd = (event: Event): void => {
     const side = (event as XRInputSourceEvent).inputSource?.handedness;
     if (side !== 'left' && side !== 'right') return;
     const grab = side === 'left' ? this.left : this.right;
-    grab.holding = false;
+    grab.pending = false;
+    if (grab.holding) this.release(grab);
   };
 
   private refreshHands(): void {
@@ -479,11 +653,31 @@ export class RoomStretchSystem extends createSystem({
     this.hands.update(this.world.xrFrame, this.world.xrReferenceSpace, this.player.matrixWorld, this.handMap);
   }
 
+  private handJoints(): HandJoints {
+    const j = this.joints;
+    j.leftStart = this.hands.leftStart;
+    j.leftCount = this.hands.leftCount;
+    j.rightStart = this.hands.rightStart;
+    j.rightCount = this.hands.rightCount;
+    return j;
+  }
+
+  /** False while a hand that should be tracked isn't: it could be anywhere in a camera frame. */
+  private handsKnown(): boolean {
+    for (let i = 0; i < SIDES.length; i++) {
+      const side = SIDES[i];
+      if (this.handMap[side] && !this.hands.hasPinch[side]) return false;
+    }
+    return true;
+  }
+
+  /** Thumb and index midpoint for a tracked hand; the ray origin for a controller. */
   private pinchPoint(side: Side, out: Vector3): boolean {
     if (this.hands.hasPinch[side]) {
       out.copy(this.hands.thumbTip[side]).add(this.hands.indexTip[side]).multiplyScalar(0.5);
       return true;
     }
+    if (this.handMap[side]) return false;
     const ray = this.player.raySpaces[side];
     if (!ray) return false;
     ray.getWorldPosition(out);
@@ -493,7 +687,7 @@ export class RoomStretchSystem extends createSystem({
   private raycast(origin: Vector3, through: Vector3): boolean {
     let bestT = Infinity;
     let bestTri = -1;
-    let bestScan: Scan | null = null;
+    let bestScan: TriScan | null = null;
     for (let i = 0; i < this.scans.length; i++) {
       const scan = this.scans[i];
       const mesh = scan.mesh;
@@ -524,6 +718,11 @@ export class RoomStretchSystem extends createSystem({
     this.hitMesh = bestScan.mesh;
     this.localHit.copy(this.bestO).addScaledVector(this.bestD, bestT);
     triangleNormal(bestScan.positions, bestScan.index, bestTri, this.localN);
+    averageNormal(
+      bestScan.positions, bestScan.index, bestScan.grid,
+      this.localHit.x, this.localHit.y, this.localHit.z, NORMAL_RADIUS,
+      this.localN.x, this.localN.y, this.localN.z, this.localN,
+    );
     if (this.localN.dot(this.bestD) > 0) this.localN.negate();
     return true;
   }
@@ -536,58 +735,223 @@ export class RoomStretchSystem extends createSystem({
     grab.normal.copy(grab.localNormal).transformDirection(mesh.matrixWorld);
   }
 
-  private stepHand(grab: Grab, dt: number, side: Side): void {
-    if (grab.holding && this.pinchPoint(side, this.pinch)) this.aim(grab, this.pinch);
-    else if (!grab.holding) grab.target.set(0, 0, 0);
-    const { stiffness, damping } = this.look;
-    grab.springs[0].step(grab.target.x, dt, stiffness, damping);
-    grab.springs[1].step(grab.target.y, dt, stiffness, damping);
-    grab.springs[2].step(grab.target.z, dt, stiffness, damping);
-    grab.D.set(grab.springs[0].value, grab.springs[1].value, grab.springs[2].value);
-    const resting = grab.springs[0].atRest(0) && grab.springs[1].atRest(0) && grab.springs[2].atRest(0);
-    grab.on = grab.holding || !resting;
-  }
-
-  /** `D` follows the hand, scaled so the grab point stays under the fingers. */
-  private aim(grab: Grab, hand: Vector3): void {
-    this.raw.copy(hand).sub(grab.hand0);
-    const dist = this.raw.length();
-    if (dist < DEAD) {
-      grab.target.set(0, 0, 0);
+  /** Turns a pinch from the last select event into a grab, now that the hand joints are readable. */
+  private resolvePending(grab: Grab, dt: number, now: number): void {
+    if (!grab.pending) return;
+    if (this.handMap[grab.side] && !this.hands.hasPinch[grab.side]) {
+      if (now - grab.pendingAt > PENDING_GIVEUP) grab.pending = false;
       return;
     }
-    this.unit.copy(this.raw).multiplyScalar(1 / dist);
-    if (!grab.locked) grab.axis.copy(this.unit);
-    if (!grab.locked && dist >= LOCK) grab.locked = true;
-    const headG = Math.max(0.05, this.head.distanceTo(grab.worldG));
-    const headH = Math.max(0.05, this.head.distanceTo(hand));
-    const k = Math.min(8, Math.max(1, this.look.gain * headG / headH));
-    grab.target.copy(this.raw).multiplyScalar(k);
-    const along = grab.target.dot(grab.axis);
-    if (along < 0) grab.target.addScaledVector(grab.axis, -along);
-    const facing = Math.abs(grab.normal.dot(grab.axis));
-    grab.A = 0.1 + (1 - facing) * 2.9;
+    if (grab.on && !grab.holding) {
+      // Still springing from the last pull: settle it fast, so re-basing doesn't pop.
+      this.stepSprings(grab, dt, SETTLE_STIFF, SETTLE_DAMP);
+      if (!this.springsAtRest(grab) && now - grab.pendingAt < SETTLE_MAX) return;
+    }
+    grab.pending = false;
+    this.resetGrab(grab);
+    this.photo.drop(grab.slot);
+    if (!this.pinchPoint(grab.side, this.pinch)) return;
+    if (!this.raycast(this.head, this.pinch)) {
+      this.sound.miss(grab.slot, this.pinch.x, this.pinch.y, this.pinch.z);
+      return;
+    }
+    grab.mesh = this.hitMesh;
+    grab.holding = true;
+    grab.on = true;
+    grab.seq = ++this.grabSeq;
+    grab.localG.copy(this.localHit);
+    grab.localNormal.copy(this.localN);
+    grab.hand0.copy(this.pinch);
+    grab.reach0 = this.pinch.distanceTo(this.head);
+    grab.ray0.copy(this.pinch).sub(this.head).normalize();
+    grab.rippleT = 0;
+    this.poseGrab(grab);
+    grab.lift.copy(this.head).sub(grab.worldG).normalize();
+    this.writeFootprint(grab);
+    this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, true, this.camera, now);
+    grab.fade = 0;
+    this.pinched = true;
+  }
+
+  /** The grab point and a ring at reach in its surface plane: what the photo has to cover. */
+  private writeFootprint(grab: Grab): void {
+    const n = grab.normal;
+    this.tanU.set(0, 1, 0).cross(n);
+    if (this.tanU.lengthSq() < 1e-6) this.tanU.set(1, 0, 0).cross(n);
+    this.tanU.normalize();
+    this.tanV.copy(n).cross(this.tanU);
+    const r = Math.min(0.4, Math.max(0.25, this.look.reach * 0.8));
+    const f = this.footprint;
+    f[0] = grab.worldG.x;
+    f[1] = grab.worldG.y;
+    f[2] = grab.worldG.z;
+    for (let i = 1; i < FOOTPRINT; i++) {
+      const a = ((i - 1) / (FOOTPRINT - 1)) * Math.PI * 2;
+      const c = Math.cos(a) * r;
+      const s = Math.sin(a) * r;
+      f[i * 3] = grab.worldG.x + this.tanU.x * c + this.tanV.x * s;
+      f[i * 3 + 1] = grab.worldG.y + this.tanU.y * c + this.tanV.y * s;
+      f[i * 3 + 2] = grab.worldG.z + this.tanU.z * c + this.tanV.z * s;
+    }
+  }
+
+  private stepHand(grab: Grab, dt: number): void {
+    if (grab.pending) return;
+    this.poseGrab(grab);
+    if (grab.holding) {
+      if (this.pinchPoint(grab.side, this.pinch)) {
+        grab.lostT = 0;
+        this.aim(grab, this.pinch);
+      } else {
+        grab.lostT += dt;
+        if (grab.lostT > LOST_RELEASE) this.release(grab);
+      }
+    }
+    if (grab.holding) {
+      const f = 1 - Math.exp(-dt / FOLLOW);
+      const inv = 1 / Math.max(dt, 1e-3);
+      grab.Dprev.copy(grab.D);
+      grab.D.lerp(grab.target, f);
+      grab.Dvel.copy(grab.D).sub(grab.Dprev).multiplyScalar(inv);
+      const e = grab.E + (grab.explodeTo - grab.E) * f;
+      grab.Evel = (e - grab.E) * inv;
+      grab.E = e;
+      const b = grab.B + (grab.liftTo - grab.B) * f;
+      grab.Bvel = (b - grab.B) * inv;
+      grab.B = b;
+      grab.lift.copy(this.head).sub(grab.worldG).normalize();
+    } else if (grab.on) {
+      this.stepSprings(grab, dt, this.look.stiffness, this.look.damping);
+    }
+    const len = grab.D.length();
+    if (len > 1e-4) grab.axis.copy(grab.D).multiplyScalar(1 / len);
+    grab.rippleT = Math.min(grab.rippleT + dt, 10);
+    const slot = this.photo.slots[grab.slot];
+    grab.fade = slot.has && slot.ready ? Math.min(1, grab.fade + dt / FADE_IN) : 0;
+    const wasOn = grab.on;
+    grab.on = grab.holding || !this.springsAtRest(grab) || grab.rippleT < RIPPLE_SECONDS;
+    if (wasOn && !grab.on) {
+      this.resetGrab(grab);
+      this.photo.drop(grab.slot);
+    }
+  }
+
+  private stepSprings(grab: Grab, dt: number, stiffness: number, damping: number): void {
+    const s = grab.springs;
+    grab.D.set(s[0].step(0, dt, stiffness, damping), s[1].step(0, dt, stiffness, damping), s[2].step(0, dt, stiffness, damping));
+    grab.E = s[3].step(0, dt, stiffness, damping);
+    grab.B = s[4].step(0, dt, stiffness, damping);
+  }
+
+  private springsAtRest(grab: Grab): boolean {
+    const s = grab.springs;
+    for (let i = 0; i < s.length; i++) if (!s[i].atRest(0)) return false;
+    return true;
+  }
+
+  /** Hands the held pull to the springs, keeping its velocity, so letting go wobbles back. */
+  private release(grab: Grab): void {
+    grab.holding = false;
+    grab.axisRel.copy(grab.axis);
+    const s = grab.springs;
+    s[0].value = grab.D.x;
+    s[0].velocity = grab.Dvel.x;
+    s[1].value = grab.D.y;
+    s[1].velocity = grab.Dvel.y;
+    s[2].value = grab.D.z;
+    s[2].velocity = grab.Dvel.z;
+    s[3].value = grab.E;
+    s[3].velocity = grab.Evel;
+    s[4].value = grab.B;
+    s[4].velocity = grab.Bvel;
+    grab.target.set(0, 0, 0);
+    grab.explodeTo = 0;
+    grab.liftTo = 0;
+  }
+
+  /**
+   * The grabbed spot stays on the pinch ray: it slides in the surface plane to where the ray from
+   * your eyes through your fingers meets that plane. Bringing the hand closer to your head than at
+   * the pinch bursts the surface outward from the pinch instead of tenting it toward you.
+   */
+  private aim(grab: Grab, hand: Vector3): void {
+    const travel = this.raw.copy(hand).sub(grab.hand0);
+    const moved = travel.length();
+    const ease = smooth((moved - 0.5 * DEAD) / DEAD);
+    const ray = this.unit.copy(hand).sub(this.head);
+    const reach = ray.length();
+    const n = grab.normal;
+    const across = n.dot(ray);
+    if (across < -GRAZE * reach) {
+      const k = this.tmp.copy(grab.worldG).sub(this.head).dot(n) / across;
+      const slide = this.tmp2.copy(this.head).addScaledVector(ray, k).sub(grab.worldG);
+      slide.addScaledVector(n, -slide.dot(n)).multiplyScalar(this.look.gain * ease);
+      const len = slide.length();
+      if (len > SLIDE_SOFT) {
+        const room = SLIDE_MAX - SLIDE_SOFT;
+        slide.multiplyScalar((SLIDE_SOFT + room * (1 - Math.exp(-(len - SLIDE_SOFT) / room))) / len);
+      }
+      this.keepInPhoto(grab, slide);
+      grab.target.copy(slide);
+    }
+    const along = travel.dot(grab.ray0);
+    const lateral = Math.sqrt(Math.max(0, moved * moved - along * along));
+    const toward = Math.max(0, grab.reach0 - reach - LATERAL_SHARE * lateral - TOWARD_DEAD) * ease;
+    const rim = Math.max(0, (BURST_ANGLE * this.head.distanceTo(grab.worldG) - 0.22) / 1.5);
+    let e = Math.min(EXPLODE_MAX, rim, this.look.radial * toward);
+    const slid = grab.target.length();
+    if (slid + e > PULL_MAX) e = Math.max(0, PULL_MAX - slid);
+    grab.explodeTo = e;
+    grab.liftTo = Math.min(LIFT_MAX, this.look.depthPull * toward);
+  }
+
+  /** Shortens a slide so the grab point lands inside its photo: past the edge there is nothing to show. */
+  private keepInPhoto(grab: Grab, slide: Vector3): void {
+    if (!this.photo.slots[grab.slot].has) return;
+    const probe = this.tmp.copy(grab.worldG).add(slide);
+    if (this.photo.slotContains(grab.slot, probe, SLIDE_MARGIN)) return;
+    let lo = 0;
+    let hi = 1;
+    for (let i = 0; i < 6; i++) {
+      const mid = (lo + hi) * 0.5;
+      probe.copy(grab.worldG).addScaledVector(slide, mid);
+      if (this.photo.slotContains(grab.slot, probe, SLIDE_MARGIN)) lo = mid;
+      else hi = mid;
+    }
+    slide.multiplyScalar(lo);
   }
 
   private clearGrabs(): void {
     this.resetGrab(this.left);
     this.resetGrab(this.right);
-    this.reveal = 0;
-    this.photo.invalidate();
+    this.left.pending = false;
+    this.right.pending = false;
+    this.photo.drop(0);
+    this.photo.drop(1);
   }
 
   private resetGrab(grab: Grab): void {
     grab.holding = false;
     grab.on = false;
-    grab.locked = false;
     grab.mesh = null;
     grab.target.set(0, 0, 0);
     grab.D.set(0, 0, 0);
+    grab.Dprev.set(0, 0, 0);
+    grab.Dvel.set(0, 0, 0);
+    grab.E = 0;
+    grab.Evel = 0;
+    grab.B = 0;
+    grab.Bvel = 0;
+    grab.explodeTo = 0;
+    grab.liftTo = 0;
+    grab.rippleT = 10;
+    grab.lostT = 0;
+    grab.fade = 0;
     for (let i = 0; i < grab.springs.length; i++) grab.springs[i].reset(0);
   }
 
   /** Desktop preview: two points on the wardrobe pull apart, hold, then return. */
-  private updateDemo(dt: number, video: HTMLVideoElement | null): void {
+  private updateDemo(dt: number, now: number): void {
     this.demoT += dt;
     const t = this.demoT % 8;
     let pull = 0;
@@ -595,17 +959,38 @@ export class RoomStretchSystem extends createSystem({
     else if (t < 5.2) pull = 0.72;
     else if (t < 6.8) pull = (1 - smooth((t - 5.2) / 1.6)) * 0.72;
     const moving = pull > 0.02;
-    this.demoL.on = moving;
-    this.demoR.on = moving;
-    this.demoL.D.set(-pull, 0, pull * 0.22);
-    this.demoR.D.set(pull, 0, pull * 0.22);
-    if (moving && video && !this.photo.ready) this.photo.freezeWorld(video, this.demoL.worldG, false);
+    this.camera.getWorldPosition(this.head);
+    this.demoGrab(this.demoL, -1, pull, moving, dt, now);
+    this.demoGrab(this.demoR, 1, pull, moving, dt, now);
   }
 
-  private publish(a: Grab, b: Grab, dt: number, time: number): void {
+  private demoGrab(grab: Grab, sign: number, pull: number, moving: boolean, dt: number, now: number): void {
+    grab.on = moving;
+    grab.holding = moving;
+    grab.D.set(sign * pull, 0, 0);
+    grab.axis.set(sign, 0, 0);
+    grab.axisRel.copy(grab.axis);
+    grab.normal.set(0, 0, 1);
+    grab.lift.copy(this.head).sub(grab.worldG).normalize();
+    grab.B = Math.min(LIFT_MAX, pull * 0.11);
+    grab.E = 0;
+    grab.rippleT = 10;
+    grab.A = AHEAD;
+    const slot = this.photo.slots[grab.slot];
+    if (moving && !slot.has) {
+      this.writeFootprint(grab);
+      this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, false, this.camera, now);
+    } else if (!moving && slot.has) {
+      this.photo.drop(grab.slot);
+    }
+    grab.fade = slot.has && slot.ready ? Math.min(1, grab.fade + dt / FADE_IN) : 0;
+  }
+
+  private publish(a: Grab, b: Grab, time: number, hasVideo: boolean): void {
     const U = this.overlay.uniforms;
-    this.writeGrab(U, 0, a);
-    this.writeGrab(U, 1, b);
+    const aFirst = !b.on || (a.on && a.seq <= b.seq);
+    this.writeGrab(U, 0, aFirst ? a : b);
+    this.writeGrab(U, 1, aFirst ? b : a);
     U.uReach.value = this.look.reach;
     U.uRamp.value = this.look.ramp;
     U.uStripes.value = this.look.stripes;
@@ -614,62 +999,104 @@ export class RoomStretchSystem extends createSystem({
     U.uWaveK.value = 1 / Math.max(this.look.waveLength, 0.05);
     U.uWaveSpeed.value = this.look.waveSpeed;
     U.uTime.value = time;
-    U.uMeshTint.value = this.look.meshTint;
-    const moving = a.on || b.on;
-    const revealTarget = moving ? 1 : 0;
-    this.reveal += (revealTarget - this.reveal) * (1 - Math.exp(-dt * 8));
-    if (!moving && this.reveal < 0.02) {
-      this.reveal = 0;
-      if (this.photo.ready) this.photo.invalidate();
+    U.uRipple.value = this.look.ripple;
+    U.uAnyPhoto.value = hasVideo ? 1 : 0;
+    U.uLinear.value = this.look.linearBlend ? 1 : 0;
+    U.uCalibrate.value = this.look.calibrate ? 1 : 0;
+    if (this.look.calibrate) {
+      const slot = this.photo.slots[0];
+      U.uPhoto0.value = slot.texture;
+      U.uWorldToClip0.value.copy(slot.toClip);
+      U.uCamPos0.value.copy(slot.cam);
+      U.uGain0.value.copy(slot.gain);
+      U.uHasPhoto0.value = slot.has && slot.ready ? 1 : 0;
     }
-    U.uReveal.value = this.reveal;
-    U.uHasPhoto.value = this.photo.ready ? 1 : 0;
-    U.uPhoto.value = this.photo.frozenTexture;
-    (U.uWorldToClip.value as Matrix4).copy(this.photo.frozenToClip);
-    (U.uCamPos.value as Vector3).copy(this.photo.ready ? this.photo.frozenCam : this.photo.liveCam);
   }
 
-  private writeGrab(U: RubberUniformSet, slot: 0 | 1, grab: Grab): void {
-    const G = (slot === 0 ? U.uG0 : U.uG1).value as Vector3;
-    const D = (slot === 0 ? U.uD0 : U.uD1).value as Vector3;
-    const axis = (slot === 0 ? U.uAxis0 : U.uAxis1).value as Vector3;
-    G.copy(grab.worldG);
-    D.copy(grab.D);
-    axis.copy(grab.axis);
-    if (slot === 0) {
+  private writeGrab(U: RubberUniformSet, k: 0 | 1, grab: Grab): void {
+    const first = k === 0;
+    (first ? U.uG0 : U.uG1).value.copy(grab.worldG);
+    (first ? U.uD0 : U.uD1).value.copy(grab.D);
+    (first ? U.uAxis0 : U.uAxis1).value.copy(grab.axis);
+    (first ? U.uN0 : U.uN1).value.copy(grab.normal);
+    (first ? U.uLift0 : U.uLift1).value.copy(grab.lift);
+    const slot = this.photo.slots[grab.slot];
+    (first ? U.uPhoto0 : U.uPhoto1).value = slot.texture;
+    (first ? U.uWorldToClip0 : U.uWorldToClip1).value.copy(slot.toClip);
+    (first ? U.uCamPos0 : U.uCamPos1).value.copy(slot.cam);
+    (first ? U.uGain0 : U.uGain1).value.copy(slot.gain);
+    const on = grab.on ? 1 : 0;
+    const has = slot.has && slot.texture ? 1 : 0;
+    // Streaks only on the side the pull went; the spring's overshoot flips D but not the picture.
+    const len = grab.D.length();
+    const sk = grab.holding || len < 1e-4 ? 1 : Math.max(0, grab.D.dot(grab.axisRel) / len);
+    if (first) {
       U.uA0.value = grab.A;
-      U.uOn0.value = grab.on ? 1 : 0;
+      U.uE0.value = grab.E;
+      U.uB0.value = grab.B;
+      U.uRip0.value = grab.rippleT;
+      U.uOn0.value = on;
+      U.uSk0.value = sk;
+      U.uHasPhoto0.value = has;
+      U.uFade0.value = grab.fade;
     } else {
       U.uA1.value = grab.A;
-      U.uOn1.value = grab.on ? 1 : 0;
+      U.uE1.value = grab.E;
+      U.uB1.value = grab.B;
+      U.uRip1.value = grab.rippleT;
+      U.uOn1.value = on;
+      U.uSk1.value = sk;
+      U.uHasPhoto1.value = has;
+      U.uFade1.value = grab.fade;
     }
+  }
+
+  /**
+   * Feeds one hand to the sound. Pull is in radians of visual pull: the held target while holding,
+   * so notes follow the fingers, then the spring after release, negative while it overshoots.
+   */
+  private sing(grab: Grab): void {
+    const G = grab.worldG;
+    if (!grab.on) {
+      this.sound.track(grab.slot, false, 0, 0, G.x, G.y, G.z);
+      return;
+    }
+    const dist = Math.max(0.5, this.head.distanceTo(G));
+    let mag: number;
+    if (grab.holding) {
+      mag = Math.max(grab.target.length(), grab.explodeTo);
+    } else {
+      const len = grab.D.length();
+      mag = Math.max(len, grab.E);
+      if (len >= grab.E && grab.D.dot(grab.axisRel) < 0) mag = -len;
+    }
+    const ramp = Math.max(this.look.ramp, 1e-3);
+    const taffy = smooth((1.5 * grab.D.length() / ramp - this.look.stripes) / STRIPE_WIDTH);
+    const burst = smooth((1.5 * grab.E / (CORE + 0.35 * Math.max(grab.E, 0)) - this.look.stripes) / STRIPE_WIDTH);
+    this.sound.track(grab.slot, grab.holding, mag / dist, Math.max(taffy, burst), G.x, G.y, G.z);
   }
 
   // ---------------------------------------------------------------- hint card
 
-  private updateHud(dt: number, presenting: boolean): void {
+  private updateHud(dt: number, presenting: boolean, hasVideo: boolean, now: number): void {
+    const want = this.cardFor(presenting, hasVideo, now);
+    if (want !== Card.None && want !== this.cardShown) this.paintCard(want);
     const holding = this.left.holding || this.right.holding;
-    const wantCard = presenting && !holding;
-    const copy = this.meshCopy(presenting);
-    const key = `${copy.title}|${copy.body}`;
-    if (key !== this.cardKey) {
-      this.cardKey = key;
-      this.cardShown = copy;
-      drawHint(this.cardPaint, copy.title, copy.body);
-      this.cardTex.needsUpdate = true;
-    }
-    this.cardOpacity += ((wantCard ? 1 : 0) - this.cardOpacity) * (1 - Math.exp(-dt * 6));
-    this.card.visible = this.cardOpacity > 0.01;
+    const target = want !== Card.None && !holding ? 1 : 0;
+    this.cardOpacity += (target - this.cardOpacity) * (1 - Math.exp(-dt * 6));
+    const visible = this.cardOpacity > 0.01;
+    if (this.card.visible !== visible) this.card.visible = visible;
     this.cardMat.opacity = this.cardOpacity;
-    if (!this.card.visible) {
+    if (!visible) {
       this.cardSettled = false;
       return;
     }
     this.unit.set(0, 0, -1).applyQuaternion(this.headQuat);
     this.unit.y = 0;
     if (this.unit.lengthSq() < 1e-6) this.unit.set(0, 0, -1);
-    this.pinch.copy(this.unit).normalize().multiplyScalar(0.7).add(this.head);
-    this.pinch.y -= 0.22;
+    this.unit.normalize();
+    this.pinch.copy(this.unit).multiplyScalar(CARD_DISTANCE * Math.sqrt(1 - CARD_RISE * CARD_RISE)).add(this.head);
+    this.pinch.y += CARD_DISTANCE * CARD_RISE;
     if (!this.cardSettled) {
       this.card.position.copy(this.pinch);
       this.cardSettled = true;
@@ -679,39 +1106,50 @@ export class RoomStretchSystem extends createSystem({
     this.card.lookAt(this.head);
   }
 
-  private meshCopy(presenting: boolean): Copy {
-    if (!presenting) return CARD.point;
-    if (!this.scans.length) return CARD.scan;
-    const triangles = Math.max(this.coarseTriangles, this.overlay.ready ? this.overlay.triangles : 0);
-    const count = triangles > 1000 ? `${Math.round(triangles / 1000)}k` : String(triangles);
-    return { title: 'Room mesh', body: `${count} tris. Pinch and pull.` };
+  private cardFor(presenting: boolean, hasVideo: boolean, now: number): Card {
+    if (!presenting) return Card.None;
+    const since = now - this.presentedAt;
+    if (!this.scans.length && since > 4) {
+      const features = (this.session as (XRSession & { enabledFeatures?: readonly string[] }) | null)?.enabledFeatures;
+      return features && !features.includes('mesh-detection') ? Card.Spatial : Card.Scan;
+    }
+    if (!hasVideo && since > 3) return Card.Camera;
+    if (!this.pinched && this.scans.length) return Card.Pinch;
+    return Card.None;
+  }
+
+  private paintCard(card: Card): void {
+    this.cardShown = card;
+    drawHint(this.cardPaint, COPY[card].title, COPY[card].body);
+    this.cardTex.needsUpdate = true;
   }
 
   private readLook(): void {
     for (const entity of this.queries.settings.entities) {
-      for (let i = 0; i < LOOK_KEYS.length; i++) {
-        const key = LOOK_KEYS[i];
+      for (let i = 0; i < NUMBER_KEYS.length; i++) {
+        const key = NUMBER_KEYS[i];
         const value = entity.getValue(StretchLook, key);
         if (typeof value === 'number') this.look[key] = value;
       }
+      const calibrate = entity.getValue(StretchLook, 'calibrate');
+      if (typeof calibrate === 'boolean') this.look.calibrate = calibrate;
+      const linear = entity.getValue(StretchLook, 'linearBlend');
+      if (typeof linear === 'boolean') this.look.linearBlend = linear;
       return;
     }
   }
 
-  // ---------------------------------------------------------------- camera
-
-  private captureReq(video: HTMLVideoElement | null): Omit<PhotoCapture, 'objectWorld' | 'center'> {
-    return {
-      renderer: this.renderer,
-      presenting: this.renderer.xr.isPresenting,
-      frame: this.world.xrFrame,
-      refSpace: this.world.xrReferenceSpace,
-      video,
-      track: this.cameraTrack(video),
-      mount: this.mount,
-      viewCamera: this.camera,
-    };
+  private applyLook(): void {
+    const lens = this.photo.lens;
+    lens.scale = this.look.lensScale;
+    lens.pitchDeg = this.look.lensPitch;
+    lens.latency = this.look.cameraLatency;
+    lens.exposure = this.look.exposure;
+    lens.warmth = this.look.warmth;
+    this.photo.updateGains();
   }
+
+  // ---------------------------------------------------------------- camera
 
   private attachCamera(devices: CameraDeviceInfo[]): boolean {
     if (getMode() !== 'stretch' || this.cameraEntity) return !!this.cameraEntity;
@@ -726,11 +1164,21 @@ export class RoomStretchSystem extends createSystem({
     entity.addComponent(CameraSource);
     entity.setValue(CameraSource, 'deviceId', chosen.deviceId);
     entity.setValue(CameraSource, 'facing', back ? CameraFacing.Back : CameraFacing.Unknown);
+    // 4:3 keeps the lens's full height; 16:9 crops ~14° off the top and bottom.
     entity.setValue(CameraSource, 'width', 1280);
-    entity.setValue(CameraSource, 'height', 720);
+    entity.setValue(CameraSource, 'height', 960);
     entity.setValue(CameraSource, 'frameRate', 30);
     this.cameraEntity = entity;
+    this.rearmTries = 0;
     return true;
+  }
+
+  /** IWSDK retries a failing camera itself; this only covers an arm that never happened or failed. */
+  private rearmCamera(now: number): void {
+    if (!this.cameraWanted || this.cameraEntity || this.arming || this.rearmTries >= 3 || now < this.rearmAt) return;
+    this.rearmTries++;
+    this.rearmAt = now + Math.pow(2, this.rearmTries - 1);
+    void this.armCamera();
   }
 
   private cameraVideo(): HTMLVideoElement | null {
@@ -740,9 +1188,11 @@ export class RoomStretchSystem extends createSystem({
   }
 
   private cameraTrack(video: HTMLVideoElement | null): MediaStreamTrack | null {
+    if (video === this.trackVideo) return this.track;
+    this.trackVideo = video;
     const stream = video?.srcObject;
-    if (!(stream instanceof MediaStream)) return null;
-    return stream.getVideoTracks()[0] ?? null;
+    this.track = stream instanceof MediaStream ? stream.getVideoTracks()[0] ?? null : null;
+    return this.track;
   }
 
   private stopCamera(): void {
@@ -765,10 +1215,13 @@ export class RoomStretchSystem extends createSystem({
   private dispose(): void {
     this.session?.removeEventListener('selectstart', this.onSelectStart);
     this.session?.removeEventListener('selectend', this.onSelectEnd);
+    this.refSpace?.removeEventListener('reset', this.onReset);
+    outlineMaterial.visible = true;
     this.stopCamera();
     this.overlay.dispose();
     this.hands.dispose();
     this.photo.dispose();
+    this.sound.dispose();
     this.room.traverse((object) => {
       const mesh = object as Mesh;
       mesh.geometry?.dispose();
@@ -778,4 +1231,11 @@ export class RoomStretchSystem extends createSystem({
     this.cardMat.dispose();
     this.hudEntity.dispose();
   }
+}
+
+interface TriScan {
+  mesh: Mesh;
+  positions: ArrayLike<number>;
+  index: ArrayLike<number>;
+  grid: TriGrid;
 }

@@ -1,6 +1,6 @@
-import { Quaternion, Vector3, VisibilityState, createSystem } from '@iwsdk/core';
+import { CameraUtils, Quaternion, Vector3, VisibilityState, createSystem } from '@iwsdk/core';
 import { prepareDepthModel } from './depth-model.js';
-import { getMode, launchSession, setMode, type ExperienceMode } from './experience.js';
+import { PREVIEW_FORCED, getMode, launchSession, setMode, type ExperienceMode } from './experience.js';
 import {
   DEFAULT_CLIP_DEPTH,
   DEFAULT_CLIP_NAME,
@@ -22,7 +22,8 @@ const DEPTH_WAIT = 'Downloading the depth model. Passthrough unlocks when it’s
 const DEPTH_FAIL = 'The depth model didn’t load. Reload the page to try again.';
 const STRETCH_HINT = 'Pinch the room and pull, with one hand or both.';
 const STRETCH_CAMERA = 'Camera on. Pinch the room and pull, one hand or both.';
-const STRETCH_BLOCKED = 'Camera blocked. The pull still bends the room, in a plain tint.';
+const STRETCH_ASKING = 'Allow the camera so the pull can show your room.';
+const STRETCH_BLOCKED = 'Camera blocked. Allow it for this site so the pull can show your room.';
 
 /** Wires the 2D launch card in index.html: pick a clip and a sample rate, then enter passthrough. */
 export class LauncherSystem extends createSystem({}) {
@@ -31,6 +32,9 @@ export class LauncherSystem extends createSystem({}) {
   /** Bumped on every open so a slower load can't replace a newer clip. */
   private loadGen = 0;
   private stretchHint = STRETCH_HINT;
+  /** The headset camera prompt is open on the page. Enter waits so the prompt can't end the session. */
+  private cameraAsking = false;
+  private cameraAsked = false;
   private readonly previewPos = new Vector3();
   private readonly previewQuat = new Quaternion();
   private previewSaved = false;
@@ -68,7 +72,8 @@ export class LauncherSystem extends createSystem({}) {
     const syncEnter = () => {
       const stackMode = getMode() === 'stack';
       const depthOk = !stackMode || depthReady || !stack.needsDepthModel;
-      enter.disabled = !(xrOk && depthOk);
+      const cameraOk = stackMode || !this.cameraAsking;
+      enter.disabled = !(xrOk && depthOk && cameraOk);
       if (!xrKnown) return;
       if (!xrOk) hint.textContent = NO_PASSTHROUGH;
       else if (stackMode && !depthOk) hint.textContent = depthNote;
@@ -131,7 +136,10 @@ export class LauncherSystem extends createSystem({}) {
     const onEnter = () => {
       touch.unlockAudio(); // this click is the gesture that lets scrub ticks play in the headset
       const stretchMode = getMode() === 'stretch';
-      if (stretchMode) void stretch.armCamera();
+      if (stretchMode) {
+        stretch.unlockAudio(); // the same click lets the pull's melody play in the headset
+        void stretch.armCamera();
+      }
       launchSession(() => this.world.launchXR(), stretchMode);
     };
     const onStack = () => applyMode('stack');
@@ -224,8 +232,9 @@ export class LauncherSystem extends createSystem({}) {
   }
 
   /**
-   * The desk preview needs a webcam. A headset already has passthrough, and
-   * opening the camera here paints that feed across the browser page.
+   * The desk preview needs a webcam. A headset already has passthrough, and opening the camera
+   * here paints that feed across the browser page, so there it only asks for permission (a
+   * stream that stops at once). Asking inside the session can end the session.
    */
   private armStretchCamera(stretch: RoomStretchSystem, syncEnter: () => void): void {
     const arm = () => {
@@ -235,12 +244,33 @@ export class LauncherSystem extends createSystem({}) {
       });
     };
     const xr = navigator.xr;
-    if (!xr) {
+    if (!xr || PREVIEW_FORCED) {
       arm();
       return;
     }
     void xr.isSessionSupported('immersive-ar').then((ok) => {
-      if (!ok && getMode() === 'stretch') arm();
+      if (getMode() !== 'stretch') return;
+      if (!ok) {
+        arm();
+        return;
+      }
+      if (this.cameraAsked) return;
+      this.cameraAsked = true;
+      this.cameraAsking = true;
+      this.stretchHint = STRETCH_ASKING;
+      syncEnter();
+      CameraUtils.getDevices().then(
+        () => {
+          this.stretchHint = STRETCH_HINT;
+        },
+        () => {
+          this.cameraAsked = false;
+          this.stretchHint = STRETCH_BLOCKED;
+        },
+      ).finally(() => {
+        this.cameraAsking = false;
+        syncEnter();
+      });
     });
   }
 

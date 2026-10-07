@@ -1,5 +1,11 @@
 export type ExperienceMode = 'stack' | 'stretch';
 
+/**
+ * `?preview=1` forces the desk stand-in room and webcam even where the dev server's
+ * emulator makes the page look like a headset.
+ */
+export const PREVIEW_FORCED = typeof location !== 'undefined' && new URLSearchParams(location.search).has('preview');
+
 let mode: ExperienceMode = 'stack';
 
 export function getMode(): ExperienceMode {

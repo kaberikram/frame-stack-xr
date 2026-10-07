@@ -289,6 +289,94 @@ function rayTriangle(
   return t > 1e-4 ? t : -1;
 }
 
+let stamp = new Int32Array(0);
+let stampGen = 0;
+
+/**
+ * Area-weighted normal of the surface within `radius` of a hit, in the vertices' space. A single
+ * scanned triangle can sit 20-40 degrees off the real wall; its neighbours average that out.
+ * Triangles turned more than ~45 degrees from `ref` (the hit triangle's normal) are skipped, so an
+ * adjacent wall or the floor doesn't tilt it. Writes a unit normal on the same side as `ref`.
+ */
+export function averageNormal(
+  positions: ArrayLike<number>,
+  index: ArrayLike<number>,
+  grid: TriGrid,
+  hx: number, hy: number, hz: number,
+  radius: number,
+  rx: number, ry: number, rz: number,
+  out: { set(x: number, y: number, z: number): void },
+): boolean {
+  const triCount = Math.floor(index.length / 3);
+  if (stamp.length < triCount) stamp = new Int32Array(triCount);
+  stampGen = (stampGen + 1) | 0;
+  if (stampGen === 0) {
+    stamp.fill(0);
+    stampGen = 1;
+  }
+  const { minX, minY, minZ, cell, dimX, dimY, dimZ, starts, tris } = grid;
+  const clamp = (v: number, hi: number) => Math.min(hi - 1, Math.max(0, v));
+  const ix0 = clamp(Math.floor((hx - radius - minX) / cell), dimX);
+  const iy0 = clamp(Math.floor((hy - radius - minY) / cell), dimY);
+  const iz0 = clamp(Math.floor((hz - radius - minZ) / cell), dimZ);
+  const ix1 = clamp(Math.floor((hx + radius - minX) / cell), dimX);
+  const iy1 = clamp(Math.floor((hy + radius - minY) / cell), dimY);
+  const iz1 = clamp(Math.floor((hz + radius - minZ) / cell), dimZ);
+  const r2 = radius * radius;
+  let sx = 0;
+  let sy = 0;
+  let sz = 0;
+  for (let ix = ix0; ix <= ix1; ix++) {
+    for (let iy = iy0; iy <= iy1; iy++) {
+      for (let iz = iz0; iz <= iz1; iz++) {
+        const id = ix + dimX * (iy + dimY * iz);
+        for (let k = starts[id]; k < starts[id + 1]; k++) {
+          const tri = tris[k];
+          if (stamp[tri] === stampGen) continue;
+          stamp[tri] = stampGen;
+          const base = tri * 3;
+          const ia = index[base] * 3;
+          const ib = index[base + 1] * 3;
+          const ic = index[base + 2] * 3;
+          const cx = (positions[ia] + positions[ib] + positions[ic]) / 3 - hx;
+          const cy = (positions[ia + 1] + positions[ib + 1] + positions[ic + 1]) / 3 - hy;
+          const cz = (positions[ia + 2] + positions[ib + 2] + positions[ic + 2]) / 3 - hz;
+          if (cx * cx + cy * cy + cz * cz > r2) continue;
+          const e1x = positions[ib] - positions[ia];
+          const e1y = positions[ib + 1] - positions[ia + 1];
+          const e1z = positions[ib + 2] - positions[ia + 2];
+          const e2x = positions[ic] - positions[ia];
+          const e2y = positions[ic + 1] - positions[ia + 1];
+          const e2z = positions[ic + 2] - positions[ia + 2];
+          let nx = e1y * e2z - e1z * e2y;
+          let ny = e1z * e2x - e1x * e2z;
+          let nz = e1x * e2y - e1y * e2x;
+          const len = Math.hypot(nx, ny, nz);
+          if (len < 1e-10) continue;
+          let facing = (nx * rx + ny * ry + nz * rz) / len;
+          if (facing < 0) {
+            nx = -nx;
+            ny = -ny;
+            nz = -nz;
+            facing = -facing;
+          }
+          if (facing < 0.7) continue;
+          sx += nx;
+          sy += ny;
+          sz += nz;
+        }
+      }
+    }
+  }
+  const len = Math.hypot(sx, sy, sz);
+  if (len < 1e-10) {
+    out.set(rx, ry, rz);
+    return false;
+  }
+  out.set(sx / len, sy / len, sz / len);
+  return true;
+}
+
 /** A damped spring. Underdamped on purpose: letting go should wobble, not glide. */
 export class Spring {
   value = 0;
