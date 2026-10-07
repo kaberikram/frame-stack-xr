@@ -5,14 +5,12 @@ import {
   Matrix4,
   Mesh,
   ShaderMaterial,
-  SRGBColorSpace,
   VideoTexture,
   type InterleavedBufferAttribute,
   type Material,
   type Object3D,
 } from '@iwsdk/core';
 import { MAX_TRIANGLES, TARGET_EDGE } from './mesh-subdivide.js';
-import { PassthroughPhoto } from './passthrough-photo.js';
 import { createRubberUniforms, rubberMaterial, type RubberUniformSet } from './stretch-material.js';
 
 interface WorkerReply {
@@ -23,20 +21,22 @@ interface WorkerReply {
   triangles: number;
 }
 
-export interface RoomMeshStats {
-  triangles: number;
-  ready: boolean;
-  hasPhoto: boolean;
+/** Writes `visible` only when it changes. On scanned meshes each write is an ECS update. */
+function setShown(object: Object3D, on: boolean): void {
+  if (object.visible !== on) object.visible = on;
 }
 
 /**
  * The room the rubber pull draws. Quest's global mesh is subdivided once in a worker
  * so a falloff can bend instead of crease, and that copy follows the scan's pose.
- * Bounded furniture boxes stay hidden. Depth testing is on.
+ * Nothing draws unless a pull is active: at rest the headset shows plain passthrough.
  */
 export class RoomMeshOverlay {
   readonly uniforms: RubberUniformSet;
+  /** Headset program. It never samples video. */
   readonly material: ShaderMaterial;
+  /** Desk stand-in program, with the webcam as the unmoved backdrop. */
+  readonly previewMaterial: ShaderMaterial;
   triangles = 0;
   ready = false;
 
@@ -45,18 +45,24 @@ export class RoomMeshOverlay {
   private source: Mesh | null = null;
   private sourceKey: object | null = null;
   private dense: Mesh | null = null;
+  private active = false;
+  /** Frames left to draw a new dense mesh while invisible, so its compile and upload don't land on a pinch. */
+  private warm = 0;
   private readonly painted = new Map<Mesh, Material | Material[]>();
   private readonly keep = new Set<Mesh>();
   private readonly dropList: Mesh[] = [];
   private video: HTMLVideoElement | null = null;
   private videoTex: VideoTexture | null = null;
 
-  constructor(
-    photo: PassthroughPhoto,
-    private readonly parent: Object3D,
-  ) {
-    this.uniforms = createRubberUniforms(photo.texture);
+  constructor(private readonly parent: Object3D) {
+    this.uniforms = createRubberUniforms();
     this.material = rubberMaterial(this.uniforms);
+    this.previewMaterial = rubberMaterial(this.uniforms, true);
+  }
+
+  /** Draw the room this frame. Off at rest, so nothing renders or uploads. */
+  setActive(on: boolean): void {
+    this.active = on;
   }
 
   /**
@@ -85,7 +91,7 @@ export class RoomMeshOverlay {
       }
     }
     if (!primary) {
-      if (this.dense) this.dense.visible = false;
+      if (this.dense) setShown(this.dense, false);
       this.source = null;
       this.sourceKey = null;
       this.ready = false;
@@ -93,36 +99,44 @@ export class RoomMeshOverlay {
       return;
     }
     if (primary !== this.source) {
-      if (this.source) this.source.visible = true;
       this.source = primary;
       this.sourceKey = null;
       this.ready = false;
       this.triangles = 0;
-      if (this.dense) this.dense.visible = false;
+      if (this.dense) setShown(this.dense, false);
     }
     const position = primary.geometry.getAttribute('position');
     if (position && position !== this.sourceKey) this.submit(primary, position);
-    if (this.dense && this.ready) {
-      primary.updateWorldMatrix(true, false);
-      this.dense.visible = true;
-      this.dense.matrixAutoUpdate = false;
-      this.dense.matrix.copy(primary.matrixWorld);
-      this.dense.updateMatrixWorld(true);
-      primary.visible = false;
+
+    const showing = this.active || this.warm > 0;
+    if (this.warm > 0) this.warm--;
+    const denseOn = !!this.dense && this.ready;
+    for (let i = 0; i < sources.length; i++) {
+      const mesh = sources[i];
+      setShown(mesh, showing && !(denseOn && mesh === primary));
+    }
+    if (this.dense) {
+      if (denseOn) {
+        primary.updateWorldMatrix(true, false);
+        this.dense.matrix.copy(primary.matrixWorld);
+        this.dense.updateMatrixWorld(true);
+      }
+      setShown(this.dense, showing && denseOn);
     }
   }
 
-  setLive(video: HTMLVideoElement | null, hasLive: boolean, liveToClip: Matrix4): void {
+  /** Desk preview only: the webcam behind the stand-in room. Never called while presenting. */
+  setPreviewLive(video: HTMLVideoElement | null, hasLive: boolean, liveToClip: Matrix4): void {
     this.attachVideo(video);
     this.uniforms.uHasLive.value = hasLive && this.videoTex ? 1 : 0;
-    (this.uniforms.uLiveToClip.value as Matrix4).copy(liveToClip);
-    if (this.videoTex) this.uniforms.uLive.value = this.videoTex;
+    this.uniforms.uLiveToClip.value.copy(liveToClip);
+    this.uniforms.uLive.value = this.videoTex;
   }
 
   hide(restore: boolean): void {
-    if (this.dense) this.dense.visible = false;
+    if (this.dense) setShown(this.dense, false);
     if (!restore) {
-      for (const mesh of this.painted.keys()) mesh.visible = false;
+      for (const mesh of this.painted.keys()) setShown(mesh, false);
       return;
     }
     const drop = this.dropList;
@@ -141,6 +155,7 @@ export class RoomMeshOverlay {
     this.videoTex?.dispose();
     this.dense?.geometry.dispose();
     this.material.dispose();
+    this.previewMaterial.dispose();
   }
 
   private paint(mesh: Mesh): void {
@@ -148,27 +163,25 @@ export class RoomMeshOverlay {
     if (mesh.material !== this.material) mesh.material = this.material;
     mesh.frustumCulled = false;
     mesh.renderOrder = 2;
-    if (mesh !== this.source || !this.ready) mesh.visible = true;
   }
 
   private release(mesh: Mesh): void {
     const saved = this.painted.get(mesh);
     if (saved && mesh.material === this.material) mesh.material = saved;
     this.painted.delete(mesh);
-    mesh.visible = false;
+    setShown(mesh, false);
     if (mesh === this.source) {
       this.source = null;
       this.sourceKey = null;
       this.ready = false;
       this.triangles = 0;
-      if (this.dense) this.dense.visible = false;
+      if (this.dense) setShown(this.dense, false);
     }
   }
 
   private submit(source: Mesh, position: BufferAttribute | InterleavedBufferAttribute): void {
     const geometry = source.geometry;
     const index = geometry.getIndex();
-    if (!geometry) return;
     this.sourceKey = position;
     const positions = new Float32Array(position.count * 3);
     for (let i = 0; i < position.count; i++) {
@@ -209,6 +222,7 @@ export class RoomMeshOverlay {
       this.dense.frustumCulled = false;
       this.dense.renderOrder = 2;
       this.dense.matrixAutoUpdate = false;
+      this.dense.visible = false;
       this.parent.add(this.dense);
     } else {
       this.dense.geometry.dispose();
@@ -217,9 +231,8 @@ export class RoomMeshOverlay {
     this.source.updateWorldMatrix(true, false);
     this.dense.matrix.copy(this.source.matrixWorld);
     this.dense.updateMatrixWorld(true);
-    this.dense.visible = true;
-    this.source.visible = false;
     this.ready = true;
+    this.warm = 2;
     this.triangles = reply.triangles;
     const edge = reply.edge >= 0.1 ? reply.edge.toFixed(2) : reply.edge.toFixed(3);
     console.info(`[jonze] dense room: ${reply.triangles} triangles, ${edge} m edges`);
@@ -229,7 +242,6 @@ export class RoomMeshOverlay {
     if (!video || video === this.video) return;
     this.videoTex?.dispose();
     const tex = new VideoTexture(video);
-    tex.colorSpace = SRGBColorSpace;
     tex.minFilter = LinearFilter;
     tex.magFilter = LinearFilter;
     tex.generateMipmaps = false;

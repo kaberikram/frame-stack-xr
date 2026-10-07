@@ -19,7 +19,12 @@ const BONES: readonly (readonly [number, number])[] = [
 ];
 
 const JOINT_COUNT = JOINTS.length;
-const PER_HAND = JOINT_COUNT + BONES.length;
+/** Spheres up the forearm, metres from the wrist. A stretched wall must not paint over the arm. */
+const FOREARM = [0.08, 0.16, 0.24] as const;
+const FOREARM_RADIUS = 0.035;
+const WRIST = 0;
+const MIDDLE_METACARPAL = 10;
+const PER_HAND = JOINT_COUNT + BONES.length + FOREARM.length;
 const HANDS = 2;
 
 type Side = 'left' | 'right';
@@ -30,13 +35,20 @@ interface FramePoses extends XRFrame {
 }
 
 /**
- * Depth-only spheres on the hand joints. Drawn before the room mesh so the real
- * hands show through the virtual room. The same joint positions feed the clean-frame test.
+ * Depth-only spheres on the hand joints and forearms. Drawn before the room mesh so the real
+ * hands and arms show through the virtual room. The same joints box the hands in camera frames.
  */
 export class HandOccluder {
   /** Packed xyz of every tracked joint, world space. `jointCount` is how many are valid. */
   readonly points = new Float32Array(JOINT_COUNT * HANDS * 3);
   jointCount = 0;
+  /** Where each hand's joints sit in `points`. A count of 0 means that hand isn't tracked. */
+  leftStart = 0;
+  leftCount = 0;
+  rightStart = 0;
+  rightCount = 0;
+  /** Sphere scale. Raised while pulling to cover tracking and passthrough lag at the hand's edges. */
+  inflate = 1;
   readonly indexTip = { left: new Vector3(), right: new Vector3() };
   readonly thumbTip = { left: new Vector3(), right: new Vector3() };
   readonly hasPinch = { left: false, right: false };
@@ -66,6 +78,8 @@ export class HandOccluder {
     this.mesh.visible = on;
     if (!on) {
       this.jointCount = 0;
+      this.leftCount = 0;
+      this.rightCount = 0;
       this.hasPinch.left = false;
       this.hasPinch.right = false;
     }
@@ -78,6 +92,8 @@ export class HandOccluder {
     hands: Record<Side, XRHand | null>,
   ): void {
     this.jointCount = 0;
+    this.leftCount = 0;
+    this.rightCount = 0;
     if (!this.mesh.visible || !frame || !ref) {
       this.hasPinch.left = false;
       this.hasPinch.right = false;
@@ -92,7 +108,15 @@ export class HandOccluder {
         this.hideRange(base, PER_HAND);
         continue;
       }
+      const start = this.jointCount;
       this.writeHand(side, base, playerWorld);
+      if (side === 'left') {
+        this.leftStart = start;
+        this.leftCount = JOINT_COUNT;
+      } else {
+        this.rightStart = start;
+        this.rightCount = JOINT_COUNT;
+      }
     }
     this.mesh.instanceMatrix.needsUpdate = true;
   }
@@ -161,7 +185,7 @@ export class HandOccluder {
       this.points[n * 3] = x;
       this.points[n * 3 + 1] = y;
       this.points[n * 3 + 2] = z;
-      this.place(base + i, x, y, z, i === 0 ? 0.02 : 0.013);
+      this.place(base + i, x, y, z, (i === 0 ? 0.02 : 0.013) * this.inflate);
     }
     this.thumbTip[side].set(this.local[4 * 3], this.local[4 * 3 + 1], this.local[4 * 3 + 2]);
     this.indexTip[side].set(this.local[9 * 3], this.local[9 * 3 + 1], this.local[9 * 3 + 2]);
@@ -176,7 +200,35 @@ export class HandOccluder {
         (ax + this.local[b * 3]) * 0.5,
         (ay + this.local[b * 3 + 1]) * 0.5,
         (az + this.local[b * 3 + 2]) * 0.5,
-        0.012,
+        0.012 * this.inflate,
+      );
+    }
+    this.writeForearm(base + JOINT_COUNT + BONES.length);
+  }
+
+  /** Up the arm from the wrist, away from the knuckles. Needs no joint orientation. */
+  private writeForearm(base: number): void {
+    const w = WRIST * 3;
+    const m = MIDDLE_METACARPAL * 3;
+    let dx = this.local[w] - this.local[m];
+    let dy = this.local[w + 1] - this.local[m + 1];
+    let dz = this.local[w + 2] - this.local[m + 2];
+    const len = Math.hypot(dx, dy, dz);
+    if (len < 1e-4) {
+      this.hideRange(base, FOREARM.length);
+      return;
+    }
+    dx /= len;
+    dy /= len;
+    dz /= len;
+    for (let i = 0; i < FOREARM.length; i++) {
+      const d = FOREARM[i];
+      this.place(
+        base + i,
+        this.local[w] + dx * d,
+        this.local[w + 1] + dy * d,
+        this.local[w + 2] + dz * d,
+        FOREARM_RADIUS * this.inflate,
       );
     }
   }

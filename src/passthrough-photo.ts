@@ -1,69 +1,100 @@
 import {
-  ArrayCamera,
   CanvasTexture,
   ClampToEdgeWrapping,
-  ExternalTexture,
   LinearFilter,
   Matrix4,
-  Mesh,
-  MeshBasicMaterial,
-  Object3D,
-  OrthographicCamera,
-  PerspectiveCamera,
-  PlaneGeometry,
-  Scene,
+  Quaternion,
   SRGBColorSpace,
   Vector3,
-  WebGLRenderTarget,
-  type Texture,
-  type WebGLRenderer,
+  type Object3D,
+  type PerspectiveCamera,
 } from '@iwsdk/core';
 
 export type CameraMount = 'left' | 'right' | 'center' | 'view';
 
-/** Where the passthrough camera sits, in the parent camera's local space. Pitch is radians, negative looks down. */
-interface Mount {
-  x: number;
-  y: number;
-  z: number;
-  pitch: number;
-}
-
-// Quest 3's getUserMedia passthrough image behaves like ~77° horizontal FOV at 1280×720
-// (fx ≈ fy ≈ 800). camera-access is still rejected by Quest Browser, so the pose is the
-// published offset of that camera from the right eye: a few centimetres toward center,
-// up, and forward, pitched down toward the hands. Other mounts mirror that.
-const RIGHT: Mount = { x: -0.032, y: 0.02, z: -0.025, pitch: -0.26 };
-const LEFT: Mount = { x: 0.032, y: 0.02, z: -0.025, pitch: -0.26 };
-const CENTER: Mount = { x: 0, y: 0.02, z: -0.025, pitch: -0.26 };
+/**
+ * Where the passthrough camera sits in the head's frame, before pitch. The right camera's published
+ * offset from the right eye is a few centimetres toward centre, up and forward, which lands near the
+ * middle of the head; the left mirrors it. Eye offsets are measured live when the mount is known.
+ */
+const FROM_EYE = { x: 0.032, y: 0.02, z: -0.025 };
+const CENTER = { x: 0, y: 0.02, z: -0.025 };
+// Quest 3's getUserMedia image behaves like ~77° horizontal FOV at 1280 wide (fx ≈ fy ≈ 800).
+// Pixels are square, so other aspect ratios are crops of the same lens.
 const REF_W = 1280;
-const REF_H = 720;
 const REF_F = 800;
 
-interface XRCameraImage {
-  width: number;
-  height: number;
+const BANK = 4;
+const POSES = 64;
+const PROBE_W = 16;
+const PROBE_H = 12;
+/** Mean linear luminance below this is a warm-up or suspended frame. */
+const DARK = 0.03;
+const STEADY_RAD = (8 * Math.PI) / 180;
+const STEADY_M = 0.1;
+/** Frames this soon after the camera starts are still finding their exposure. */
+const WARMUP = 1;
+const ADMIT_GAP = 0.2;
+const SAME_VIEW = Math.cos((20 * Math.PI) / 180);
+const MAX_AGE = 30;
+/** A photo must hold the whole grab footprint this far inside its edges. */
+const MARGIN = 0.08;
+/** Failing that, a hand-free photo still has to hold the grab point this far in. */
+const CENTER_MARGIN = 0.15;
+const HAND_PAD = 0.25;
+const RVFC_WAIT = 0.5;
+const CALIBRATE_GAP = 0.25;
+
+export interface LensTuning {
+  scale: number;
+  pitchDeg: number;
+  latency: number;
+  exposure: number;
+  warmth: number;
 }
 
-interface CameraView extends XRView {
-  camera?: XRCameraImage;
+/** Packed world-space joints, with where each hand's run starts and how long it is. */
+export interface HandJoints {
+  points: Float32Array;
+  leftStart: number;
+  leftCount: number;
+  rightStart: number;
+  rightCount: number;
 }
 
-interface CameraBinding extends XRWebGLBinding {
-  getCameraImage?: (camera: XRCameraImage) => WebGLTexture | null;
+interface BankEntry {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  used: boolean;
+  w: number;
+  h: number;
+  time: number;
+  lum: number;
+  readonly toClip: Matrix4;
+  readonly cam: Vector3;
+  readonly dir: Vector3;
+  /** uv boxes of each tracked hand: u0, v0, u1, v1 per hand. u0 > u1 means no hand. */
+  readonly hands: Float32Array;
 }
 
-export interface PhotoCapture {
-  renderer: WebGLRenderer;
-  presenting: boolean;
-  frame: XRFrame | null;
-  refSpace: XRReferenceSpace | null;
-  objectWorld: Matrix4;
-  center: Vector3;
-  video: HTMLVideoElement | null;
-  track: MediaStreamTrack | null;
-  mount: CameraMount;
-  viewCamera: PerspectiveCamera;
+export interface PhotoSlot {
+  texture: CanvasTexture | null;
+  /** A photo is frozen in this slot. */
+  has: boolean;
+  /** Its texture has actually reached the GPU. Uploads are deferred under multiview. */
+  ready: boolean;
+  readonly toClip: Matrix4;
+  readonly cam: Vector3;
+  readonly gain: Vector3;
+}
+
+interface SlotStore {
+  canvas: HTMLCanvasElement;
+  ctx: CanvasRenderingContext2D;
+  w: number;
+  h: number;
+  lum: number;
+  refreshAt: number;
 }
 
 /** Which visor camera a device label is talking about. A webcam stays `view`. */
@@ -77,435 +108,581 @@ export function cameraMount(label: string, facing: 'back' | 'front' | 'unknown')
 }
 
 /**
- * Freezes one camera frame and the projection that mapped it onto the object.
- * On a headset the frame is the passthrough camera. On a desk it is the webcam,
- * projected through the preview camera so the smear is still made of real pixels.
+ * Keeps a few clean camera frames, each stamped with the head pose it was taken from, and freezes
+ * one into a slot when a hand grabs. Clean means steady, bright, and with every tracked hand boxed
+ * so a grab can pick a frame whose hands are nowhere near what it stretches. On a desk the frames
+ * come from the webcam through the preview camera.
  */
 export class PassthroughPhoto {
-  readonly meshToClip = new Matrix4();
-  /** World-space points into the live camera's clip space. Updated by `projectLive`, not by a frozen capture. */
+  /** World-space points into the live camera's clip space, at the latency-corrected pose. */
   readonly worldToClip = new Matrix4();
   readonly liveCam = new Vector3();
-  /** Frozen snapshot, world space. A second grab reuses whatever the first one stored. */
-  readonly frozenToClip = new Matrix4();
-  readonly frozenCam = new Vector3();
-  readonly camMesh = new Vector3();
-  ready = false;
+  readonly slots: [PhotoSlot, PhotoSlot];
+  /** Tunables the system copies in from StretchLook each frame. */
+  readonly lens: LensTuning = { scale: 1, pitchDeg: -15, latency: 0.07, exposure: 1.1, warmth: -0.1 };
 
-  private readonly canvas = document.createElement('canvas');
-  private readonly ctx: CanvasRenderingContext2D;
-  private readonly canvasTex: CanvasTexture;
-  private readonly cleanCanvas = document.createElement('canvas');
-  private readonly cleanCtx: CanvasRenderingContext2D;
-  private readonly cleanTex: CanvasTexture;
-  private readonly cleanToClip = new Matrix4();
-  private readonly cleanCam = new Vector3();
-  private cleanAt = -Infinity;
-  private cleanReady = false;
-  private frozenIsClean = false;
-  private readonly rt: WebGLRenderTarget;
-  private readonly blitScene = new Scene();
-  private readonly blitCam = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
-  private readonly blitMat: MeshBasicMaterial;
-  private readonly external: ExternalTexture;
-  private showingRT = false;
-  private xrImages: boolean | null = null;
+  private readonly bank: BankEntry[] = [];
+  private readonly stores: [SlotStore, SlotStore];
+  private readonly probe: HTMLCanvasElement;
+  private readonly probeCtx: CanvasRenderingContext2D;
+  private sessionLum = 0;
+  private lastAdmit = -Infinity;
 
-  private readonly offset = new Matrix4();
+  private readonly poses = new Float64Array(POSES * 8);
+  private poseHead = -1;
+  private poseCount = 0;
+
+  private video: HTMLVideoElement | null = null;
+  private videoW = 0;
+  private videoH = 0;
+  private activeAt = 0;
+  private rvfcHandle = -1;
+  private rvfcSeen = false;
+  private frameSerial = 0;
+  private frameTime = 0;
+  private seenSerial = 0;
+  private polledFrames = -1;
+  private loggedPath = false;
+  private loggedTrack: MediaStreamTrack | null = null;
+
+  private readonly eyeShift = new Vector3(CENTER.x, CENTER.y, CENTER.z);
   private readonly camWorld = new Matrix4();
+  private readonly offset = new Matrix4();
+  private readonly pitch = new Matrix4();
   private readonly projection = new Matrix4();
   private readonly view = new Matrix4();
-  private readonly vp = new Matrix4();
-  private readonly centerT = new Matrix4();
-  private readonly meshFromWorld = new Matrix4();
-  private readonly camPos = new Vector3();
-  private readonly lensOffset = new Vector3();
-
-  private lensW = 0;
-  private lensH = 0;
-  private lensTrack: MediaStreamTrack | null = null;
-  private lensFx = REF_F;
-  private lensFy = REF_F;
-  private lensCx = REF_W / 2;
-  private lensCy = REF_H / 2;
-  private lensHasOffset = false;
-  private lensPitch: number | null = null;
+  private readonly pos = new Vector3();
+  private readonly quat = new Quaternion();
+  private readonly quatB = new Quaternion();
+  private readonly quatC = new Quaternion();
+  private readonly one = new Vector3(1, 1, 1);
+  private readonly tmp = new Vector3();
+  private readonly inv = new Matrix4();
+  private readonly eyeLocal = new Matrix4();
 
   constructor() {
-    this.canvas.width = 2;
-    this.canvas.height = 2;
-    const ctx = this.canvas.getContext('2d');
-    if (!ctx) throw new Error('2D canvas is unavailable');
-    this.ctx = ctx;
-    this.canvasTex = new CanvasTexture(this.canvas);
-    this.canvasTex.colorSpace = SRGBColorSpace;
-    this.canvasTex.minFilter = LinearFilter;
-    this.canvasTex.magFilter = LinearFilter;
-    this.canvasTex.generateMipmaps = false;
-    this.canvasTex.wrapS = ClampToEdgeWrapping;
-    this.canvasTex.wrapT = ClampToEdgeWrapping;
-    this.cleanCanvas.width = 2;
-    this.cleanCanvas.height = 2;
-    const cleanCtx = this.cleanCanvas.getContext('2d');
-    if (!cleanCtx) throw new Error('2D canvas is unavailable');
-    this.cleanCtx = cleanCtx;
-    this.cleanTex = new CanvasTexture(this.cleanCanvas);
-    this.cleanTex.colorSpace = SRGBColorSpace;
-    this.cleanTex.minFilter = LinearFilter;
-    this.cleanTex.magFilter = LinearFilter;
-    this.cleanTex.generateMipmaps = false;
-    this.cleanTex.wrapS = ClampToEdgeWrapping;
-    this.cleanTex.wrapT = ClampToEdgeWrapping;
-    this.rt = new WebGLRenderTarget(4, 4, { depthBuffer: false, stencilBuffer: false });
-    this.rt.texture.colorSpace = SRGBColorSpace;
-    this.rt.texture.minFilter = LinearFilter;
-    this.rt.texture.magFilter = LinearFilter;
-    this.rt.texture.generateMipmaps = false;
-    this.blitMat = new MeshBasicMaterial({ map: this.canvasTex, toneMapped: false });
-    this.blitScene.add(new Mesh(new PlaneGeometry(2, 2), this.blitMat));
-    this.external = new ExternalTexture(null);
+    for (let i = 0; i < BANK; i++) {
+      const canvas = document.createElement('canvas');
+      const ctx = canvas.getContext('2d');
+      if (!ctx) throw new Error('2D canvas is unavailable');
+      this.bank.push({
+        canvas, ctx, used: false, w: 0, h: 0, time: 0, lum: 0,
+        toClip: new Matrix4(), cam: new Vector3(), dir: new Vector3(), hands: new Float32Array(8),
+      });
+    }
+    this.stores = [makeStore(), makeStore()];
+    this.slots = [makeSlot(), makeSlot()];
+    this.probe = document.createElement('canvas');
+    this.probe.width = PROBE_W;
+    this.probe.height = PROBE_H;
+    const probeCtx = this.probe.getContext('2d', { willReadFrequently: true });
+    if (!probeCtx) throw new Error('2D canvas is unavailable');
+    this.probeCtx = probeCtx;
   }
 
-  get texture(): Texture {
-    return this.showingRT ? this.rt.texture : this.canvasTex;
-  }
-
-  /** The snapshot a grab is showing. The clean frame when hands were out of view, otherwise the pinch frame. */
-  get frozenTexture(): Texture {
-    return this.frozenIsClean ? this.cleanTex : this.texture;
-  }
-
-  invalidate(): void {
-    this.ready = false;
+  /** Call every presenting frame, after the input system moved the head. */
+  recordHead(head: Object3D, now: number): void {
+    head.matrixWorld.decompose(this.pos, this.quat, this.tmp);
+    this.poseHead = (this.poseHead + 1) % POSES;
+    this.poseCount = Math.min(POSES, this.poseCount + 1);
+    const o = this.poseHead * 8;
+    const p = this.poses;
+    p[o] = now;
+    p[o + 1] = this.pos.x;
+    p[o + 2] = this.pos.y;
+    p[o + 3] = this.pos.z;
+    p[o + 4] = this.quat.x;
+    p[o + 5] = this.quat.y;
+    p[o + 6] = this.quat.z;
+    p[o + 7] = this.quat.w;
   }
 
   /**
-   * Updates `worldToClip` for the camera that is playing right now.
-   * Leaves the frozen snapshot alone, so a pinch and this overlay can share one photo helper.
+   * Follows the camera's video element. A new element or new size is a camera restart: the
+   * bank is dropped and the warm-up starts again. Returns whether a usable video is playing.
    */
-  projectLive(req: Omit<PhotoCapture, 'objectWorld' | 'center'>): boolean {
-    const video = req.video;
+  watch(video: HTMLVideoElement | null, track: MediaStreamTrack | null, now: number): boolean {
+    if (video !== this.video) {
+      if (this.video && this.rvfcHandle >= 0) this.video.cancelVideoFrameCallback?.(this.rvfcHandle);
+      this.video = video;
+      this.rvfcHandle = -1;
+      this.rvfcSeen = false;
+      this.activeAt = now;
+      this.polledFrames = -1;
+      if (video && typeof video.requestVideoFrameCallback === 'function') {
+        this.rvfcHandle = video.requestVideoFrameCallback(this.onFrame);
+      }
+    }
     if (!video || video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) return false;
-    if (req.presenting) this.fitLens(req, video.videoWidth, video.videoHeight);
-    else this.fitView(req.viewCamera);
-    this.worldToClip.copy(this.vp);
-    this.liveCam.copy(this.camPos);
+    if (video.videoWidth !== this.videoW || video.videoHeight !== this.videoH) {
+      this.videoW = video.videoWidth;
+      this.videoH = video.videoHeight;
+      this.activeAt = now;
+      for (let i = 0; i < this.bank.length; i++) this.bank[i].used = false;
+      console.info(`[jonze] camera frame ${this.videoW}x${this.videoH}`);
+    }
+    if (track && track !== this.loggedTrack) {
+      this.loggedTrack = track;
+      logTrack(track);
+    }
     return true;
   }
 
-  /** True when any joint lands inside the live camera, so that frame would smear a hand onto the room. */
-  jointsInFrame(points: ArrayLike<number>, count: number): boolean {
-    for (let i = 0; i < count; i++) {
-      if (this.contains(points[i * 3], points[i * 3 + 1], points[i * 3 + 2], this.worldToClip)) return true;
+  /** Measures where the camera sits relative to the head when the mount is one eye's camera. */
+  measureMount(mount: CameraMount, head: Object3D, eyes: readonly Object3D[]): void {
+    if ((mount !== 'left' && mount !== 'right') || eyes.length < 2) {
+      this.eyeShift.set(CENTER.x, CENTER.y, CENTER.z);
+      return;
     }
-    return false;
+    const eye = mount === 'left' ? eyes[0] : eyes[eyes.length - 1];
+    this.eyeLocal.compose(eye.position, eye.quaternion, this.one);
+    this.inv.copy(head.matrix).invert().multiply(this.eyeLocal);
+    this.eyeShift.setFromMatrixPosition(this.inv);
+    const toward = mount === 'left' ? FROM_EYE.x : -FROM_EYE.x;
+    this.eyeShift.x += toward;
+    this.eyeShift.y += FROM_EYE.y;
+    this.eyeShift.z += FROM_EYE.z;
   }
 
   /**
-   * Keeps one spare frame from a moment when the hands were out of the camera.
-   * Call after `projectLive`. `allow` is false while a joint is inside the frame.
+   * The live camera's projection: the head pose one camera latency ago on a headset, the preview
+   * camera on a desk. Used for the pinch-frame fallback and calibration.
    */
-  keepClean(video: HTMLVideoElement | null, allow: boolean): void {
-    if (!allow || !video) return;
-    const now = performance.now() / 1000;
-    if (this.cleanReady && now - this.cleanAt < 0.25) return;
-    if (!this.drawInto(this.cleanCanvas, this.cleanCtx, this.cleanTex, video)) return;
-    this.cleanToClip.copy(this.worldToClip);
-    this.cleanCam.copy(this.camPos);
-    this.cleanAt = now;
-    this.cleanReady = true;
-  }
-
-  /**
-   * Freezes a world-space snapshot for a grab at `point`.
-   * Uses the spare frame when it is recent and contains the point, so raised hands
-   * are not painted onto the table. `reuse` keeps the snapshot the other hand already took.
-   */
-  freezeWorld(video: HTMLVideoElement | null, point: Vector3 | null, reuse: boolean): boolean {
-    if (reuse && this.ready) return true;
-    const now = performance.now() / 1000;
-    if (
-      this.cleanReady &&
-      now - this.cleanAt < 2 &&
-      point &&
-      this.contains(point.x, point.y, point.z, this.cleanToClip)
-    ) {
-      this.frozenIsClean = true;
-      this.frozenToClip.copy(this.cleanToClip);
-      this.frozenCam.copy(this.cleanCam);
-      this.showingRT = false;
-      this.ready = true;
-      return true;
+  projectLive(presenting: boolean, viewCamera: PerspectiveCamera, now: number): boolean {
+    if (!this.videoW) return false;
+    if (presenting) {
+      if (!this.poseAt(now - this.lens.latency)) return false;
+      this.writeClip(this.worldToClip, this.liveCam);
+    } else {
+      viewCamera.updateMatrixWorld();
+      this.worldToClip.copy(viewCamera.projectionMatrix).multiply(viewCamera.matrixWorldInverse);
+      this.liveCam.setFromMatrixPosition(viewCamera.matrixWorld);
     }
-    if (!video || !this.drawInto(this.canvas, this.ctx, this.canvasTex, video)) return false;
-    this.frozenIsClean = false;
-    this.frozenToClip.copy(this.worldToClip);
-    this.frozenCam.copy(this.camPos);
-    this.showingRT = false;
-    this.ready = true;
     return true;
   }
 
-  /** Copies the current frame and bakes object-local points into that frame's clip space. */
-  capture(req: PhotoCapture): boolean {
-    if (req.video && this.drawVideo(req.video)) {
-      if (req.presenting) this.fitQuest(req);
-      else this.fitView(req.viewCamera);
-      this.finish(req.objectWorld, req.center);
-      this.showingRT = false;
-      this.ready = true;
+  /**
+   * Considers the newest camera frame for the bank. `handsKnown` is false while a hand that should
+   * be tracked isn't, since it could be anywhere in the picture. `steady` covers the desk preview.
+   */
+  capture(presenting: boolean, viewCamera: PerspectiveCamera, joints: HandJoints | null, handsKnown: boolean, now: number): void {
+    const video = this.video;
+    if (!video || !this.videoW || !handsKnown) return;
+    if (now - this.activeAt < WARMUP || now - this.lastAdmit < ADMIT_GAP) return;
+    let captured = now - this.lens.latency;
+    if (presenting) {
+      if (this.rvfcSeen) {
+        if (this.frameSerial === this.seenSerial) return;
+        this.seenSerial = this.frameSerial;
+        captured = this.frameTime > 0 ? this.frameTime : captured;
+      } else {
+        if (this.rvfcHandle >= 0 && now - this.activeAt < RVFC_WAIT) return;
+        const frames = video.getVideoPlaybackQuality?.().totalVideoFrames ?? -1;
+        if (frames >= 0 && frames === this.polledFrames) return;
+        this.polledFrames = frames;
+      }
+      this.notePath();
+      if (!this.steady(captured - 0.06, now)) return;
+    }
+    const lum = this.measure(video);
+    if (lum < DARK) return;
+    if (presenting) {
+      if (!this.poseAt(captured)) return;
+    } else {
+      viewCamera.updateMatrixWorld();
+    }
+    const entry = this.pick(presenting, viewCamera);
+    if (!entry) return;
+    if (entry.canvas.width !== this.videoW || entry.canvas.height !== this.videoH) {
+      entry.canvas.width = this.videoW;
+      entry.canvas.height = this.videoH;
+    }
+    entry.ctx.drawImage(video, 0, 0, this.videoW, this.videoH);
+    entry.used = true;
+    entry.w = this.videoW;
+    entry.h = this.videoH;
+    entry.time = now;
+    entry.lum = lum;
+    this.boxHands(entry, joints);
+    this.sessionLum = this.sessionLum > 0 ? this.sessionLum + (lum - this.sessionLum) * 0.2 : lum;
+    this.lastAdmit = now;
+  }
+
+  /**
+   * Freezes a photo into slot `k` for a grab whose footprint is `count` world points, the grab
+   * point first. Prefers a recent bank frame with no hand on the footprint: one that holds all of
+   * it, else one that holds the grab point well inside (the rest feathers out). Only then the live
+   * frame, which has the pinching hand in it. False when nothing usable exists.
+   */
+  freeze(k: 0 | 1, footprint: Float32Array, count: number, presenting: boolean, viewCamera: PerspectiveCamera, now: number): boolean {
+    let best: BankEntry | null = null;
+    let bestScore = -Infinity;
+    for (let i = 0; i < this.bank.length; i++) {
+      const entry = this.bank[i];
+      if (!entry.used || now - entry.time > MAX_AGE) continue;
+      const center = footprintMargin(entry.toClip, footprint, 1);
+      if (center < CENTER_MARGIN || touchesHands(entry, footprint, count)) continue;
+      const margin = footprintMargin(entry.toClip, footprint, count);
+      const tier = margin >= MARGIN ? 2 : 1;
+      const score = tier * 10 + (margin >= MARGIN ? margin : center) / (1 + (now - entry.time) / 8);
+      if (score > bestScore) {
+        bestScore = score;
+        best = entry;
+      }
+    }
+    if (best) {
+      this.fill(k, best.canvas, best.w, best.h, best.lum, now);
+      this.slots[k].toClip.copy(best.toClip);
+      this.slots[k].cam.copy(best.cam);
       return true;
     }
-    return this.tryXR(req);
+    const video = this.video;
+    if (!video || !this.videoW || !this.projectLive(presenting, viewCamera, now)) return false;
+    if (footprintMargin(this.worldToClip, footprint, 1) < 0.02) return false;
+    const lum = this.measure(video);
+    if (lum < DARK) return false;
+    this.fill(k, video, this.videoW, this.videoH, lum, now);
+    this.slots[k].toClip.copy(this.worldToClip);
+    this.slots[k].cam.copy(this.liveCam);
+    return true;
+  }
+
+  /** Calibration: keeps slot `k` fed with the live camera a few times a second. */
+  refreshLive(k: 0 | 1, presenting: boolean, viewCamera: PerspectiveCamera, now: number): void {
+    const store = this.stores[k];
+    const video = this.video;
+    if (!video || !this.videoW || now - store.refreshAt < CALIBRATE_GAP) return;
+    if (!this.projectLive(presenting, viewCamera, now)) return;
+    store.refreshAt = now;
+    this.fill(k, video, this.videoW, this.videoH, this.sessionLum || 0.2, now);
+    this.slots[k].toClip.copy(this.worldToClip);
+    this.slots[k].cam.copy(this.liveCam);
+  }
+
+  /** True when `point` lands inside slot `k`'s photo with `margin` to spare. */
+  slotContains(k: 0 | 1, point: Vector3, margin: number): boolean {
+    const slot = this.slots[k];
+    if (!slot.has) return true;
+    return uvMargin(slot.toClip, point.x, point.y, point.z) >= margin;
+  }
+
+  /** Re-derives each slot's colour from the current exposure and warmth. */
+  updateGains(): void {
+    for (let k = 0; k < 2; k++) this.writeGain(this.slots[k].gain, this.stores[k].lum);
+  }
+
+  drop(k: 0 | 1): void {
+    this.slots[k].has = false;
+  }
+
+  /** Forget every frame: a new session, a recentred space, or a restarted camera. */
+  clear(): void {
+    for (let i = 0; i < this.bank.length; i++) this.bank[i].used = false;
+    this.slots[0].has = false;
+    this.slots[1].has = false;
+    this.poseCount = 0;
+    this.poseHead = -1;
+    this.lastAdmit = -Infinity;
   }
 
   dispose(): void {
-    this.canvasTex.dispose();
-    this.cleanTex.dispose();
-    this.rt.dispose();
-    this.blitMat.dispose();
-    this.blitScene.traverse((object) => {
-      const mesh = object as Mesh;
-      mesh.geometry?.dispose();
-    });
-  }
-
-  private drawVideo(video: HTMLVideoElement): boolean {
-    return this.drawInto(this.canvas, this.ctx, this.canvasTex, video);
-  }
-
-  private drawInto(
-    canvas: HTMLCanvasElement,
-    ctx: CanvasRenderingContext2D,
-    tex: CanvasTexture,
-    video: HTMLVideoElement,
-  ): boolean {
-    if (video.readyState < 2 || video.videoWidth === 0 || video.videoHeight === 0) return false;
-    const w = video.videoWidth;
-    const h = video.videoHeight;
-    if (canvas.width !== w || canvas.height !== h) {
-      canvas.width = w;
-      canvas.height = h;
+    if (this.video && this.rvfcHandle >= 0) this.video.cancelVideoFrameCallback?.(this.rvfcHandle);
+    this.video = null;
+    for (let k = 0; k < 2; k++) {
+      this.slots[k].texture?.dispose();
+      this.slots[k].texture = null;
     }
-    ctx.drawImage(video, 0, 0, w, h);
-    tex.needsUpdate = true;
+  }
+
+  // ---------------------------------------------------------------- internals
+
+  private readonly onFrame = (_now: number, meta: VideoFrameCallbackMetadata): void => {
+    const video = this.video;
+    if (!video) return;
+    this.rvfcSeen = true;
+    this.frameSerial++;
+    const at = meta.captureTime ?? meta.expectedDisplayTime - this.lens.latency * 1000;
+    this.frameTime = at / 1000;
+    this.rvfcHandle = video.requestVideoFrameCallback(this.onFrame);
+  };
+
+  private notePath(): void {
+    if (this.loggedPath) return;
+    this.loggedPath = true;
+    console.info(`[jonze] camera frames: ${this.rvfcSeen ? 'requestVideoFrameCallback' : 'polling, latency estimate'}`);
+  }
+
+  /** Copies a source into slot `k`'s own canvas, rebuilding its texture when the size changes. */
+  private fill(k: 0 | 1, source: CanvasImageSource, w: number, h: number, lum: number, now: number): void {
+    const store = this.stores[k];
+    const slot = this.slots[k];
+    if (store.w !== w || store.h !== h || !slot.texture) {
+      store.canvas.width = w;
+      store.canvas.height = h;
+      store.w = w;
+      store.h = h;
+      slot.texture?.dispose();
+      slot.texture = makeTexture(store.canvas, slot);
+    }
+    store.ctx.drawImage(source, 0, 0, w, h);
+    store.lum = lum;
+    store.refreshAt = now;
+    slot.ready = false;
+    slot.texture.needsUpdate = true;
+    slot.has = true;
+    this.writeGain(slot.gain, lum);
+  }
+
+  private writeGain(out: Vector3, lum: number): void {
+    const auto = lum > 0 && this.sessionLum > 0 ? Math.min(1.15, Math.max(0.85, this.sessionLum / lum)) : 1;
+    const g = this.lens.exposure * auto;
+    const w = this.lens.warmth;
+    out.set(g * (1 + 0.5 * w), g, g * (1 - 0.5 * w));
+  }
+
+  /** Mean linear luminance of the video, from a tiny copy. */
+  private measure(video: HTMLVideoElement): number {
+    this.probeCtx.drawImage(video, 0, 0, PROBE_W, PROBE_H);
+    const data = this.probeCtx.getImageData(0, 0, PROBE_W, PROBE_H).data;
+    let sum = 0;
+    for (let i = 0; i < data.length; i += 4) {
+      sum += 0.2126 * SRGB_TO_LINEAR[data[i]] + 0.7152 * SRGB_TO_LINEAR[data[i + 1]] + 0.0722 * SRGB_TO_LINEAR[data[i + 2]];
+    }
+    return sum / (PROBE_W * PROBE_H);
+  }
+
+  /** Bank entry for a frame looking the way the camera looks now: the same view, else empty, else oldest. */
+  private pick(presenting: boolean, viewCamera: PerspectiveCamera): BankEntry | null {
+    const toClip = this.projection;
+    const cam = this.pos;
+    const dir = this.tmp;
+    if (presenting) {
+      this.writeClip(toClip, cam);
+      dir.set(-this.camWorld.elements[8], -this.camWorld.elements[9], -this.camWorld.elements[10]).normalize();
+    } else {
+      toClip.copy(viewCamera.projectionMatrix).multiply(viewCamera.matrixWorldInverse);
+      cam.setFromMatrixPosition(viewCamera.matrixWorld);
+      viewCamera.getWorldDirection(dir);
+    }
+    let chosen: BankEntry | null = null;
+    for (let i = 0; i < this.bank.length; i++) {
+      const entry = this.bank[i];
+      if (entry.used && entry.dir.dot(dir) > SAME_VIEW) {
+        chosen = entry;
+        break;
+      }
+    }
+    if (!chosen) {
+      for (let i = 0; i < this.bank.length; i++) {
+        const entry = this.bank[i];
+        if (!entry.used) {
+          chosen = entry;
+          break;
+        }
+        if (!chosen || entry.time < chosen.time) chosen = entry;
+      }
+    }
+    if (!chosen) return null;
+    chosen.toClip.copy(toClip);
+    chosen.cam.copy(cam);
+    chosen.dir.copy(dir);
+    return chosen;
+  }
+
+  private boxHands(entry: BankEntry, joints: HandJoints | null): void {
+    const box = entry.hands;
+    for (let i = 0; i < 2; i++) {
+      box[i * 4] = 1;
+      box[i * 4 + 1] = 1;
+      box[i * 4 + 2] = 0;
+      box[i * 4 + 3] = 0;
+    }
+    if (!joints) return;
+    this.boxOne(entry, joints.points, joints.leftStart, joints.leftCount, 0);
+    this.boxOne(entry, joints.points, joints.rightStart, joints.rightCount, 1);
+  }
+
+  private boxOne(entry: BankEntry, points: Float32Array, start: number, count: number, slot: number): void {
+    if (count <= 0) return;
+    const e = entry.toClip.elements;
+    let u0 = Infinity;
+    let v0 = Infinity;
+    let u1 = -Infinity;
+    let v1 = -Infinity;
+    for (let i = start; i < start + count; i++) {
+      const x = points[i * 3];
+      const y = points[i * 3 + 1];
+      const z = points[i * 3 + 2];
+      const w = e[3] * x + e[7] * y + e[11] * z + e[15];
+      if (w <= 1e-4) continue;
+      const u = ((e[0] * x + e[4] * y + e[8] * z + e[12]) / w) * 0.5 + 0.5;
+      const v = ((e[1] * x + e[5] * y + e[9] * z + e[13]) / w) * 0.5 + 0.5;
+      if (u < u0) u0 = u;
+      if (v < v0) v0 = v;
+      if (u > u1) u1 = u;
+      if (v > v1) v1 = v;
+    }
+    if (u0 > u1) return;
+    const padU = (u1 - u0) * HAND_PAD + 0.02;
+    const padV = (v1 - v0) * HAND_PAD + 0.02;
+    const o = slot * 4;
+    entry.hands[o] = u0 - padU;
+    entry.hands[o + 1] = v0 - padV;
+    entry.hands[o + 2] = u1 + padU;
+    entry.hands[o + 3] = v1 + padV;
+  }
+
+  /** True when the head turned less than ~8°/s and moved less than 0.1 m/s between two times. */
+  private steady(from: number, to: number): boolean {
+    if (to - from < 1e-3 || !this.poseAt(from)) return false;
+    const ax = this.pos.x;
+    const ay = this.pos.y;
+    const az = this.pos.z;
+    this.quatC.copy(this.quat);
+    if (!this.poseAt(to)) return false;
+    const dt = to - from;
+    const moved = Math.hypot(this.pos.x - ax, this.pos.y - ay, this.pos.z - az) / dt;
+    const turned = this.quat.angleTo(this.quatC) / dt;
+    return moved < STEADY_M && turned < STEADY_RAD;
+  }
+
+  /** Head pose at `time`, interpolated from the ring, into `pos`/`quat`. */
+  private poseAt(time: number): boolean {
+    const n = this.poseCount;
+    if (n === 0) return false;
+    const p = this.poses;
+    let newer = this.poseHead;
+    for (let i = 0; i < n; i++) {
+      const idx = (this.poseHead - i + POSES) % POSES;
+      const o = idx * 8;
+      if (p[o] <= time) {
+        if (i === 0) {
+          this.readPose(o);
+          return true;
+        }
+        const on = newer * 8;
+        const span = p[on] - p[o];
+        const f = span > 1e-6 ? (time - p[o]) / span : 0;
+        this.readPose(o);
+        this.quatB.set(p[on + 4], p[on + 5], p[on + 6], p[on + 7]);
+        this.pos.set(
+          this.pos.x + (p[on + 1] - this.pos.x) * f,
+          this.pos.y + (p[on + 2] - this.pos.y) * f,
+          this.pos.z + (p[on + 3] - this.pos.z) * f,
+        );
+        this.quat.slerp(this.quatB, f);
+        return true;
+      }
+      newer = idx;
+    }
+    this.readPose(((this.poseHead - n + 1 + POSES) % POSES) * 8);
     return true;
   }
 
-  private contains(x: number, y: number, z: number, clip: Matrix4): boolean {
-    const e = clip.elements;
+  private readPose(o: number): void {
+    const p = this.poses;
+    this.pos.set(p[o + 1], p[o + 2], p[o + 3]);
+    this.quat.set(p[o + 4], p[o + 5], p[o + 6], p[o + 7]);
+  }
+
+  /** Camera projection from the pose in `pos`/`quat`. Also leaves the camera matrix in `camWorld`. */
+  private writeClip(outClip: Matrix4, outCam: Vector3): void {
+    this.camWorld.compose(this.pos, this.quat, this.one);
+    this.offset.makeTranslation(this.eyeShift.x, this.eyeShift.y, this.eyeShift.z);
+    this.pitch.makeRotationX((this.lens.pitchDeg * Math.PI) / 180);
+    this.camWorld.multiply(this.offset).multiply(this.pitch);
+    const f = REF_F * (this.videoW / REF_W) * this.lens.scale;
+    writeProjection(this.view, f, f, this.videoW * 0.5, this.videoH * 0.5, this.videoW, this.videoH);
+    outCam.setFromMatrixPosition(this.camWorld);
+    outClip.copy(this.camWorld).invert().premultiply(this.view);
+  }
+}
+
+const SRGB_TO_LINEAR = (() => {
+  const table = new Float32Array(256);
+  for (let i = 0; i < 256; i++) {
+    const c = i / 255;
+    table[i] = c <= 0.04045 ? c / 12.92 : Math.pow((c + 0.055) / 1.055, 2.4);
+  }
+  return table;
+})();
+
+function makeStore(): SlotStore {
+  const canvas = document.createElement('canvas');
+  canvas.width = 2;
+  canvas.height = 2;
+  const ctx = canvas.getContext('2d');
+  if (!ctx) throw new Error('2D canvas is unavailable');
+  return { canvas, ctx, w: 0, h: 0, lum: 0, refreshAt: -Infinity };
+}
+
+function makeSlot(): PhotoSlot {
+  return { texture: null, has: false, ready: false, toClip: new Matrix4(), cam: new Vector3(), gain: new Vector3(1, 1, 1) };
+}
+
+/** Created at the frame's real size: three allocates immutable storage on the first upload. */
+function makeTexture(canvas: HTMLCanvasElement, slot: PhotoSlot): CanvasTexture {
+  const tex = new CanvasTexture(canvas);
+  tex.colorSpace = SRGBColorSpace;
+  tex.minFilter = LinearFilter;
+  tex.magFilter = LinearFilter;
+  tex.generateMipmaps = false;
+  tex.wrapS = ClampToEdgeWrapping;
+  tex.wrapT = ClampToEdgeWrapping;
+  tex.onUpdate = () => {
+    slot.ready = true;
+  };
+  return tex;
+}
+
+/** Distance from the point's uv to the nearest frame edge; negative outside or behind. */
+function uvMargin(clip: Matrix4, x: number, y: number, z: number): number {
+  const e = clip.elements;
+  const w = e[3] * x + e[7] * y + e[11] * z + e[15];
+  if (w <= 1e-4) return -1;
+  const u = ((e[0] * x + e[4] * y + e[8] * z + e[12]) / w) * 0.5 + 0.5;
+  const v = ((e[1] * x + e[5] * y + e[9] * z + e[13]) / w) * 0.5 + 0.5;
+  return Math.min(u, 1 - u, v, 1 - v);
+}
+
+/** Smallest margin over the footprint's points. */
+function footprintMargin(clip: Matrix4, points: Float32Array, count: number): number {
+  let low = Infinity;
+  for (let i = 0; i < count; i++) {
+    const m = uvMargin(clip, points[i * 3], points[i * 3 + 1], points[i * 3 + 2]);
+    if (m < low) low = m;
+    if (low < 0) return low;
+  }
+  return low;
+}
+
+/** True when any footprint point lands in a hand box of that frame. */
+function touchesHands(entry: BankEntry, points: Float32Array, count: number): boolean {
+  const e = entry.toClip.elements;
+  const box = entry.hands;
+  for (let i = 0; i < count; i++) {
+    const x = points[i * 3];
+    const y = points[i * 3 + 1];
+    const z = points[i * 3 + 2];
     const w = e[3] * x + e[7] * y + e[11] * z + e[15];
-    if (w <= 1e-4) return false;
+    if (w <= 1e-4) continue;
     const u = ((e[0] * x + e[4] * y + e[8] * z + e[12]) / w) * 0.5 + 0.5;
     const v = ((e[1] * x + e[5] * y + e[9] * z + e[13]) / w) * 0.5 + 0.5;
-    return u > 0.02 && u < 0.98 && v > 0.02 && v < 0.98;
-  }
-
-  private fitView(cam: PerspectiveCamera): void {
-    cam.updateMatrixWorld();
-    this.vp.copy(cam.projectionMatrix).multiply(cam.matrixWorldInverse);
-    this.camPos.setFromMatrixPosition(cam.matrixWorld);
-  }
-
-  private fitQuest(req: PhotoCapture): void {
-    this.fitLens(req, this.canvas.width, this.canvas.height);
-  }
-
-  private fitLens(req: Omit<PhotoCapture, 'objectWorld' | 'center'>, w: number, h: number): void {
-    this.readLens(req.track, w, h);
-    const xrCam = req.renderer.xr.getCamera() as ArrayCamera;
-    xrCam.updateMatrixWorld(true);
-    const eyes = xrCam.cameras;
-    const mount = req.mount === 'view' ? 'center' : req.mount;
-    if (this.lensHasOffset) {
-      this.place(xrCam, this.lensOffset.x, this.lensOffset.y, this.lensOffset.z, this.lensPitch ?? CENTER.pitch);
-    } else if (mount === 'left' && eyes[0]) {
-      this.place(eyes[0], LEFT.x, LEFT.y, LEFT.z, LEFT.pitch);
-    } else if (mount === 'right' && eyes.length) {
-      this.place(eyes[eyes.length - 1], RIGHT.x, RIGHT.y, RIGHT.z, RIGHT.pitch);
-    } else {
-      this.place(xrCam, CENTER.x, CENTER.y, CENTER.z, CENTER.pitch);
-    }
-    writeProjection(this.projection, this.lensFx, this.lensFy, this.lensCx, this.lensCy, w, h);
-    this.view.copy(this.camWorld).invert();
-    this.vp.copy(this.projection).multiply(this.view);
-    this.camPos.setFromMatrixPosition(this.camWorld);
-  }
-
-  private place(parent: Object3D, x: number, y: number, z: number, pitch: number): void {
-    this.offset.makeRotationX(pitch);
-    this.offset.setPosition(x, y, z);
-    parent.updateWorldMatrix(true, false);
-    this.camWorld.copy(parent.matrixWorld).multiply(this.offset);
-  }
-
-  private finish(objectWorld: Matrix4, center: Vector3): void {
-    this.centerT.makeTranslation(center.x, center.y, center.z);
-    this.meshToClip.copy(this.vp).multiply(objectWorld).multiply(this.centerT);
-    this.meshFromWorld.copy(objectWorld).multiply(this.centerT).invert();
-    this.camMesh.copy(this.camPos).applyMatrix4(this.meshFromWorld);
-  }
-
-  /** Raw camera access, when the browser actually has it. The image belongs to that eye. */
-  private tryXR(req: PhotoCapture): boolean {
-    if (this.xrImages === false || !req.presenting || !req.frame || !req.refSpace) return false;
-    const binding = req.renderer.xr.getBinding() as CameraBinding | null;
-    if (!binding?.getCameraImage) {
-      this.xrImages = false;
-      return false;
-    }
-    const pose = req.frame.getViewerPose(req.refSpace);
-    if (!pose) return false;
-    for (const view of pose.views) {
-      const camera = (view as CameraView).camera;
-      if (!camera) continue;
-      const tex = binding.getCameraImage(camera);
-      if (!tex) continue;
-      this.blit(req.renderer, tex, camera.width, camera.height);
-      this.fitEye(req.renderer, view.eye);
-      this.finish(req.objectWorld, req.center);
-      this.showingRT = true;
-      this.ready = true;
-      this.xrImages = true;
-      return true;
-    }
-    return false;
-  }
-
-  private fitEye(renderer: WebGLRenderer, eye: XREye): void {
-    const xrCam = renderer.xr.getCamera() as ArrayCamera;
-    xrCam.updateMatrixWorld(true);
-    const eyes = xrCam.cameras;
-    const cam = eye === 'left' ? eyes[0] : eyes[eyes.length - 1] ?? eyes[0];
-    if (!cam) {
-      this.fitView(xrCam as unknown as PerspectiveCamera);
-      return;
-    }
-    this.vp.copy(cam.projectionMatrix).multiply(cam.matrixWorldInverse);
-    this.camPos.setFromMatrixPosition(cam.matrixWorld);
-  }
-
-  private blit(renderer: WebGLRenderer, tex: WebGLTexture, w: number, h: number): void {
-    this.external.sourceTexture = tex;
-    if (this.rt.width !== w || this.rt.height !== h) this.rt.setSize(w, h);
-    this.blitMat.map = this.external;
-    const prev = renderer.getRenderTarget();
-    const xrOn = renderer.xr.enabled;
-    renderer.xr.enabled = false;
-    try {
-      renderer.setRenderTarget(this.rt);
-      renderer.clear();
-      renderer.render(this.blitScene, this.blitCam);
-    } finally {
-      renderer.setRenderTarget(prev);
-      renderer.xr.enabled = xrOn;
+    for (let h = 0; h < 2; h++) {
+      const o = h * 4;
+      if (box[o] <= box[o + 2] && u >= box[o] && u <= box[o + 2] && v >= box[o + 1] && v <= box[o + 3]) return true;
     }
   }
-
-  /** Intrinsics from the track when the browser reports them, otherwise the Quest 3 estimate scaled to this frame. */
-  private readLens(track: MediaStreamTrack | null, w: number, h: number): void {
-    if (this.lensTrack === track && this.lensW === w && this.lensH === h) return;
-    this.lensTrack = track;
-    this.lensW = w;
-    this.lensH = h;
-    this.lensFx = REF_F * (w / REF_W);
-    this.lensFy = REF_F * (h / REF_H);
-    this.lensCx = w * 0.5;
-    this.lensCy = h * 0.5;
-    this.lensHasOffset = false;
-    this.lensPitch = null;
-    if (!track) return;
-    let settings: Record<string, unknown>;
-    try {
-      settings = track.getSettings() as Record<string, unknown>;
-    } catch {
-      return;
-    }
-    const sw = typeof settings.width === 'number' && settings.width > 0 ? settings.width : w;
-    const sh = typeof settings.height === 'number' && settings.height > 0 ? settings.height : h;
-    let fx: number | null = null;
-    let fy: number | null = null;
-    let cx: number | null = null;
-    let cy: number | null = null;
-    for (const [raw, value] of Object.entries(settings)) {
-      const key = raw.toLowerCase();
-      if (key.includes('intrinsic') && Array.isArray(value) && value.length >= 9) {
-        const mfx = num(value[0]);
-        const mfy = num(value[4]);
-        const mcx = num(value[2]);
-        const mcy = num(value[5]);
-        if (mfx !== null && mfy !== null && mfx > 50 && mfy > 50) {
-          fx = mfx;
-          fy = mfy;
-          cx = mcx;
-          cy = mcy;
-        }
-      }
-      if (key.includes('focal')) {
-        const pair = xy(value);
-        if (pair && pair.x > 50 && pair.y > 50) {
-          fx = pair.x;
-          fy = pair.y;
-        } else {
-          const n = num(value);
-          if (n !== null && n > 50 && n < 8000) fx = fy = n;
-        }
-      }
-      if (key.includes('principal')) {
-        const pair = xy(value);
-        if (!pair) continue;
-        cx = pair.x <= 2 ? pair.x * sw : pair.x;
-        cy = pair.y <= 2 ? pair.y * sh : pair.y;
-      }
-      if (key.includes('position') || key.includes('translation') || key.includes('lenspose') || key.includes('extrinsic')) {
-        const p = xyz(value);
-        if (!p || Math.hypot(p.x, p.y, p.z) > 0.5) continue;
-        this.lensOffset.set(p.x, p.y, p.z);
-        this.lensHasOffset = true;
-      }
-    }
-    if (fx === null || fy === null) return;
-    this.lensFx = fx * (w / sw);
-    this.lensFy = fy * (h / sh);
-    if (cx !== null) this.lensCx = cx * (w / sw);
-    if (cy !== null) this.lensCy = cy * (h / sh);
-  }
+  return false;
 }
 
-function num(value: unknown): number | null {
-  return typeof value === 'number' && Number.isFinite(value) ? value : null;
-}
-
-function xy(value: unknown): { x: number; y: number } | null {
-  if (Array.isArray(value) && value.length >= 2) {
-    const x = num(value[0]);
-    const y = num(value[1]);
-    if (x !== null && y !== null) return { x, y };
+function logTrack(track: MediaStreamTrack): void {
+  try {
+    const caps = typeof track.getCapabilities === 'function' ? track.getCapabilities() : {};
+    console.info('[jonze] camera', track.label, JSON.stringify(track.getSettings()), JSON.stringify(caps));
+  } catch {
+    // Some browsers throw on getCapabilities for camera tracks; the log is only a hint.
   }
-  if (value && typeof value === 'object') {
-    const o = value as Record<string, unknown>;
-    const x = num(o.x);
-    const y = num(o.y);
-    if (x !== null && y !== null) return { x, y };
-  }
-  return null;
-}
-
-function xyz(value: unknown): { x: number; y: number; z: number } | null {
-  if (Array.isArray(value) && value.length >= 3) {
-    const x = num(value[0]);
-    const y = num(value[1]);
-    const z = num(value[2]);
-    if (x !== null && y !== null && z !== null) return { x, y, z };
-  }
-  if (value && typeof value === 'object') {
-    const o = value as Record<string, unknown>;
-    const x = num(o.x);
-    const y = num(o.y);
-    const z = num(o.z);
-    if (x !== null && y !== null && z !== null) return { x, y, z };
-  }
-  return null;
 }
 
 /** OpenGL projection from pixel intrinsics. x right, y up, camera looking down -Z. */
