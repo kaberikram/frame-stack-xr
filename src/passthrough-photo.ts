@@ -24,7 +24,7 @@ const CENTER = { x: 0, y: 0.02, z: -0.025 };
 const REF_W = 1280;
 const REF_F = 800;
 
-const BANK = 4;
+const BANK = 8;
 const POSES = 64;
 const PROBE_W = 16;
 const PROBE_H = 12;
@@ -42,6 +42,12 @@ const MARGIN = 0.08;
 /** Failing that, a hand-free photo still has to hold the grab point this far in. */
 const CENTER_MARGIN = 0.15;
 const HAND_PAD = 0.25;
+/** A new frame of the same view replaces the stored one only if it covers this much less of the centre. */
+const CLEANER = 0.02;
+const CORE_U0 = 0.3;
+const CORE_V0 = 0.25;
+const CORE_U1 = 0.7;
+const CORE_V1 = 0.75;
 const RVFC_WAIT = 0.5;
 const CALIBRATE_GAP = 0.25;
 
@@ -51,6 +57,14 @@ export interface LensTuning {
   latency: number;
   exposure: number;
   warmth: number;
+  tint: number;
+}
+
+interface MeanRgb {
+  r: number;
+  g: number;
+  b: number;
+  lum: number;
 }
 
 /** Packed world-space joints, with where each hand's run starts and how long it is. */
@@ -69,6 +83,9 @@ interface BankEntry {
   w: number;
   h: number;
   time: number;
+  r: number;
+  g: number;
+  b: number;
   lum: number;
   readonly toClip: Matrix4;
   readonly cam: Vector3;
@@ -93,6 +110,9 @@ interface SlotStore {
   ctx: CanvasRenderingContext2D;
   w: number;
   h: number;
+  r: number;
+  g: number;
+  b: number;
   lum: number;
   refreshAt: number;
 }
@@ -119,13 +139,18 @@ export class PassthroughPhoto {
   readonly liveCam = new Vector3();
   readonly slots: [PhotoSlot, PhotoSlot];
   /** Tunables the system copies in from StretchLook each frame. */
-  readonly lens: LensTuning = { scale: 1, pitchDeg: -15, latency: 0.07, exposure: 1.1, warmth: -0.1 };
+  readonly lens: LensTuning = { scale: 1, pitchDeg: -15, latency: 0.07, exposure: 1, warmth: -0.06, tint: 0 };
 
   private readonly bank: BankEntry[] = [];
   private readonly stores: [SlotStore, SlotStore];
   private readonly probe: HTMLCanvasElement;
   private readonly probeCtx: CanvasRenderingContext2D;
   private sessionLum = 0;
+  private sessionReady = false;
+  private readonly sessionRgb = new Vector3();
+  private readonly probeMean: MeanRgb = { r: 0, g: 0, b: 0, lum: 0 };
+  private readonly scratchHands = new Float32Array(8);
+  private cameraLocked = false;
   private lastAdmit = -Infinity;
 
   private readonly poses = new Float64Array(POSES * 8);
@@ -166,7 +191,7 @@ export class PassthroughPhoto {
       const ctx = canvas.getContext('2d');
       if (!ctx) throw new Error('2D canvas is unavailable');
       this.bank.push({
-        canvas, ctx, used: false, w: 0, h: 0, time: 0, lum: 0,
+        canvas, ctx, used: false, w: 0, h: 0, time: 0, r: 0, g: 0, b: 0, lum: 0,
         toClip: new Matrix4(), cam: new Vector3(), dir: new Vector3(), hands: new Float32Array(8),
       });
     }
@@ -209,6 +234,8 @@ export class PassthroughPhoto {
       this.rvfcSeen = false;
       this.activeAt = now;
       this.polledFrames = -1;
+      this.cameraLocked = false;
+      this.resetSession();
       if (video && typeof video.requestVideoFrameCallback === 'function') {
         this.rvfcHandle = video.requestVideoFrameCallback(this.onFrame);
       }
@@ -218,9 +245,11 @@ export class PassthroughPhoto {
       this.videoW = video.videoWidth;
       this.videoH = video.videoHeight;
       this.activeAt = now;
+      this.resetSession();
       for (let i = 0; i < this.bank.length; i++) this.bank[i].used = false;
       console.info(`[jonze] camera frame ${this.videoW}x${this.videoH}`);
     }
+    if (track && now - this.activeAt >= WARMUP) this.lockExposure(track);
     if (track && track !== this.loggedTrack) {
       this.loggedTrack = track;
       logTrack(track);
@@ -284,14 +313,13 @@ export class PassthroughPhoto {
       this.notePath();
       if (!this.steady(captured - 0.06, now)) return;
     }
-    const lum = this.measure(video);
-    if (lum < DARK) return;
+    if (!this.measure(video)) return;
     if (presenting) {
       if (!this.poseAt(captured)) return;
     } else {
       viewCamera.updateMatrixWorld();
     }
-    const entry = this.pick(presenting, viewCamera);
+    const entry = this.pick(presenting, viewCamera, joints, now);
     if (!entry) return;
     if (entry.canvas.width !== this.videoW || entry.canvas.height !== this.videoH) {
       entry.canvas.width = this.videoW;
@@ -302,9 +330,12 @@ export class PassthroughPhoto {
     entry.w = this.videoW;
     entry.h = this.videoH;
     entry.time = now;
-    entry.lum = lum;
+    entry.r = this.probeMean.r;
+    entry.g = this.probeMean.g;
+    entry.b = this.probeMean.b;
+    entry.lum = this.probeMean.lum;
     this.boxHands(entry, joints);
-    this.sessionLum = this.sessionLum > 0 ? this.sessionLum + (lum - this.sessionLum) * 0.2 : lum;
+    this.noteSession(this.probeMean);
     this.lastAdmit = now;
   }
 
@@ -314,7 +345,15 @@ export class PassthroughPhoto {
    * it, else one that holds the grab point well inside (the rest feathers out). Only then the live
    * frame, which has the pinching hand in it. False when nothing usable exists.
    */
-  freeze(k: 0 | 1, footprint: Float32Array, count: number, presenting: boolean, viewCamera: PerspectiveCamera, now: number): boolean {
+  freeze(
+    k: 0 | 1,
+    footprint: Float32Array,
+    count: number,
+    presenting: boolean,
+    viewCamera: PerspectiveCamera,
+    now: number,
+    joints: HandJoints | null,
+  ): boolean {
     let best: BankEntry | null = null;
     let bestScore = -Infinity;
     for (let i = 0; i < this.bank.length; i++) {
@@ -331,7 +370,7 @@ export class PassthroughPhoto {
       }
     }
     if (best) {
-      this.fill(k, best.canvas, best.w, best.h, best.lum, now);
+      this.fill(k, best.canvas, best.w, best.h, best, now);
       this.slots[k].toClip.copy(best.toClip);
       this.slots[k].cam.copy(best.cam);
       return true;
@@ -339,9 +378,9 @@ export class PassthroughPhoto {
     const video = this.video;
     if (!video || !this.videoW || !this.projectLive(presenting, viewCamera, now)) return false;
     if (footprintMargin(this.worldToClip, footprint, 1) < 0.02) return false;
-    const lum = this.measure(video);
-    if (lum < DARK) return false;
-    this.fill(k, video, this.videoW, this.videoH, lum, now);
+    if (!this.measure(video)) return false;
+    this.fill(k, video, this.videoW, this.videoH, this.probeMean, now);
+    this.smearHands(k, joints);
     this.slots[k].toClip.copy(this.worldToClip);
     this.slots[k].cam.copy(this.liveCam);
     return true;
@@ -354,7 +393,8 @@ export class PassthroughPhoto {
     if (!video || !this.videoW || now - store.refreshAt < CALIBRATE_GAP) return;
     if (!this.projectLive(presenting, viewCamera, now)) return;
     store.refreshAt = now;
-    this.fill(k, video, this.videoW, this.videoH, this.sessionLum || 0.2, now);
+    if (!this.measure(video)) return;
+    this.fill(k, video, this.videoW, this.videoH, this.probeMean, now);
     this.slots[k].toClip.copy(this.worldToClip);
     this.slots[k].cam.copy(this.liveCam);
   }
@@ -366,9 +406,9 @@ export class PassthroughPhoto {
     return uvMargin(slot.toClip, point.x, point.y, point.z) >= margin;
   }
 
-  /** Re-derives each slot's colour from the current exposure and warmth. */
+  /** Re-derives each slot's colour from the current exposure, warmth and tint. */
   updateGains(): void {
-    for (let k = 0; k < 2; k++) this.writeGain(this.slots[k].gain, this.stores[k].lum);
+    for (let k = 0; k < 2; k++) this.writeGain(this.slots[k].gain, this.stores[k]);
   }
 
   drop(k: 0 | 1): void {
@@ -383,6 +423,7 @@ export class PassthroughPhoto {
     this.poseCount = 0;
     this.poseHead = -1;
     this.lastAdmit = -Infinity;
+    this.resetSession();
   }
 
   dispose(): void {
@@ -413,7 +454,7 @@ export class PassthroughPhoto {
   }
 
   /** Copies a source into slot `k`'s own canvas, rebuilding its texture when the size changes. */
-  private fill(k: 0 | 1, source: CanvasImageSource, w: number, h: number, lum: number, now: number): void {
+  private fill(k: 0 | 1, source: CanvasImageSource, w: number, h: number, rgb: MeanRgb, now: number): void {
     const store = this.stores[k];
     const slot = this.slots[k];
     if (store.w !== w || store.h !== h || !slot.texture) {
@@ -425,34 +466,114 @@ export class PassthroughPhoto {
       slot.texture = makeTexture(store.canvas, slot);
     }
     store.ctx.drawImage(source, 0, 0, w, h);
-    store.lum = lum;
+    store.r = rgb.r;
+    store.g = rgb.g;
+    store.b = rgb.b;
+    store.lum = rgb.lum;
     store.refreshAt = now;
     slot.ready = false;
-    slot.texture.needsUpdate = true;
+    if (slot.texture) slot.texture.needsUpdate = true;
     slot.has = true;
-    this.writeGain(slot.gain, lum);
+    this.writeGain(slot.gain, store);
   }
 
-  private writeGain(out: Vector3, lum: number): void {
-    const auto = lum > 0 && this.sessionLum > 0 ? Math.min(1.15, Math.max(0.85, this.sessionLum / lum)) : 1;
-    const g = this.lens.exposure * auto;
-    const w = this.lens.warmth;
-    out.set(g * (1 + 0.5 * w), g, g * (1 - 0.5 * w));
+  private writeGain(out: Vector3, rgb: MeanRgb): void {
+    const channel = (photo: number, session: number) =>
+      photo > 1e-4 && session > 1e-4 ? Math.min(1.15, Math.max(0.85, session / photo)) : 1;
+    const e = this.lens.exposure;
+    const warm = this.lens.warmth;
+    const tint = this.lens.tint;
+    const ar = channel(rgb.r, this.sessionRgb.x);
+    const ag = channel(rgb.g, this.sessionRgb.y);
+    const ab = channel(rgb.b, this.sessionRgb.z);
+    out.set(
+      e * ar * (1 + 0.5 * warm) * (1 - 0.25 * tint),
+      e * ag * (1 + 0.5 * tint),
+      e * ab * (1 - 0.5 * warm) * (1 - 0.25 * tint),
+    );
   }
 
-  /** Mean linear luminance of the video, from a tiny copy. */
-  private measure(video: HTMLVideoElement): number {
+  private noteSession(rgb: MeanRgb): void {
+    if (!this.sessionReady) {
+      this.sessionRgb.set(rgb.r, rgb.g, rgb.b);
+      this.sessionLum = rgb.lum;
+      this.sessionReady = true;
+      return;
+    }
+    const k = 0.2;
+    this.sessionRgb.x += (rgb.r - this.sessionRgb.x) * k;
+    this.sessionRgb.y += (rgb.g - this.sessionRgb.y) * k;
+    this.sessionRgb.z += (rgb.b - this.sessionRgb.z) * k;
+    this.sessionLum += (rgb.lum - this.sessionLum) * k;
+  }
+
+  private resetSession(): void {
+    this.sessionReady = false;
+    this.sessionRgb.set(0, 0, 0);
+    this.sessionLum = 0;
+  }
+
+  /**
+   * After warm-up, freeze exposure and white balance when the camera offers a manual mode.
+   * Quest often doesn't; the per-channel gain covers that case. Logged either way.
+   */
+  private lockExposure(track: MediaStreamTrack): void {
+    if (this.cameraLocked) return;
+    this.cameraLocked = true;
+    void this.applyLock(track);
+  }
+
+  private async applyLock(track: MediaStreamTrack): Promise<void> {
+    let caps: MediaTrackCapabilities = {};
+    try {
+      caps = typeof track.getCapabilities === 'function' ? track.getCapabilities() : {};
+    } catch {
+      console.info('[jonze] camera lock: capabilities unavailable');
+      return;
+    }
+    const exposureMode = (caps as { exposureMode?: string[] }).exposureMode;
+    const whiteBalanceMode = (caps as { whiteBalanceMode?: string[] }).whiteBalanceMode;
+    const advanced: Record<string, string> = {};
+    if (exposureMode?.includes('manual')) advanced.exposureMode = 'manual';
+    if (whiteBalanceMode?.includes('manual')) advanced.whiteBalanceMode = 'manual';
+    if (!advanced.exposureMode && !advanced.whiteBalanceMode) {
+      console.info('[jonze] camera lock unavailable', JSON.stringify({ exposureMode, whiteBalanceMode }));
+      return;
+    }
+    try {
+      await track.applyConstraints({ advanced: [advanced] } as MediaTrackConstraints);
+      console.info('[jonze] camera locked', JSON.stringify(advanced), JSON.stringify(track.getSettings()));
+    } catch (err) {
+      console.info('[jonze] camera lock failed', err);
+    }
+  }
+
+  /** Mean linear RGB of the video, from a tiny copy. False when the frame is still black. */
+  private measure(video: HTMLVideoElement): boolean {
     this.probeCtx.drawImage(video, 0, 0, PROBE_W, PROBE_H);
     const data = this.probeCtx.getImageData(0, 0, PROBE_W, PROBE_H).data;
-    let sum = 0;
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    const n = PROBE_W * PROBE_H;
     for (let i = 0; i < data.length; i += 4) {
-      sum += 0.2126 * SRGB_TO_LINEAR[data[i]] + 0.7152 * SRGB_TO_LINEAR[data[i + 1]] + 0.0722 * SRGB_TO_LINEAR[data[i + 2]];
+      r += SRGB_TO_LINEAR[data[i]];
+      g += SRGB_TO_LINEAR[data[i + 1]];
+      b += SRGB_TO_LINEAR[data[i + 2]];
     }
-    return sum / (PROBE_W * PROBE_H);
+    const mean = this.probeMean;
+    mean.r = r / n;
+    mean.g = g / n;
+    mean.b = b / n;
+    mean.lum = 0.2126 * mean.r + 0.7152 * mean.g + 0.0722 * mean.b;
+    return mean.lum >= DARK;
   }
 
-  /** Bank entry for a frame looking the way the camera looks now: the same view, else empty, else oldest. */
-  private pick(presenting: boolean, viewCamera: PerspectiveCamera): BankEntry | null {
+  /**
+   * Bank entry for a frame looking the way the camera looks now. Within one view the stored frame
+   * stays unless the new one has less hand in the centre, or the stored one is older than MAX_AGE.
+   */
+  private pick(presenting: boolean, viewCamera: PerspectiveCamera, joints: HandJoints | null, now: number): BankEntry | null {
     const toClip = this.projection;
     const cam = this.pos;
     const dir = this.tmp;
@@ -465,9 +586,12 @@ export class PassthroughPhoto {
       viewCamera.getWorldDirection(dir);
     }
     let chosen: BankEntry | null = null;
+    const incoming = coverBoxes(this.boxesFor(joints, toClip));
     for (let i = 0; i < this.bank.length; i++) {
       const entry = this.bank[i];
       if (entry.used && entry.dir.dot(dir) > SAME_VIEW) {
+        const stale = now - entry.time > MAX_AGE;
+        if (!stale && incoming + CLEANER >= coverBoxes(entry.hands)) return null;
         chosen = entry;
         break;
       }
@@ -490,21 +614,25 @@ export class PassthroughPhoto {
   }
 
   private boxHands(entry: BankEntry, joints: HandJoints | null): void {
-    const box = entry.hands;
-    for (let i = 0; i < 2; i++) {
-      box[i * 4] = 1;
-      box[i * 4 + 1] = 1;
-      box[i * 4 + 2] = 0;
-      box[i * 4 + 3] = 0;
-    }
+    clearBoxes(entry.hands);
     if (!joints) return;
-    this.boxOne(entry, joints.points, joints.leftStart, joints.leftCount, 0);
-    this.boxOne(entry, joints.points, joints.rightStart, joints.rightCount, 1);
+    this.writeBox(entry.hands, entry.toClip, joints.points, joints.leftStart, joints.leftCount, 0);
+    this.writeBox(entry.hands, entry.toClip, joints.points, joints.rightStart, joints.rightCount, 1);
   }
 
-  private boxOne(entry: BankEntry, points: Float32Array, start: number, count: number, slot: number): void {
+  /** Hand boxes for `clip`, written into the scratch buffer. */
+  private boxesFor(joints: HandJoints | null, clip: Matrix4): Float32Array {
+    const box = this.scratchHands;
+    clearBoxes(box);
+    if (!joints) return box;
+    this.writeBox(box, clip, joints.points, joints.leftStart, joints.leftCount, 0);
+    this.writeBox(box, clip, joints.points, joints.rightStart, joints.rightCount, 1);
+    return box;
+  }
+
+  private writeBox(box: Float32Array, clip: Matrix4, points: Float32Array, start: number, count: number, slot: number): void {
     if (count <= 0) return;
-    const e = entry.toClip.elements;
+    const e = clip.elements;
     let u0 = Infinity;
     let v0 = Infinity;
     let u1 = -Infinity;
@@ -526,10 +654,19 @@ export class PassthroughPhoto {
     const padU = (u1 - u0) * HAND_PAD + 0.02;
     const padV = (v1 - v0) * HAND_PAD + 0.02;
     const o = slot * 4;
-    entry.hands[o] = u0 - padU;
-    entry.hands[o + 1] = v0 - padV;
-    entry.hands[o + 2] = u1 + padU;
-    entry.hands[o + 3] = v1 + padV;
+    box[o] = u0 - padU;
+    box[o + 1] = v0 - padV;
+    box[o + 2] = u1 + padU;
+    box[o + 3] = v1 + padV;
+  }
+
+  /** Stretches a strip of nearby pixels across each hand box. The pull turns that area into streaks. */
+  private smearHands(k: 0 | 1, joints: HandJoints | null): void {
+    if (!joints) return;
+    const store = this.stores[k];
+    const box = this.boxesFor(joints, this.worldToClip);
+    paintOutHand(store, box, 0);
+    paintOutHand(store, box, 4);
   }
 
   /** True when the head turned less than ~8°/s and moved less than 0.1 m/s between two times. */
@@ -613,7 +750,56 @@ function makeStore(): SlotStore {
   canvas.height = 2;
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('2D canvas is unavailable');
-  return { canvas, ctx, w: 0, h: 0, lum: 0, refreshAt: -Infinity };
+  return { canvas, ctx, w: 0, h: 0, r: 0, g: 0, b: 0, lum: 0, refreshAt: -Infinity };
+}
+
+function clearBoxes(box: Float32Array): void {
+  for (let i = 0; i < 2; i++) {
+    box[i * 4] = 1;
+    box[i * 4 + 1] = 1;
+    box[i * 4 + 2] = 0;
+    box[i * 4 + 3] = 0;
+  }
+}
+
+/** Fraction of the frame centre covered by hand boxes. */
+function coverBoxes(box: Float32Array): number {
+  const area = (CORE_U1 - CORE_U0) * (CORE_V1 - CORE_V0);
+  let covered = 0;
+  for (let h = 0; h < 2; h++) {
+    const o = h * 4;
+    if (box[o] > box[o + 2]) continue;
+    const x0 = Math.max(CORE_U0, box[o]);
+    const y0 = Math.max(CORE_V0, box[o + 1]);
+    const x1 = Math.min(CORE_U1, box[o + 2]);
+    const y1 = Math.min(CORE_V1, box[o + 3]);
+    if (x1 > x0 && y1 > y0) covered += (x1 - x0) * (y1 - y0);
+  }
+  return covered / area;
+}
+
+function paintOutHand(store: SlotStore, box: Float32Array, o: number): void {
+  if (box[o] > box[o + 2]) return;
+  const { ctx, canvas, w, h } = store;
+  const x0 = Math.max(0, Math.min(w - 1, Math.floor(box[o] * w)));
+  const x1 = Math.max(0, Math.min(w, Math.ceil(box[o + 2] * w)));
+  const y0 = Math.max(0, Math.min(h - 1, Math.floor((1 - box[o + 3]) * h)));
+  const y1 = Math.max(0, Math.min(h, Math.ceil((1 - box[o + 1]) * h)));
+  const dw = x1 - x0;
+  const dh = y1 - y0;
+  if (dw < 2 || dh < 2) return;
+  const sw = Math.max(4, Math.round(dw * 0.08));
+  let sx = x0 - sw - 2;
+  if (sx < 0) sx = x1 + 2;
+  if (sx >= 0 && sx + sw <= w) {
+    ctx.drawImage(canvas, sx, y0, sw, dh, x0, y0, dw, dh);
+    return;
+  }
+  const sh = Math.max(4, Math.round(Math.min(12, dh)));
+  let sy = y0 - sh - 2;
+  if (sy < 0) sy = y1 + 2;
+  if (sy < 0 || sy + sh > h) return;
+  ctx.drawImage(canvas, x0, sy, dw, sh, x0, y0, dw, dh);
 }
 
 function makeSlot(): PhotoSlot {
