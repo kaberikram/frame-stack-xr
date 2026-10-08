@@ -48,6 +48,16 @@ const TOWARD_DEAD = 0.02;
 const LATERAL_SHARE = 0.35;
 const EXPLODE_MAX = 0.8;
 const LIFT_MAX = 0.08;
+/**
+ * A table or floor bursts only when the hand leaves it nearly straight off: the off-surface share of
+ * the hand's travel ramps from 0.8 (37° off the normal) to full at 0.95 (18°). Pulling a table edge
+ * toward your chest is mostly along the table, so it just stretches toward you.
+ */
+const STRAIGHT_FROM = 0.8;
+const STRAIGHT_FULL = 0.95;
+/** Surfaces this far from level (|normal.y| below 0.5, fading to 0.8) count as walls and burst as before. */
+const WALL_UP = 0.5;
+const WALL_FADE = 0.3;
 /** The burst's rim stays inside ~25° of the grab point, so a full pull never fills the view. */
 const BURST_ANGLE = Math.tan((25 * Math.PI) / 180);
 /** Slide plus burst. Past this, scan triangles start to sliver. */
@@ -68,10 +78,11 @@ const SETTLE_STIFF = 1200;
 const SETTLE_DAMP = 70;
 const SETTLE_MAX = 0.12;
 const FADE_IN = 0.12;
+/** A pinch with no usable photo yet keeps trying this long (fresh pose, fresh frame) before it lets go. */
+const PHOTO_WAIT = 0.4;
 const FOOTPRINT = 9;
-/** Matches the shader's streak ramp and burst core. */
-const STRIPE_WIDTH = 0.6;
-const CORE = 0.12;
+/** Streaks bloom over this many metres of pull after `stripes`. The shader and the sparkle both read it. */
+const STREAK_SPAN = 0.35;
 const CARD_DISTANCE = 1.2;
 const CARD_RISE = Math.sin((10 * Math.PI) / 180);
 
@@ -141,6 +152,15 @@ interface Grab {
   rippleT: number;
   lostT: number;
   fade: number;
+  /** 0 until `stripes` m of pull, 1 by STREAK_SPAN more. What is drawn and what is heard both read it. */
+  bloom: number;
+  /** For the one console line each pull prints when it lets go. */
+  heldAt: number;
+  peakSlide: number;
+  peakLift: number;
+  peakBurst: number;
+  peakBloom: number;
+  clipped: boolean;
 }
 
 const enum Card {
@@ -152,7 +172,7 @@ const enum Card {
 }
 const COPY: Record<Card, { title: string; body: string }> = {
   [Card.None]: { title: '', body: '' },
-  [Card.Pinch]: { title: 'Pinch anything and pull', body: 'Sideways stretches. Toward you bursts.' },
+  [Card.Pinch]: { title: 'Pinch anything and pull', body: 'It stretches, then it streaks.' },
   [Card.Scan]: { title: 'No room mesh yet', body: 'Finish Space Setup, then enter again.' },
   [Card.Spatial]: { title: 'Room scan is off', body: 'Allow spatial data, then enter again.' },
   [Card.Camera]: { title: 'Camera is off', body: 'Allow the camera, then enter again.' },
@@ -196,6 +216,13 @@ function makeGrab(side: Side): Grab {
     rippleT: 10,
     lostT: 0,
     fade: 0,
+    bloom: 0,
+    heldAt: 0,
+    peakSlide: 0,
+    peakLift: 0,
+    peakBurst: 0,
+    peakBloom: 0,
+    clipped: false,
   };
 }
 
@@ -243,9 +270,10 @@ function smooth(t: number): number {
 }
 
 /**
- * Pinch the scanned room and pull. Each hand grabs the surface behind the pinch. Sideways pulls
- * slide that spot along the surface and stretch what is behind it into streaks; pulling toward
- * you bursts the surface outward from the pinch. At rest nothing is drawn: plain passthrough.
+ * Pinch the scanned room and pull. Each hand grabs the surface behind the pinch. A pull slides that
+ * spot along the surface and stretches what is behind it, real texture first, streaking on long
+ * pulls; pulling a wall (or a table straight up) toward you also bursts it outward from the pinch.
+ * At rest nothing is drawn: plain passthrough.
  */
 export class RoomStretchSystem extends createSystem({
   settings: { required: [StretchLook] },
@@ -274,7 +302,7 @@ export class RoomStretchSystem extends createSystem({
   private refSpace: XRReferenceSpace | null = null;
   private outlineShown = true;
   private readonly look: Look = {
-    gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.2, feather: 0.04, wobble: 0.035,
+    gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.15, feather: 0.04, wobble: 0.035,
     waveLength: 0.45, waveSpeed: 7, stiffness: 90, damping: 9, depthPull: 0.35, radial: 2.5,
     ripple: 0.015, exposure: 1.1, warmth: -0.1, tint: 0,
     lensScale: 1, lensPitch: -15, cameraLatency: 0.07,
@@ -802,8 +830,13 @@ export class RoomStretchSystem extends createSystem({
     grab.pending = false;
     this.resetGrab(grab);
     this.photo.drop(grab.slot);
-    if (!this.pinchPoint(grab.side, this.pinch)) return;
+    const tag = grab.side === 'left' ? 'L' : 'R';
+    if (!this.pinchPoint(grab.side, this.pinch)) {
+      console.warn(`[jonze] pinch ${tag}: no hand pose`);
+      return;
+    }
     if (!this.raycast(this.head, this.pinch)) {
+      console.warn(`[jonze] pinch ${tag}: no room mesh under the pinch (${this.scans.length} scans)`);
       this.sound.miss(grab.slot, this.pinch.x, this.pinch.y, this.pinch.z);
       return;
     }
@@ -820,7 +853,26 @@ export class RoomStretchSystem extends createSystem({
     this.poseGrab(grab);
     grab.lift.copy(this.head).sub(grab.worldG).normalize();
     this.writeFootprint(grab);
-    this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, true, this.camera, now, this.handJoints());
+    if (!this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, true, this.camera, now, this.handJoints())) {
+      // Nothing to show: bending it would be invisible. Without video a retry can't help.
+      const retry = this.photo.lastMiss !== 'no-video' && now - grab.pendingAt < PHOTO_WAIT;
+      this.resetGrab(grab);
+      this.photo.drop(grab.slot);
+      if (retry) {
+        grab.pending = true;
+        return;
+      }
+      console.warn(`[jonze] ${this.photo.pickLine(grab.slot)}, released`);
+      this.sound.miss(grab.slot, this.pinch.x, this.pinch.y, this.pinch.z);
+      return;
+    }
+    const n = grab.normal;
+    const surface = Math.abs(n.y) < 0.5 ? 'wall' : n.y > 0 ? 'table' : 'ceiling';
+    console.info(
+      `[jonze] pinch ${tag} ${surface} ${this.head.distanceTo(grab.worldG).toFixed(2)}m dense=${this.overlay.ready ? 'y' : 'n'}`,
+    );
+    console.info(`[jonze] ${this.photo.pickLine(grab.slot)}`);
+    grab.heldAt = now;
     grab.fade = 0;
     this.pinched = true;
   }
@@ -872,6 +924,10 @@ export class RoomStretchSystem extends createSystem({
       grab.Bvel = (b - grab.B) * inv;
       grab.B = b;
       grab.lift.copy(this.head).sub(grab.worldG).normalize();
+      const slid = grab.D.length();
+      if (slid > grab.peakSlide) grab.peakSlide = slid;
+      if (b > grab.peakLift) grab.peakLift = b;
+      if (e > grab.peakBurst) grab.peakBurst = e;
     } else if (grab.on) {
       this.stepSprings(grab, dt, this.look.stiffness, this.look.damping);
     }
@@ -903,6 +959,7 @@ export class RoomStretchSystem extends createSystem({
 
   /** Hands the held pull to the springs, keeping its velocity, so letting go wobbles back. */
   private release(grab: Grab): void {
+    if (grab.holding) this.logPull(grab);
     grab.holding = false;
     grab.axisRel.copy(grab.axis);
     const s = grab.springs;
@@ -923,8 +980,9 @@ export class RoomStretchSystem extends createSystem({
 
   /**
    * The grabbed spot stays on the pinch ray: it slides in the surface plane to where the ray from
-   * your eyes through your fingers meets that plane. Bringing the hand closer to your head than at
-   * the pinch bursts the surface outward from the pinch instead of tenting it toward you.
+   * your eyes through your fingers meets that plane, so pulling a table edge toward you stretches it
+   * toward you. Bringing the hand closer to your head bursts a wall outward from the pinch; a table
+   * or floor bursts only when the hand comes nearly straight off it.
    */
   private aim(grab: Grab, hand: Vector3): void {
     const travel = this.raw.copy(hand).sub(grab.hand0);
@@ -949,12 +1007,25 @@ export class RoomStretchSystem extends createSystem({
     const along = travel.dot(grab.ray0);
     const lateral = Math.sqrt(Math.max(0, moved * moved - along * along));
     const toward = Math.max(0, grab.reach0 - reach - LATERAL_SHARE * lateral - TOWARD_DEAD) * ease;
+    const off = travel.dot(n);
+    const straight = moved > 1e-3 ? smooth((off / moved - STRAIGHT_FROM) / (STRAIGHT_FULL - STRAIGHT_FROM)) : 0;
+    const wall = 1 - smooth((Math.abs(n.y) - WALL_UP) / WALL_FADE);
     const rim = Math.max(0, (BURST_ANGLE * this.head.distanceTo(grab.worldG) - 0.22) / 1.5);
-    let e = Math.min(EXPLODE_MAX, rim, this.look.radial * toward);
+    let e = Math.min(EXPLODE_MAX, rim, this.look.radial * toward * Math.max(straight, wall));
     const slid = grab.target.length();
     if (slid + e > PULL_MAX) e = Math.max(0, PULL_MAX - slid);
     grab.explodeTo = e;
     grab.liftTo = Math.min(LIFT_MAX, this.look.depthPull * toward);
+  }
+
+  /** One line per pull, when it lets go: how far it went and whether streaks or the photo edge came in. */
+  private logPull(grab: Grab): void {
+    const held = performance.now() / 1000 - grab.heldAt;
+    console.info(
+      `[jonze] pull ${grab.side === 'left' ? 'L' : 'R'} ${held.toFixed(1)}s slide=${grab.peakSlide.toFixed(2)} ` +
+        `lift=${grab.peakLift.toFixed(2)} burst=${grab.peakBurst.toFixed(2)} bloom=${grab.peakBloom.toFixed(2)}` +
+        (grab.clipped ? ' clip' : ''),
+    );
   }
 
   /** Shortens a slide so the grab point lands inside its photo: past the edge there is nothing to show. */
@@ -962,6 +1033,7 @@ export class RoomStretchSystem extends createSystem({
     if (!this.photo.slots[grab.slot].has) return;
     const probe = this.tmp.copy(grab.worldG).add(slide);
     if (this.photo.slotContains(grab.slot, probe, SLIDE_MARGIN)) return;
+    grab.clipped = true;
     let lo = 0;
     let hi = 1;
     for (let i = 0; i < 6; i++) {
@@ -999,6 +1071,12 @@ export class RoomStretchSystem extends createSystem({
     grab.rippleT = 10;
     grab.lostT = 0;
     grab.fade = 0;
+    grab.bloom = 0;
+    grab.peakSlide = 0;
+    grab.peakLift = 0;
+    grab.peakBurst = 0;
+    grab.peakBloom = 0;
+    grab.clipped = false;
     for (let i = 0; i < grab.springs.length; i++) grab.springs[i].reset(0);
   }
 
@@ -1045,7 +1123,6 @@ export class RoomStretchSystem extends createSystem({
     this.writeGrab(U, 1, aFirst ? b : a);
     U.uReach.value = this.look.reach;
     U.uRamp.value = this.look.ramp;
-    U.uStripes.value = this.look.stripes;
     U.uFeather.value = this.look.feather;
     U.uWobble.value = this.look.wobble;
     U.uWaveK.value = 1 / Math.max(this.look.waveLength, 0.05);
@@ -1073,13 +1150,16 @@ export class RoomStretchSystem extends createSystem({
     // Streaks only on the side the pull went; the spring's overshoot flips D but not the picture.
     const len = grab.D.length();
     const sk = grab.holding || len < 1e-4 ? 1 : Math.max(0, grab.D.dot(grab.axisRel) / len);
+    // A live frame with the hand painted out: its grabbed column is the painted strip, so it only stretches.
+    grab.bloom = grab.on && !slot.painted ? smooth((len * sk - this.look.stripes) / STREAK_SPAN) : 0;
+    if (grab.holding && grab.bloom > grab.peakBloom) grab.peakBloom = grab.bloom;
     if (first) {
       U.uA0.value = grab.A;
       U.uE0.value = grab.E;
       U.uB0.value = grab.B;
       U.uRip0.value = grab.rippleT;
       U.uOn0.value = on;
-      U.uSk0.value = sk;
+      U.uBloom0.value = grab.bloom;
       U.uHasPhoto0.value = has;
       U.uFade0.value = grab.fade;
     } else {
@@ -1088,7 +1168,7 @@ export class RoomStretchSystem extends createSystem({
       U.uB1.value = grab.B;
       U.uRip1.value = grab.rippleT;
       U.uOn1.value = on;
-      U.uSk1.value = sk;
+      U.uBloom1.value = grab.bloom;
       U.uHasPhoto1.value = has;
       U.uFade1.value = grab.fade;
     }
@@ -1113,10 +1193,8 @@ export class RoomStretchSystem extends createSystem({
       mag = Math.max(len, grab.E);
       if (len >= grab.E && grab.D.dot(grab.axisRel) < 0) mag = -len;
     }
-    const ramp = Math.max(this.look.ramp, 1e-3);
-    const taffy = smooth((1.5 * grab.D.length() / ramp - this.look.stripes) / STRIPE_WIDTH);
-    const burst = smooth((1.5 * grab.E / (CORE + 0.35 * Math.max(grab.E, 0)) - this.look.stripes) / STRIPE_WIDTH);
-    this.sound.track(grab.slot, grab.holding, mag / dist, Math.max(taffy, burst), G.x, G.y, G.z);
+    // publish() ran first this frame, so the sparkle follows the streaks actually drawn.
+    this.sound.track(grab.slot, grab.holding, mag / dist, grab.bloom, G.x, G.y, G.z);
   }
 
   // ---------------------------------------------------------------- hint card

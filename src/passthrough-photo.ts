@@ -66,6 +66,21 @@ interface MeanRgb {
   lum: number;
 }
 
+/** Why the last freeze found no photo. A string literal, so recording it allocates nothing. */
+export type PhotoMiss = 'none' | 'no-video' | 'no-pose' | 'off-frame' | 'dark';
+
+/** What the last freeze chose and why, for one console line per pinch. */
+interface PickNote {
+  source: 'bank' | 'live' | 'none';
+  age: number;
+  margin: number;
+  tier: number;
+  seen: number;
+  old: number;
+  edge: number;
+  hand: number;
+}
+
 /** Packed world-space joints, with where each hand's run starts and how long it is. */
 export interface HandJoints {
   points: Float32Array;
@@ -99,6 +114,8 @@ export interface PhotoSlot {
   has: boolean;
   /** Its texture has actually reached the GPU. Uploads are deferred under multiview. */
   ready: boolean;
+  /** The live frame with the pinching hand painted out: stretch it, but never streak the painted strip. */
+  painted: boolean;
   readonly toClip: Matrix4;
   readonly cam: Vector3;
   readonly gain: Vector3;
@@ -136,6 +153,9 @@ export class PassthroughPhoto {
   readonly worldToClip = new Matrix4();
   readonly liveCam = new Vector3();
   readonly slots: [PhotoSlot, PhotoSlot];
+  /** Why the last freeze() returned false. */
+  lastMiss: PhotoMiss = 'none';
+  private readonly pickNote: PickNote = { source: 'none', age: 0, margin: 0, tier: 0, seen: 0, old: 0, edge: 0, hand: 0 };
   /** Tunables the system copies in from StretchLook each frame. */
   readonly lens: LensTuning = { scale: 1, pitchDeg: -15, latency: 0.07, exposure: 1.1, warmth: -0.1, tint: 0 };
 
@@ -347,36 +367,95 @@ export class PassthroughPhoto {
     now: number,
     joints: HandJoints | null,
   ): boolean {
+    const note = this.pickNote;
+    note.source = 'none';
+    note.seen = 0;
+    note.old = 0;
+    note.edge = 0;
+    note.hand = 0;
     let best: BankEntry | null = null;
     let bestScore = -Infinity;
+    let bestMargin = 0;
+    let bestTier = 0;
     for (let i = 0; i < this.bank.length; i++) {
       const entry = this.bank[i];
-      if (!entry.used || now - entry.time > MAX_AGE) continue;
+      if (!entry.used) continue;
+      note.seen++;
+      if (now - entry.time > MAX_AGE) {
+        note.old++;
+        continue;
+      }
       const center = footprintMargin(entry.toClip, footprint, 1);
-      if (center < CENTER_MARGIN || touchesHands(entry, footprint, count)) continue;
+      if (center < CENTER_MARGIN) {
+        note.edge++;
+        continue;
+      }
+      if (touchesHands(entry, footprint, count)) {
+        note.hand++;
+        continue;
+      }
       const margin = footprintMargin(entry.toClip, footprint, count);
       const tier = margin >= MARGIN ? 2 : 1;
       const score = tier * 10 + (margin >= MARGIN ? margin : center) / (1 + (now - entry.time) / 8);
       if (score > bestScore) {
         bestScore = score;
         best = entry;
+        bestMargin = margin >= MARGIN ? margin : center;
+        bestTier = tier;
       }
     }
     if (best) {
       this.fill(k, best.canvas, best.w, best.h, best);
+      this.slots[k].painted = false;
       this.slots[k].toClip.copy(best.toClip);
       this.slots[k].cam.copy(best.cam);
+      note.source = 'bank';
+      note.age = now - best.time;
+      note.margin = bestMargin;
+      note.tier = bestTier;
+      this.lastMiss = 'none';
       return true;
     }
     const video = this.video;
-    if (!video || !this.videoW || !this.projectLive(presenting, viewCamera, now)) return false;
-    if (footprintMargin(this.worldToClip, footprint, 1) < 0.02) return false;
-    if (!this.measure(video)) return false;
+    if (!video || !this.videoW) {
+      this.lastMiss = 'no-video';
+      return false;
+    }
+    if (!this.projectLive(presenting, viewCamera, now)) {
+      this.lastMiss = 'no-pose';
+      return false;
+    }
+    const margin = footprintMargin(this.worldToClip, footprint, 1);
+    if (margin < 0.02) {
+      this.lastMiss = 'off-frame';
+      return false;
+    }
+    if (!this.measure(video)) {
+      this.lastMiss = 'dark';
+      return false;
+    }
+    this.lastMiss = 'none';
+    note.source = 'live';
+    note.age = 0;
+    note.margin = margin;
+    note.tier = 0;
     this.fill(k, video, this.videoW, this.videoH, this.probeMean);
-    this.smearHands(k, joints);
+    this.slots[k].painted = this.smearHands(k, joints);
     this.slots[k].toClip.copy(this.worldToClip);
     this.slots[k].cam.copy(this.liveCam);
     return true;
+  }
+
+  /** One line on the last freeze for slot `k`: where its photo came from, or why there was none. */
+  pickLine(k: 0 | 1): string {
+    const n = this.pickNote;
+    const side = k === 0 ? 'L' : 'R';
+    const bank = `${n.seen}/${BANK} old${n.old} edge${n.edge} hand${n.hand}`;
+    if (n.source === 'bank') return `photo ${side}: bank age=${n.age.toFixed(1)}s mrg=${n.margin.toFixed(2)} t${n.tier} | ${bank}`;
+    if (n.source === 'live') {
+      return `photo ${side}: live${this.slots[k].painted ? ', hand painted out' : ''} mrg=${n.margin.toFixed(2)} | ${bank}`;
+    }
+    return `photo ${side}: none (${this.lastMiss}) | ${bank}`;
   }
 
   /** True when `point` lands inside slot `k`'s photo with `margin` to spare. */
@@ -584,13 +663,14 @@ export class PassthroughPhoto {
     box[o + 3] = v1 + padV;
   }
 
-  /** Stretches a strip of nearby pixels across each hand box. The pull turns that area into streaks. */
-  private smearHands(k: 0 | 1, joints: HandJoints | null): void {
-    if (!joints) return;
+  /** Stretches a strip of nearby pixels across each hand box. True when anything was painted. */
+  private smearHands(k: 0 | 1, joints: HandJoints | null): boolean {
+    if (!joints) return false;
     const store = this.stores[k];
     const box = this.boxesFor(joints, this.worldToClip);
-    paintOutHand(store, box, 0);
-    paintOutHand(store, box, 4);
+    const left = paintOutHand(store, box, 0);
+    const right = paintOutHand(store, box, 4);
+    return left || right;
   }
 
   /** True when the head turned less than ~8°/s and moved less than 0.1 m/s between two times. */
@@ -702,8 +782,8 @@ function coverBoxes(box: Float32Array): number {
   return covered / area;
 }
 
-function paintOutHand(store: SlotStore, box: Float32Array, o: number): void {
-  if (box[o] > box[o + 2]) return;
+function paintOutHand(store: SlotStore, box: Float32Array, o: number): boolean {
+  if (box[o] > box[o + 2]) return false;
   const { ctx, canvas, w, h } = store;
   const x0 = Math.max(0, Math.min(w - 1, Math.floor(box[o] * w)));
   const x1 = Math.max(0, Math.min(w, Math.ceil(box[o + 2] * w)));
@@ -711,23 +791,27 @@ function paintOutHand(store: SlotStore, box: Float32Array, o: number): void {
   const y1 = Math.max(0, Math.min(h, Math.ceil((1 - box[o + 1]) * h)));
   const dw = x1 - x0;
   const dh = y1 - y0;
-  if (dw < 2 || dh < 2) return;
+  if (dw < 2 || dh < 2) return false;
   const sw = Math.max(4, Math.round(dw * 0.08));
   let sx = x0 - sw - 2;
   if (sx < 0) sx = x1 + 2;
   if (sx >= 0 && sx + sw <= w) {
     ctx.drawImage(canvas, sx, y0, sw, dh, x0, y0, dw, dh);
-    return;
+    return true;
   }
   const sh = Math.max(4, Math.round(Math.min(12, dh)));
   let sy = y0 - sh - 2;
   if (sy < 0) sy = y1 + 2;
-  if (sy < 0 || sy + sh > h) return;
+  if (sy < 0 || sy + sh > h) return false;
   ctx.drawImage(canvas, x0, sy, dw, sh, x0, y0, dw, dh);
+  return true;
 }
 
 function makeSlot(): PhotoSlot {
-  return { texture: null, has: false, ready: false, toClip: new Matrix4(), cam: new Vector3(), gain: new Vector3(1, 1, 1) };
+  return {
+    texture: null, has: false, ready: false, painted: false,
+    toClip: new Matrix4(), cam: new Vector3(), gain: new Vector3(1, 1, 1),
+  };
 }
 
 /** Created at the frame's real size: three allocates immutable storage on the first upload. */
