@@ -49,7 +49,6 @@ const CORE_V0 = 0.25;
 const CORE_U1 = 0.7;
 const CORE_V1 = 0.75;
 const RVFC_WAIT = 0.5;
-const CALIBRATE_GAP = 0.25;
 
 export interface LensTuning {
   scale: number;
@@ -114,7 +113,6 @@ interface SlotStore {
   g: number;
   b: number;
   lum: number;
-  refreshAt: number;
 }
 
 /** Which visor camera a device label is talking about. A webcam stays `view`. */
@@ -275,7 +273,7 @@ export class PassthroughPhoto {
 
   /**
    * The live camera's projection: the head pose one camera latency ago on a headset, the preview
-   * camera on a desk. Used for the pinch-frame fallback and calibration.
+   * camera on a desk. Used for the pinch-frame fallback and the desk preview.
    */
   projectLive(presenting: boolean, viewCamera: PerspectiveCamera, now: number): boolean {
     if (!this.videoW) return false;
@@ -386,19 +384,6 @@ export class PassthroughPhoto {
     return true;
   }
 
-  /** Calibration: keeps slot `k` fed with the live camera a few times a second. */
-  refreshLive(k: 0 | 1, presenting: boolean, viewCamera: PerspectiveCamera, now: number): void {
-    const store = this.stores[k];
-    const video = this.video;
-    if (!video || !this.videoW || now - store.refreshAt < CALIBRATE_GAP) return;
-    if (!this.projectLive(presenting, viewCamera, now)) return;
-    store.refreshAt = now;
-    if (!this.measure(video)) return;
-    this.fill(k, video, this.videoW, this.videoH, this.probeMean, now);
-    this.slots[k].toClip.copy(this.worldToClip);
-    this.slots[k].cam.copy(this.liveCam);
-  }
-
   /** True when `point` lands inside slot `k`'s photo with `margin` to spare. */
   slotContains(k: 0 | 1, point: Vector3, margin: number): boolean {
     const slot = this.slots[k];
@@ -470,7 +455,6 @@ export class PassthroughPhoto {
     store.g = rgb.g;
     store.b = rgb.b;
     store.lum = rgb.lum;
-    store.refreshAt = now;
     slot.ready = false;
     if (slot.texture) slot.texture.needsUpdate = true;
     slot.has = true;
@@ -750,7 +734,7 @@ function makeStore(): SlotStore {
   canvas.height = 2;
   const ctx = canvas.getContext('2d');
   if (!ctx) throw new Error('2D canvas is unavailable');
-  return { canvas, ctx, w: 0, h: 0, r: 0, g: 0, b: 0, lum: 0, refreshAt: -Infinity };
+  return { canvas, ctx, w: 0, h: 0, r: 0, g: 0, b: 0, lum: 0 };
 }
 
 function clearBoxes(box: Float32Array): void {

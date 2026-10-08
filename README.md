@@ -41,5 +41,5 @@ Finish **Space Setup** on the headset first, allow the camera when the page asks
 - `src/layout.ts`: stack size, strip length, touch and hover heights.
 - The `FrameStack` component (scene JSON or the editor inspector): ghost, trail, length, lift, feather, glow.
 - The `StretchLook` component: pull gain, sideways reach, stretch ramp, where stripes start, photo feather, wobble, spring stiffness and damping, the toward-you burst and lift, and the pinch ripple.
-- Matching the camera to passthrough, also in `StretchLook`: photo exposure and warmth, camera focal scale and pitch, and camera latency. Turn on **Calibrate** to checker the live camera over the room, then adjust until the squares line up with the real room and match its colour.
+- Matching the camera to passthrough, also in `StretchLook`: photo exposure and warmth, camera focal scale and pitch, and camera latency.
 - `MAX_LAYERS` in `src/frame-stack-system.ts`: raise it if the headset holds frame rate.

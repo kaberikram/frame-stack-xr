@@ -63,7 +63,6 @@ export function createRubberUniforms() {
     /** 1 while a camera feeds photos. Without one, moved surfaces get a faint frost instead. */
     uAnyPhoto: { value: 0 },
     uLinear: { value: 1 },
-    uCalibrate: { value: 0 },
     // Desk preview only: the webcam stands in for passthrough on unmoved surfaces.
     uLive: { value: null as Texture | null },
     uLiveToClip: { value: new Matrix4() },
@@ -251,7 +250,6 @@ uniform float uFade1;
 uniform float uAnyPhoto;
 uniform float uFeather;
 uniform float uLinear;
-uniform float uCalibrate;
 #ifdef PREVIEW
 uniform sampler2D uLive;
 uniform mat4 uLiveToClip;
@@ -334,32 +332,6 @@ void main() {
   float streaked = step(0.5, vMask.y);
   c0 *= max(step(0.0, dot(nr, uCamPos0 - vRest)), streaked);
   c1 *= max(step(0.0, dot(nr, uCamPos1 - vRest)), streaked);
-
-  if (uCalibrate > 0.5) {
-    float cell = mod(floor(vRest.x * 4.0) + floor(vRest.y * 4.0) + floor(vRest.z * 4.0), 2.0);
-    float a = cell * c0;
-#ifdef PREVIEW
-    vec3 back = vec3(0.16) * (0.65 + 0.35 * abs(normalize(nr).y));
-    if (uHasLive > 0.5) {
-      vec4 lc = uLiveToClip * vec4(vRest, 1.0);
-      vec2 luv = lc.xy / max(lc.w, 1e-4) * 0.5 + 0.5;
-      if (lc.w > 1e-4 && luv.x >= 0.0 && luv.y >= 0.0 && luv.x <= 1.0 && luv.y <= 1.0) {
-        back = sRGBTransferEOTF(texture(uLive, luv)).rgb;
-      }
-    }
-    vec3 shownPhoto = a > 0.002 ? photoLin(uPhoto0, uv0, uGain0) : back;
-    gl_FragColor = vec4(shownPhoto, 1.0);
-    #include <colorspace_fragment>
-    return;
-#else
-    if (a < 0.002) {
-      gl_FragColor = vec4(0.0);
-      return;
-    }
-    writeColor(photoLin(uPhoto0, uv0, uGain0), a);
-    return;
-#endif
-  }
 
   float shown = max(
     smoothstep(0.003, 0.03, vMask.x + edgeJitter() * uEdge * 0.025),

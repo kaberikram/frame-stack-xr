@@ -26,7 +26,6 @@ import { HandOccluder } from './hand-occluder.js';
 import { drawHint, makeCanvas, type Canvas2D } from './labels.js';
 import { cameraMount, PassthroughPhoto, type CameraMount, type HandJoints } from './passthrough-photo.js';
 import { RoomMeshOverlay } from './room-mesh-overlay.js';
-import { CALIBRATE_URL, StretchCalibration, applyStoredGrade } from './stretch-calibration.js';
 import { StretchLook } from './stretch-component.js';
 import { Spring, averageNormal, buildTriGrid, rayTriGrid, triangleNormal, type RayHit, type TriGrid } from './stretch-math.js';
 import type { RubberUniformSet } from './stretch-material.js';
@@ -104,7 +103,6 @@ interface Look {
   lensScale: number;
   lensPitch: number;
   cameraLatency: number;
-  calibrate: boolean;
   linearBlend: boolean;
 }
 const NUMBER_KEYS = [
@@ -210,6 +208,30 @@ function makeGrab(side: Side): Grab {
   };
 }
 
+/** The removed ?calibrate=1 mode stored a grade here and re-applied it every frame, on every visit. */
+const OLD_GRADE_KEY = 'jonze-stretch-grade';
+
+function purgeOldGrade(): void {
+  let raw: string | null = null;
+  try {
+    raw = localStorage.getItem(OLD_GRADE_KEY);
+    if (raw === null) return;
+    localStorage.removeItem(OLD_GRADE_KEY);
+  } catch {
+    return; // Storage blocked: nothing could have been stored either.
+  }
+  let text = raw;
+  try {
+    const g = JSON.parse(raw) as Record<string, number>;
+    const f = (key: string, digits = 2) => (typeof g[key] === 'number' ? g[key].toFixed(digits) : '?');
+    console.info(`[jonze] cleared old calibration grade exp=${f('exposure')} warm=${f('warmth')} tint=${f('tint')}`);
+    text = `sat=${f('saturation')} con=${f('contrast')} lift=${f('blackLift', 3)} lens=${f('lensScale', 3)}/${f('lensPitch')}`;
+  } catch {
+    // Not JSON: print it raw.
+  }
+  console.info(`[jonze] old grade ${text}`);
+}
+
 function smooth(t: number): number {
   const x = Math.min(1, Math.max(0, t));
   return x * x * (3 - 2 * x);
@@ -252,12 +274,10 @@ export class RoomStretchSystem extends createSystem({
     ripple: 0.015, exposure: 1, warmth: -0.06, tint: 0, saturation: 0.9, contrast: 0.95, blackLift: 0.02,
     grain: 0.04, edgeNoise: 0.5, softness: 0.8, shadow: 0.32, shade: 0.45,
     lensScale: 1, lensPitch: -15, cameraLatency: 0.07,
-    calibrate: false, linearBlend: true,
+    linearBlend: true,
   };
 
   private readonly photo = new PassthroughPhoto();
-  private readonly calibration = new StretchCalibration();
-  private gradeKey = '';
   private readonly sound = new StretchSound();
   private overlay!: RoomMeshOverlay;
   private hands!: HandOccluder;
@@ -306,7 +326,7 @@ export class RoomStretchSystem extends createSystem({
     this.overlay = new RoomMeshOverlay(this.scene);
     this.hands = new HandOccluder(this.scene);
     this.joints.points = this.hands.points;
-    if (CALIBRATE_URL) this.look.calibrate = true;
+    purgeOldGrade();
     this.buildRoom();
     if (navigator.xr && !PREVIEW_FORCED) {
       void navigator.xr.isSessionSupported('immersive-ar').then((ok) => {
@@ -390,8 +410,6 @@ export class RoomStretchSystem extends createSystem({
     const dt = Math.min(0.1, delta);
     const now = performance.now() / 1000;
     this.readLook();
-    applyStoredGrade(this.look);
-    if (CALIBRATE_URL) this.look.calibrate = true;
     this.syncSession(now);
     const presenting = this.renderer.xr.isPresenting;
     const video = this.cameraVideo();
@@ -405,16 +423,6 @@ export class RoomStretchSystem extends createSystem({
       this.photo.recordHead(this.player.head, now);
       this.photo.measureMount(this.mount, this.player.head, (this.renderer.xr.getCamera() as ArrayCamera).cameras);
       this.refreshHands();
-      if (CALIBRATE_URL) {
-        const rightClosed = this.fingersClosed('right');
-        this.calibration.steer(
-          this.fingersClosed('left'),
-          rightClosed,
-          rightClosed ? this.rightTravel() : 0,
-          this.look,
-        );
-        this.applyLook();
-      }
       const meshes = this.findMeshes();
       this.syncGrids(meshes);
       this.photo.capture(true, this.camera, this.handJoints(), this.handsKnown(), now);
@@ -422,8 +430,7 @@ export class RoomStretchSystem extends createSystem({
       this.resolvePending(this.right, dt, now);
       this.stepHand(this.left, dt);
       this.stepHand(this.right, dt);
-      if (this.look.calibrate) this.photo.refreshLive(0, true, this.camera, now);
-      const active = this.left.on || this.right.on || this.look.calibrate;
+      const active = this.left.on || this.right.on;
       this.overlay.setActive(active);
       this.overlay.sync(meshes);
       this.hands.inflate = this.left.holding || this.right.holding ? 1.3 : 1;
@@ -454,13 +461,10 @@ export class RoomStretchSystem extends createSystem({
       this.sound.stop();
       const live = this.photo.projectLive(false, this.camera, now);
       this.photo.capture(false, this.camera, null, true, now);
-      if (CALIBRATE_URL) this.photo.refreshLive(0, false, this.camera, now);
-      else this.updateDemo(dt, now);
-      if (this.look.calibrate && !CALIBRATE_URL) this.photo.refreshLive(0, false, this.camera, now);
+      this.updateDemo(dt, now);
       this.overlay.setPreviewLive(video, live, this.photo.worldToClip);
       this.publish(this.demoL, this.demoR, time, hasVideo);
     }
-    if (CALIBRATE_URL) this.calibration.present(this.look);
     this.hud.visible = true;
     this.updateHud(dt, presenting, hasVideo, now);
   }
@@ -659,7 +663,7 @@ export class RoomStretchSystem extends createSystem({
 
   /** Select events arrive outside the XR frame, where hand joints can't be read. Resolve them next update. */
   private readonly onSelectStart = (event: Event): void => {
-    if (getMode() !== 'stretch' || !this.renderer.xr.isPresenting || this.look.calibrate || CALIBRATE_URL) return;
+    if (getMode() !== 'stretch' || !this.renderer.xr.isPresenting) return;
     const side = (event as XRInputSourceEvent).inputSource?.handedness;
     if (side !== 'left' && side !== 'right') return;
     const grab = side === 'left' ? this.left : this.right;
@@ -768,24 +772,7 @@ export class RoomStretchSystem extends createSystem({
   }
 
   /** Turns a pinch from the last select event into a grab, now that the hand joints are readable. */
-  private fingersClosed(side: Side): boolean {
-    if (!this.hands.hasPinch[side]) return false;
-    return this.hands.thumbTip[side].distanceTo(this.hands.indexTip[side]) < 0.032;
-  }
-
-  /** Pinch midpoint measured along the head's right, so a sideways drag doesn't depend on facing north. */
-  private rightTravel(): number {
-    this.unit.set(1, 0, 0).applyQuaternion(this.headQuat);
-    const thumb = this.hands.thumbTip.right;
-    const index = this.hands.indexTip.right;
-    return this.unit.dot(this.pinch.copy(thumb).add(index).multiplyScalar(0.5));
-  }
-
   private resolvePending(grab: Grab, dt: number, now: number): void {
-    if (this.look.calibrate) {
-      grab.pending = false;
-      return;
-    }
     if (!grab.pending) return;
     if (this.handMap[grab.side] && !this.hands.hasPinch[grab.side]) {
       if (now - grab.pendingAt > PENDING_GIVEUP) grab.pending = false;
@@ -1051,21 +1038,12 @@ export class RoomStretchSystem extends createSystem({
     U.uRipple.value = this.look.ripple;
     U.uAnyPhoto.value = hasVideo ? 1 : 0;
     U.uLinear.value = this.look.linearBlend ? 1 : 0;
-    U.uCalibrate.value = this.look.calibrate ? 1 : 0;
     U.uGrade.value.set(this.look.saturation, this.look.contrast, this.look.blackLift);
     U.uGrain.value = this.look.grain;
     U.uEdge.value = this.look.edgeNoise;
     U.uSoft.value = this.look.softness;
     U.uShadow.value = this.look.shadow;
     U.uShade.value = this.look.shade;
-    if (this.look.calibrate) {
-      const slot = this.photo.slots[0];
-      U.uPhoto0.value = slot.texture;
-      U.uWorldToClip0.value.copy(slot.toClip);
-      U.uCamPos0.value.copy(slot.cam);
-      U.uGain0.value.copy(slot.gain);
-      U.uHasPhoto0.value = slot.has && slot.ready ? 1 : 0;
-    }
   }
 
   private writeGrab(U: RubberUniformSet, k: 0 | 1, grab: Grab): void {
@@ -1134,28 +1112,14 @@ export class RoomStretchSystem extends createSystem({
   // ---------------------------------------------------------------- hint card
 
   private updateHud(dt: number, presenting: boolean, hasVideo: boolean, now: number): void {
-    if (CALIBRATE_URL) {
-      this.paintGrade();
-      this.placeCard(dt, 1, 0.14);
-      return;
-    }
     const want = this.cardFor(presenting, hasVideo, now);
     if (want !== Card.None && want !== this.cardShown) this.paintCard(want);
     const holding = this.left.holding || this.right.holding;
     const target = want !== Card.None && !holding ? 1 : 0;
-    this.placeCard(dt, target, 0);
+    this.placeCard(dt, target);
   }
 
-  private paintGrade(): void {
-    const card = this.calibration.card;
-    const key = `${card.title}|${card.body}`;
-    if (key === this.gradeKey) return;
-    this.gradeKey = key;
-    drawHint(this.cardPaint, card.title, card.body);
-    this.cardTex.needsUpdate = true;
-  }
-
-  private placeCard(dt: number, target: number, lift: number): void {
+  private placeCard(dt: number, target: number): void {
     this.cardOpacity += (target - this.cardOpacity) * (1 - Math.exp(-dt * 6));
     const visible = this.cardOpacity > 0.01;
     if (this.card.visible !== visible) this.card.visible = visible;
@@ -1169,7 +1133,7 @@ export class RoomStretchSystem extends createSystem({
     if (this.unit.lengthSq() < 1e-6) this.unit.set(0, 0, -1);
     this.unit.normalize();
     this.pinch.copy(this.unit).multiplyScalar(CARD_DISTANCE * Math.sqrt(1 - CARD_RISE * CARD_RISE)).add(this.head);
-    this.pinch.y += CARD_DISTANCE * CARD_RISE + lift;
+    this.pinch.y += CARD_DISTANCE * CARD_RISE;
     if (!this.cardSettled) {
       this.card.position.copy(this.pinch);
       this.cardSettled = true;
@@ -1204,8 +1168,6 @@ export class RoomStretchSystem extends createSystem({
         const value = entity.getValue(StretchLook, key);
         if (typeof value === 'number') this.look[key] = value;
       }
-      const calibrate = entity.getValue(StretchLook, 'calibrate');
-      if (typeof calibrate === 'boolean') this.look.calibrate = calibrate;
       const linear = entity.getValue(StretchLook, 'linearBlend');
       if (typeof linear === 'boolean') this.look.linearBlend = linear;
       return;

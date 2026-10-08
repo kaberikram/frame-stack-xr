@@ -47,10 +47,6 @@ export const StretchLook = createComponent('StretchLook', {
   lensScale: { type: Types.Float32, default: 1, min: 0.8, max: 1.2, step: 0.005, label: 'Camera focal scale' },
   lensPitch: { type: Types.Float32, default: -15, min: -30, max: 0, step: 0.25, label: 'Camera pitch (deg)' },
   cameraLatency: { type: Types.Float32, default: 0.07, min: 0, max: 0.2, step: 0.005, label: 'Camera latency (s)' },
-  calibrate: {
-    type: Types.Boolean, default: false, label: 'Calibrate',
-    help: 'Checker the live camera over the room to line up focal scale, pitch, exposure and warmth.',
-  },
   linearBlend: {
     type: Types.Boolean, default: true, label: 'Linear edge blend',
     help: 'Premultiply in linear light. Turn off only to compare edges on a new headset build.',
