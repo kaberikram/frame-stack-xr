@@ -12,7 +12,7 @@ export const INK = {
 } as const;
 
 const SANS = '"Recursive", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif';
-const MONO = 'ui-monospace, "SF Mono", Menlo, Consolas, "Roboto Mono", monospace';
+export const MONO = 'ui-monospace, "SF Mono", Menlo, Consolas, "Roboto Mono", monospace';
 
 export interface Canvas2D {
   canvas: HTMLCanvasElement;
