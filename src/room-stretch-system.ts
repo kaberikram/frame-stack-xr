@@ -314,7 +314,10 @@ export class RoomStretchSystem extends createSystem({
   private overlay!: RoomMeshOverlay;
   private hands!: HandOccluder;
   private readonly handMap: { left: XRHand | null; right: XRHand | null } = { left: null, right: null };
-  private readonly joints: HandJoints = { points: new Float32Array(0), leftStart: 0, leftCount: 0, rightStart: 0, rightCount: 0 };
+  private readonly joints: HandJoints = {
+    points: new Float32Array(0), leftStart: 0, leftCount: 0, rightStart: 0, rightCount: 0,
+    arms: new Float32Array(0), armOk: new Uint8Array(0),
+  };
   private room!: Group;
   private cameraEntity: Entity | null = null;
   private cameraWanted = false;
@@ -362,6 +365,8 @@ export class RoomStretchSystem extends createSystem({
     this.overlay = new RoomMeshOverlay(this.scene);
     this.hands = new HandOccluder(this.scene);
     this.joints.points = this.hands.points;
+    this.joints.arms = this.hands.arms;
+    this.joints.armOk = this.hands.armOk;
     purgeOldGrade();
     this.buildRoom();
     if (navigator.xr && !PREVIEW_FORCED) {
@@ -853,7 +858,7 @@ export class RoomStretchSystem extends createSystem({
     this.poseGrab(grab);
     grab.lift.copy(this.head).sub(grab.worldG).normalize();
     this.writeFootprint(grab);
-    if (!this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, true, this.camera, now, this.handJoints())) {
+    if (!this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, true, this.camera, now, this.handJoints(), this.head)) {
       // Nothing to show: bending it would be invisible. Without video a retry can't help.
       const retry = this.photo.lastMiss !== 'no-video' && now - grab.pendingAt < PHOTO_WAIT;
       this.resetGrab(grab);
@@ -1109,7 +1114,9 @@ export class RoomStretchSystem extends createSystem({
     const slot = this.photo.slots[grab.slot];
     if (moving && !slot.has) {
       this.writeFootprint(grab);
-      this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, false, this.camera, now, null);
+      if (this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, false, this.camera, now, null, this.head)) {
+        console.info(`[jonze] ${this.photo.pickLine(grab.slot)}`);
+      }
     } else if (!moving && slot.has) {
       this.photo.drop(grab.slot);
     }

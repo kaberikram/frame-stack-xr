@@ -42,6 +42,12 @@ export class HandOccluder {
   /** Packed xyz of every tracked joint, world space. `jointCount` is how many are valid. */
   readonly points = new Float32Array(JOINT_COUNT * HANDS * 3);
   jointCount = 0;
+  /**
+   * Each hand's forearm for keeping it out of camera photos: wrist xyz then unit direction up the arm,
+   * 6 floats per hand (left first). `armOk[0|1]` is 1 while that hand's arm is valid.
+   */
+  readonly arms = new Float32Array(6 * HANDS);
+  readonly armOk = new Uint8Array(HANDS);
   /** Where each hand's joints sit in `points`. A count of 0 means that hand isn't tracked. */
   leftStart = 0;
   leftCount = 0;
@@ -82,6 +88,8 @@ export class HandOccluder {
       this.rightCount = 0;
       this.hasPinch.left = false;
       this.hasPinch.right = false;
+      this.armOk[0] = 0;
+      this.armOk[1] = 0;
     }
   }
 
@@ -94,6 +102,8 @@ export class HandOccluder {
     this.jointCount = 0;
     this.leftCount = 0;
     this.rightCount = 0;
+    this.armOk[0] = 0;
+    this.armOk[1] = 0;
     if (!this.mesh.visible || !frame || !ref) {
       this.hasPinch.left = false;
       this.hasPinch.right = false;
@@ -203,11 +213,11 @@ export class HandOccluder {
         0.012 * this.inflate,
       );
     }
-    this.writeForearm(base + JOINT_COUNT + BONES.length);
+    this.writeForearm(side === 'left' ? 0 : 1, base + JOINT_COUNT + BONES.length);
   }
 
   /** Up the arm from the wrist, away from the knuckles. Needs no joint orientation. */
-  private writeForearm(base: number): void {
+  private writeForearm(hand: number, base: number): void {
     const w = WRIST * 3;
     const m = MIDDLE_METACARPAL * 3;
     let dx = this.local[w] - this.local[m];
@@ -221,6 +231,14 @@ export class HandOccluder {
     dx /= len;
     dy /= len;
     dz /= len;
+    const o = hand * 6;
+    this.arms[o] = this.local[w];
+    this.arms[o + 1] = this.local[w + 1];
+    this.arms[o + 2] = this.local[w + 2];
+    this.arms[o + 3] = dx;
+    this.arms[o + 4] = dy;
+    this.arms[o + 5] = dz;
+    this.armOk[hand] = 1;
     for (let i = 0; i < FOREARM.length; i++) {
       const d = FOREARM[i];
       this.place(
