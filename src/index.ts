@@ -1,9 +1,13 @@
 import { World } from '@iwsdk/core';
 import projectOptions from 'virtual:iwsdk-project';
+import { DebugConsoleSystem, installDebugConsole } from './debug-console.js';
 import { FrameStackSystem } from './frame-stack-system.js';
 import { LauncherSystem } from './launcher-system.js';
 import { RoomStretchSystem } from './room-stretch-system.js';
 import { TableTouchSystem } from './table-touch-system.js';
+
+// Before World.create, so its own logs, errors and rejections reach the headset panel too.
+installDebugConsole();
 
 World.create(document.getElementById('scene-container') as HTMLDivElement, projectOptions).then((world) => {
   world
@@ -11,5 +15,7 @@ World.create(document.getElementById('scene-container') as HTMLDivElement, proje
     .registerSystem(FrameStackSystem, { priority: 1 })
     .registerSystem(TableTouchSystem)
     .registerSystem(RoomStretchSystem)
-    .registerSystem(LauncherSystem);
+    .registerSystem(LauncherSystem)
+    // Runs last, so a line logged this frame is drawn this frame.
+    .registerSystem(DebugConsoleSystem, { priority: 2 });
 });
