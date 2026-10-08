@@ -41,6 +41,7 @@ export function launchSession(launch: () => void, requestCamera: boolean): void 
     return original(sessionMode, { ...init, optionalFeatures: optional }).catch((error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       if (!/camera-access/i.test(message)) throw error;
+      console.warn(`[jonze] session refused camera-access, retrying without it: ${message}`);
       return original(sessionMode, init);
     });
   }) as typeof xr.requestSession;

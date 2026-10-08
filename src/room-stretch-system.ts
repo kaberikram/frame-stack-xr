@@ -92,14 +92,6 @@ interface Look {
   exposure: number;
   warmth: number;
   tint: number;
-  saturation: number;
-  contrast: number;
-  blackLift: number;
-  grain: number;
-  edgeNoise: number;
-  softness: number;
-  shadow: number;
-  shade: number;
   lensScale: number;
   lensPitch: number;
   cameraLatency: number;
@@ -108,8 +100,7 @@ interface Look {
 const NUMBER_KEYS = [
   'gain', 'reach', 'ramp', 'stripes', 'feather', 'wobble', 'waveLength', 'waveSpeed',
   'stiffness', 'damping', 'depthPull', 'radial', 'ripple', 'exposure', 'warmth',
-  'tint', 'saturation', 'contrast', 'blackLift', 'grain', 'edgeNoise', 'softness', 'shadow', 'shade',
-  'lensScale', 'lensPitch', 'cameraLatency',
+  'tint', 'lensScale', 'lensPitch', 'cameraLatency',
 ] as const;
 
 interface Grab {
@@ -232,6 +223,20 @@ function purgeOldGrade(): void {
   console.info(`[jonze] old grade ${text}`);
 }
 
+/** Which optional features the headset actually granted. A missing camera or mesh shows here first. */
+function logSession(session: XRSession): void {
+  const features = (session as XRSession & { enabledFeatures?: readonly string[] }).enabledFeatures;
+  if (!features) {
+    console.info('[jonze] session started (features not reported)');
+    return;
+  }
+  const has = (name: string) => (features.includes(name) ? 'Y' : 'n');
+  console.info(
+    `[jonze] session camera=${has('camera-access')} mesh=${has('mesh-detection')} plane=${has('plane-detection')} ` +
+      `hands=${has('hand-tracking')} anchors=${has('anchors')}`,
+  );
+}
+
 function smooth(t: number): number {
   const x = Math.min(1, Math.max(0, t));
   return x * x * (3 - 2 * x);
@@ -269,10 +274,9 @@ export class RoomStretchSystem extends createSystem({
   private refSpace: XRReferenceSpace | null = null;
   private outlineShown = true;
   private readonly look: Look = {
-    gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.2, feather: 0.12, wobble: 0.035,
+    gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.2, feather: 0.04, wobble: 0.035,
     waveLength: 0.45, waveSpeed: 7, stiffness: 90, damping: 9, depthPull: 0.35, radial: 2.5,
-    ripple: 0.015, exposure: 1, warmth: -0.06, tint: 0, saturation: 0.9, contrast: 0.95, blackLift: 0.02,
-    grain: 0.04, edgeNoise: 0.5, softness: 0.8, shadow: 0.32, shade: 0.45,
+    ripple: 0.015, exposure: 1.1, warmth: -0.1, tint: 0,
     lensScale: 1, lensPitch: -15, cameraLatency: 0.07,
     linearBlend: true,
   };
@@ -292,6 +296,10 @@ export class RoomStretchSystem extends createSystem({
   private arming: Promise<boolean> | null = null;
   private trackVideo: HTMLVideoElement | null = null;
   private track: MediaStreamTrack | null = null;
+  /** Diagnostics: each prints on change, never per frame. */
+  private lookLogged = false;
+  private videoWas = false;
+  private cameraStateWas = '';
 
   private hud!: Group;
   private hudEntity!: Entity;
@@ -382,8 +390,9 @@ export class RoomStretchSystem extends createSystem({
         this.arming = null;
         return this.attachCamera(devices);
       })
-      .catch(() => {
+      .catch((error: unknown) => {
         this.arming = null;
+        console.warn('[jonze] camera arm failed:', error);
         return false;
       });
     return this.arming;
@@ -411,9 +420,14 @@ export class RoomStretchSystem extends createSystem({
     const now = performance.now() / 1000;
     this.readLook();
     this.syncSession(now);
+    if (!this.lookLogged) this.logLook();
     const presenting = this.renderer.xr.isPresenting;
     const video = this.cameraVideo();
     const hasVideo = this.photo.watch(video, this.cameraTrack(video), now);
+    if (hasVideo !== this.videoWas) {
+      this.videoWas = hasVideo;
+      console.info(hasVideo ? `[jonze] camera video on ${video?.videoWidth}x${video?.videoHeight}` : '[jonze] camera video off');
+    }
     this.applyLook();
     if (presenting) {
       this.wasPresenting = true;
@@ -622,6 +636,8 @@ export class RoomStretchSystem extends createSystem({
       session?.addEventListener('selectstart', this.onSelectStart);
       session?.addEventListener('selectend', this.onSelectEnd);
       this.session = session;
+      this.lookLogged = false;
+      if (session) logSession(session);
       this.clearGrabs();
       this.photo.clear();
       this.pinched = false;
@@ -1038,12 +1054,6 @@ export class RoomStretchSystem extends createSystem({
     U.uRipple.value = this.look.ripple;
     U.uAnyPhoto.value = hasVideo ? 1 : 0;
     U.uLinear.value = this.look.linearBlend ? 1 : 0;
-    U.uGrade.value.set(this.look.saturation, this.look.contrast, this.look.blackLift);
-    U.uGrain.value = this.look.grain;
-    U.uEdge.value = this.look.edgeNoise;
-    U.uSoft.value = this.look.softness;
-    U.uShadow.value = this.look.shadow;
-    U.uShade.value = this.look.shade;
   }
 
   private writeGrab(U: RubberUniformSet, k: 0 | 1, grab: Grab): void {
@@ -1161,6 +1171,20 @@ export class RoomStretchSystem extends createSystem({
     this.cardTex.needsUpdate = true;
   }
 
+  /** What the pull is actually running with, once per session. */
+  private logLook(): void {
+    this.lookLogged = true;
+    const k = this.look;
+    console.info(
+      `[jonze] look exp=${k.exposure.toFixed(2)} warm=${k.warmth.toFixed(2)} tint=${k.tint.toFixed(2)} ` +
+        `feather=${k.feather.toFixed(3)} wobble=${k.wobble.toFixed(3)} lin=${k.linearBlend ? 1 : 0}`,
+    );
+    console.info(
+      `[jonze] look stripes=${k.stripes.toFixed(2)} ramp=${k.ramp.toFixed(2)} radial=${k.radial.toFixed(1)} ` +
+        `lens=${k.lensScale.toFixed(3)}/${k.lensPitch.toFixed(2)} lat=${k.cameraLatency.toFixed(3)}`,
+    );
+  }
+
   private readLook(): void {
     for (const entity of this.queries.settings.entities) {
       for (let i = 0; i < NUMBER_KEYS.length; i++) {
@@ -1191,8 +1215,13 @@ export class RoomStretchSystem extends createSystem({
     if (getMode() !== 'stretch' || this.cameraEntity) return !!this.cameraEntity;
     const back = CameraUtils.findByFacing(devices, CameraFacing.Back);
     const chosen = back ?? devices[0];
-    if (!chosen) return false;
+    if (!chosen) {
+      console.warn('[jonze] camera: no video inputs');
+      return false;
+    }
     this.mount = cameraMount(chosen.label, back ? 'back' : 'unknown');
+    console.info(`[jonze] camera pick "${chosen.label}" mount=${this.mount}${back ? ' back' : ''} of ${devices.length}`);
+    console.debug('[jonze] camera devices', devices.map((d) => d.label).join(' | '));
     const anchor = new Group();
     anchor.name = 'passthrough-camera';
     anchor.visible = false;
@@ -1219,7 +1248,12 @@ export class RoomStretchSystem extends createSystem({
 
   private cameraVideo(): HTMLVideoElement | null {
     const entity = this.cameraEntity;
-    if (!entity || entity.getValue(CameraSource, 'state') !== CameraState.Active) return null;
+    const state = entity ? String(entity.getValue(CameraSource, 'state')) : '';
+    if (state !== this.cameraStateWas) {
+      this.cameraStateWas = state;
+      if (state && state !== CameraState.Active) console.info(`[jonze] camera state ${state}`);
+    }
+    if (!entity || state !== CameraState.Active) return null;
     return entity.getValue(CameraSource, 'videoElement') as HTMLVideoElement | null;
   }
 

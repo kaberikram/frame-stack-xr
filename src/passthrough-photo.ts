@@ -137,18 +137,14 @@ export class PassthroughPhoto {
   readonly liveCam = new Vector3();
   readonly slots: [PhotoSlot, PhotoSlot];
   /** Tunables the system copies in from StretchLook each frame. */
-  readonly lens: LensTuning = { scale: 1, pitchDeg: -15, latency: 0.07, exposure: 1, warmth: -0.06, tint: 0 };
+  readonly lens: LensTuning = { scale: 1, pitchDeg: -15, latency: 0.07, exposure: 1.1, warmth: -0.1, tint: 0 };
 
   private readonly bank: BankEntry[] = [];
   private readonly stores: [SlotStore, SlotStore];
   private readonly probe: HTMLCanvasElement;
   private readonly probeCtx: CanvasRenderingContext2D;
-  private sessionLum = 0;
-  private sessionReady = false;
-  private readonly sessionRgb = new Vector3();
   private readonly probeMean: MeanRgb = { r: 0, g: 0, b: 0, lum: 0 };
   private readonly scratchHands = new Float32Array(8);
-  private cameraLocked = false;
   private lastAdmit = -Infinity;
 
   private readonly poses = new Float64Array(POSES * 8);
@@ -232,8 +228,10 @@ export class PassthroughPhoto {
       this.rvfcSeen = false;
       this.activeAt = now;
       this.polledFrames = -1;
-      this.cameraLocked = false;
-      this.resetSession();
+      // A new camera start: print its frame size and path again.
+      this.videoW = 0;
+      this.videoH = 0;
+      this.loggedPath = false;
       if (video && typeof video.requestVideoFrameCallback === 'function') {
         this.rvfcHandle = video.requestVideoFrameCallback(this.onFrame);
       }
@@ -243,11 +241,9 @@ export class PassthroughPhoto {
       this.videoW = video.videoWidth;
       this.videoH = video.videoHeight;
       this.activeAt = now;
-      this.resetSession();
       for (let i = 0; i < this.bank.length; i++) this.bank[i].used = false;
       console.info(`[jonze] camera frame ${this.videoW}x${this.videoH}`);
     }
-    if (track && now - this.activeAt >= WARMUP) this.lockExposure(track);
     if (track && track !== this.loggedTrack) {
       this.loggedTrack = track;
       logTrack(track);
@@ -333,7 +329,6 @@ export class PassthroughPhoto {
     entry.b = this.probeMean.b;
     entry.lum = this.probeMean.lum;
     this.boxHands(entry, joints);
-    this.noteSession(this.probeMean);
     this.lastAdmit = now;
   }
 
@@ -368,7 +363,7 @@ export class PassthroughPhoto {
       }
     }
     if (best) {
-      this.fill(k, best.canvas, best.w, best.h, best, now);
+      this.fill(k, best.canvas, best.w, best.h, best);
       this.slots[k].toClip.copy(best.toClip);
       this.slots[k].cam.copy(best.cam);
       return true;
@@ -377,7 +372,7 @@ export class PassthroughPhoto {
     if (!video || !this.videoW || !this.projectLive(presenting, viewCamera, now)) return false;
     if (footprintMargin(this.worldToClip, footprint, 1) < 0.02) return false;
     if (!this.measure(video)) return false;
-    this.fill(k, video, this.videoW, this.videoH, this.probeMean, now);
+    this.fill(k, video, this.videoW, this.videoH, this.probeMean);
     this.smearHands(k, joints);
     this.slots[k].toClip.copy(this.worldToClip);
     this.slots[k].cam.copy(this.liveCam);
@@ -393,7 +388,7 @@ export class PassthroughPhoto {
 
   /** Re-derives each slot's colour from the current exposure, warmth and tint. */
   updateGains(): void {
-    for (let k = 0; k < 2; k++) this.writeGain(this.slots[k].gain, this.stores[k]);
+    for (let k = 0; k < 2; k++) this.writeGain(this.slots[k].gain);
   }
 
   drop(k: 0 | 1): void {
@@ -408,7 +403,7 @@ export class PassthroughPhoto {
     this.poseCount = 0;
     this.poseHead = -1;
     this.lastAdmit = -Infinity;
-    this.resetSession();
+    this.loggedPath = false;
   }
 
   dispose(): void {
@@ -435,11 +430,16 @@ export class PassthroughPhoto {
   private notePath(): void {
     if (this.loggedPath) return;
     this.loggedPath = true;
-    console.info(`[jonze] camera frames: ${this.rvfcSeen ? 'requestVideoFrameCallback' : 'polling, latency estimate'}`);
+    const f = REF_F * (this.videoW / REF_W) * this.lens.scale;
+    const e = this.eyeShift;
+    console.info(
+      `[jonze] camera frames: ${this.rvfcSeen ? 'rVFC' : 'polling'} f=${f.toFixed(0)} pitch=${this.lens.pitchDeg.toFixed(2)} ` +
+        `shift=${e.x.toFixed(3)},${e.y.toFixed(3)},${e.z.toFixed(3)}`,
+    );
   }
 
   /** Copies a source into slot `k`'s own canvas, rebuilding its texture when the size changes. */
-  private fill(k: 0 | 1, source: CanvasImageSource, w: number, h: number, rgb: MeanRgb, now: number): void {
+  private fill(k: 0 | 1, source: CanvasImageSource, w: number, h: number, rgb: MeanRgb): void {
     const store = this.stores[k];
     const slot = this.slots[k];
     if (store.w !== w || store.h !== h || !slot.texture) {
@@ -458,78 +458,18 @@ export class PassthroughPhoto {
     slot.ready = false;
     if (slot.texture) slot.texture.needsUpdate = true;
     slot.has = true;
-    this.writeGain(slot.gain, store);
-  }
-
-  private writeGain(out: Vector3, rgb: MeanRgb): void {
-    const channel = (photo: number, session: number) =>
-      photo > 1e-4 && session > 1e-4 ? Math.min(1.15, Math.max(0.85, session / photo)) : 1;
-    const e = this.lens.exposure;
-    const warm = this.lens.warmth;
-    const tint = this.lens.tint;
-    const ar = channel(rgb.r, this.sessionRgb.x);
-    const ag = channel(rgb.g, this.sessionRgb.y);
-    const ab = channel(rgb.b, this.sessionRgb.z);
-    out.set(
-      e * ar * (1 + 0.5 * warm) * (1 - 0.25 * tint),
-      e * ag * (1 + 0.5 * tint),
-      e * ab * (1 - 0.5 * warm) * (1 - 0.25 * tint),
-    );
-  }
-
-  private noteSession(rgb: MeanRgb): void {
-    if (!this.sessionReady) {
-      this.sessionRgb.set(rgb.r, rgb.g, rgb.b);
-      this.sessionLum = rgb.lum;
-      this.sessionReady = true;
-      return;
-    }
-    const k = 0.2;
-    this.sessionRgb.x += (rgb.r - this.sessionRgb.x) * k;
-    this.sessionRgb.y += (rgb.g - this.sessionRgb.y) * k;
-    this.sessionRgb.z += (rgb.b - this.sessionRgb.z) * k;
-    this.sessionLum += (rgb.lum - this.sessionLum) * k;
-  }
-
-  private resetSession(): void {
-    this.sessionReady = false;
-    this.sessionRgb.set(0, 0, 0);
-    this.sessionLum = 0;
+    this.writeGain(slot.gain);
   }
 
   /**
-   * After warm-up, freeze exposure and white balance when the camera offers a manual mode.
-   * Quest often doesn't; the per-channel gain covers that case. Logged either way.
+   * Exposure, warmth and tint only. No term from the photo's own average: that pulled a brown table
+   * toward the room's mean grey. Allocates nothing; it runs every frame.
    */
-  private lockExposure(track: MediaStreamTrack): void {
-    if (this.cameraLocked) return;
-    this.cameraLocked = true;
-    void this.applyLock(track);
-  }
-
-  private async applyLock(track: MediaStreamTrack): Promise<void> {
-    let caps: MediaTrackCapabilities = {};
-    try {
-      caps = typeof track.getCapabilities === 'function' ? track.getCapabilities() : {};
-    } catch {
-      console.info('[jonze] camera lock: capabilities unavailable');
-      return;
-    }
-    const exposureMode = (caps as { exposureMode?: string[] }).exposureMode;
-    const whiteBalanceMode = (caps as { whiteBalanceMode?: string[] }).whiteBalanceMode;
-    const advanced: Record<string, string> = {};
-    if (exposureMode?.includes('manual')) advanced.exposureMode = 'manual';
-    if (whiteBalanceMode?.includes('manual')) advanced.whiteBalanceMode = 'manual';
-    if (!advanced.exposureMode && !advanced.whiteBalanceMode) {
-      console.info('[jonze] camera lock unavailable', JSON.stringify({ exposureMode, whiteBalanceMode }));
-      return;
-    }
-    try {
-      await track.applyConstraints({ advanced: [advanced] } as MediaTrackConstraints);
-      console.info('[jonze] camera locked', JSON.stringify(advanced), JSON.stringify(track.getSettings()));
-    } catch (err) {
-      console.info('[jonze] camera lock failed', err);
-    }
+  private writeGain(out: Vector3): void {
+    const e = this.lens.exposure;
+    const warm = this.lens.warmth;
+    const tint = this.lens.tint;
+    out.set(e * (1 + 0.5 * warm) * (1 - 0.25 * tint), e * (1 + 0.5 * tint), e * (1 - 0.5 * warm) * (1 - 0.25 * tint));
   }
 
   /** Mean linear RGB of the video, from a tiny copy. False when the frame is still black. */
@@ -847,9 +787,12 @@ function touchesHands(entry: BankEntry, points: Float32Array, count: number): bo
 }
 
 function logTrack(track: MediaStreamTrack): void {
+  const settings = track.getSettings() as MediaTrackSettings & { resizeMode?: string };
+  const fps = settings.frameRate ? settings.frameRate.toFixed(0) : '?';
+  console.info(`[jonze] camera "${track.label}" ${settings.width}x${settings.height}@${fps} resize=${settings.resizeMode ?? '?'}`);
   try {
     const caps = typeof track.getCapabilities === 'function' ? track.getCapabilities() : {};
-    console.info('[jonze] camera', track.label, JSON.stringify(track.getSettings()), JSON.stringify(caps));
+    console.debug('[jonze] camera settings', JSON.stringify(settings), JSON.stringify(caps));
   } catch {
     // Some browsers throw on getCapabilities for camera tracks; the log is only a hint.
   }

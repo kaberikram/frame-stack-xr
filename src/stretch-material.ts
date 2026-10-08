@@ -31,7 +31,7 @@ export function createRubberUniforms() {
     uReach: { value: 0.45 },
     uRamp: { value: 0.35 },
     uStripes: { value: 0.2 },
-    uFeather: { value: 0.12 },
+    uFeather: { value: 0.04 },
     uWobble: { value: 0.035 },
     uWaveK: { value: 1 / 0.45 },
     uWaveSpeed: { value: 7 },
@@ -49,18 +49,11 @@ export function createRubberUniforms() {
     uCamPos1: { value: new Vector3() },
     uGain0: { value: new Vector3(1, 1, 1) },
     uGain1: { value: new Vector3(1, 1, 1) },
-    /** x saturation, y contrast, z black lift. Shared by both slots. */
-    uGrade: { value: new Vector3(0.9, 0.95, 0.02) },
-    uGrain: { value: 0.04 },
-    uEdge: { value: 0.5 },
-    uSoft: { value: 0.8 },
-    uShadow: { value: 0.32 },
-    uShade: { value: 0.45 },
     uHasPhoto0: { value: 0 },
     uHasPhoto1: { value: 0 },
     uFade0: { value: 0 },
     uFade1: { value: 0 },
-    /** 1 while a camera feeds photos. Without one, moved surfaces get a faint frost instead. */
+    /** 1 while a camera feeds photos. Without one the desk preview frosts moved surfaces; a headset draws nothing. */
     uAnyPhoto: { value: 0 },
     uLinear: { value: 1 },
     // Desk preview only: the webcam stands in for passthrough on unmoved surfaces.
@@ -96,10 +89,8 @@ varying vec4 vPhoto0;
 varying vec4 vPhoto1;
 varying vec3 vRest;
 varying vec3 vWorld;
-varying vec3 vRestN;
 varying vec2 vMask; // x: visible displacement (m), y: how streaked
 varying vec2 vW;    // how much each grab moved this point
-varying float vShadow;
 
 const float STRIPE_WIDTH = 0.6; // stretch range over which streaks fade in
 const float SIDE_GROW = 0.5;    // the band widens 0.5 m per metre pulled, so small triangles never flip
@@ -117,7 +108,7 @@ float ease(float x) { x = clamp(x, 0.0, 1.0); return x * x * (3.0 - 2.0 * x); }
  * pulled onto the column (taffy) or ring (burst) through the pinch where the surface stretched.
  * 'hide' rises where a squeezed zone should hand back to the real room.
  */
-void pinch(inout vec3 p, inout vec3 s, inout float seen, inout float streak, inout float hide, out float own, inout float contact,
+void pinch(inout vec3 p, inout vec3 s, inout float seen, inout float streak, inout float hide, out float own,
            vec3 G, vec3 D, vec3 axis, vec3 n, vec3 lift, float A, float E, float B, float rip, float sk) {
   vec3 q = p - G;
   float len = length(D);
@@ -190,15 +181,6 @@ void pinch(inout vec3 p, inout vec3 s, inout float seen, inout float streak, ino
   float hideT = (1.0 - capT) * smoothstep(0.0, 0.02, length(moveT));
   float hideR = (1.0 - capR) * smoothstep(0.0, 0.02, length(moveR));
   hide = max(hide, max(hideT, hideR));
-  // A rim on points that barely moved, just outside the slide and the burst. The lift strengthens it.
-  float sideEdge = r0 + 0.6 * uReach + SIDE_GROW * len;
-  float sideRim = smoothstep(sideEdge - 0.1, sideEdge - 0.015, r) * (1.0 - smoothstep(sideEdge, sideEdge + 0.08, r));
-  float wideSide = onTaffy * sideRim * (t < 0.15 ? 1.0 : along);
-  float burstEdge = core + squash;
-  float burstRim = smoothstep(burstEdge - 0.1, burstEdge - 0.015, rho) * (1.0 - smoothstep(burstEdge, burstEdge + 0.08, rho));
-  float halo = max(wideSide, onBurst * burstRim) * (1.0 - smoothstep(0.0, 0.015, own));
-  float lifted = smoothstep(0.0, 0.035, abs(B) + len * 0.2);
-  contact = max(contact, halo * mix(0.4, 1.0, lifted));
 }
 
 void main() {
@@ -210,17 +192,14 @@ void main() {
   float hide = 0.0;
   float own0 = 0.0;
   float own1 = 0.0;
-  float contact = 0.0;
-  if (uOn0 > 0.5) pinch(p, s, seen, streak, hide, own0, contact, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0, uSk0);
-  if (uOn1 > 0.5) pinch(p, s, seen, streak, hide, own1, contact, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1, uSk1);
+  if (uOn0 > 0.5) pinch(p, s, seen, streak, hide, own0, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0, uSk0);
+  if (uOn1 > 0.5) pinch(p, s, seen, streak, hide, own1, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1, uSk1);
   // A squeezed zone reads the photo where it now sits, which is what passthrough shows there,
   // so it can fade into the real room without a seam.
   float h = ease(hide);
   s = mix(s, p, h);
   vRest = rest;
   vWorld = p;
-  vRestN = normalize(mat3(modelMatrix) * normal);
-  vShadow = contact;
   vPhoto0 = uWorldToClip0 * vec4(s, 1.0);
   vPhoto1 = uWorldToClip1 * vec4(s, 1.0);
   vMask = vec2(seen * (1.0 - smoothstep(0.6, 1.0, hide)), streak * (1.0 - h));
@@ -236,13 +215,6 @@ uniform vec3 uCamPos0;
 uniform vec3 uCamPos1;
 uniform vec3 uGain0;
 uniform vec3 uGain1;
-uniform vec3 uGrade;
-uniform float uGrain;
-uniform float uEdge;
-uniform float uSoft;
-uniform float uShadow;
-uniform float uShade;
-uniform float uTime;
 uniform float uHasPhoto0;
 uniform float uHasPhoto1;
 uniform float uFade0;
@@ -260,49 +232,22 @@ varying vec4 vPhoto0;
 varying vec4 vPhoto1;
 varying vec3 vRest;
 varying vec3 vWorld;
-varying vec3 vRestN;
 varying vec2 vMask;
 varying vec2 vW;
-varying float vShadow;
-
-float hash13(vec3 p) {
-  p = fract(p * 0.1031);
-  p += dot(p, p.yzx + 33.33);
-  return fract((p.x + p.y) * p.z);
-}
-
-/** World-anchored, so the ragged edge stays put as the head moves. */
-float edgeJitter() {
-  return hash13(floor(vRest * 28.0)) - 0.5;
-}
 
 float frameCover(vec4 clip, out vec2 uv) {
   uv = clip.xy / max(clip.w, 1e-4) * 0.5 + 0.5;
   if (clip.w <= 1e-4 || uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return 0.0;
   float edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-  return smoothstep(0.0, max(uFeather, 1e-4), edge + edgeJitter() * uEdge * max(uFeather, 0.02));
+  return smoothstep(0.0, max(uFeather, 1e-4), edge);
 }
 
-vec3 grade(vec3 lin) {
-  float luma = dot(lin, vec3(0.2126, 0.7152, 0.0722));
-  vec3 sat = mix(vec3(luma), lin, uGrade.x);
-  vec3 con = (sat - vec3(0.18)) * uGrade.y + vec3(0.18);
-  con = max(con, vec3(0.0));
-  return con + uGrade.z * (vec3(1.0) - con);
-}
-
-vec3 photoTap(sampler2D tex, vec2 uv) {
-  return sRGBTransferEOTF(texture(tex, uv)).rgb;
-}
-
-vec3 photoLin(sampler2D tex, vec2 uv, vec3 gain) {
-  vec2 o = vec2(0.0015, 0.002) * uSoft;
-  vec3 c = photoTap(tex, uv);
-  c += photoTap(tex, uv + vec2(o.x, 0.0));
-  c += photoTap(tex, uv - vec2(o.x, 0.0));
-  c += photoTap(tex, uv + vec2(0.0, o.y));
-  c += photoTap(tex, uv - vec2(0.0, o.y));
-  return grade(c * 0.2 * gain);
+/**
+ * The photos are SRGBColorSpace textures, stored as SRGB8_ALPHA8, so the sampler already returns
+ * linear light. Decoding again crushed every photo to a flat grey. textureLod needs no derivatives.
+ */
+vec3 photo(sampler2D tex, vec2 uv, vec3 gain) {
+  return textureLod(tex, uv, 0.0).rgb * gain;
 }
 
 /**
@@ -323,7 +268,6 @@ void writeColor(vec3 lin, float alpha) {
 void main() {
   // Derivatives first: they are undefined after a non-uniform early return.
   vec3 nr = cross(dFdx(vRest), dFdy(vRest));
-  vec3 bent = cross(dFdx(vWorld), dFdy(vWorld));
   vec2 uv0;
   vec2 uv1;
   float c0 = uHasPhoto0 * frameCover(vPhoto0, uv0);
@@ -333,68 +277,48 @@ void main() {
   c0 *= max(step(0.0, dot(nr, uCamPos0 - vRest)), streaked);
   c1 *= max(step(0.0, dot(nr, uCamPos1 - vRest)), streaked);
 
-  float shown = max(
-    smoothstep(0.003, 0.03, vMask.x + edgeJitter() * uEdge * 0.025),
-    smoothstep(0.05, 0.2, vMask.y)
-  );
+  float shown = max(smoothstep(0.003, 0.03, vMask.x), smoothstep(0.05, 0.2, vMask.y));
   float k0 = c0 * uFade0 * smoothstep(0.0, 0.01, vW.x);
   float k1 = c1 * uFade1 * smoothstep(0.0, 0.01, vW.y);
+#ifdef PREVIEW
+  // Desk without a webcam: a faint frost keeps the demo visible.
   float frost = (1.0 - uAnyPhoto) * 0.25;
+#else
+  // Headset: no photo, nothing drawn. Passthrough stays.
+  const float frost = 0.0;
+#endif
   float alpha = shown * max(max(k0, k1), frost);
-  float shadeA = vShadow * uShadow * (1.0 - smoothstep(0.02, 0.25, alpha));
 
 #ifdef PREVIEW
   vec3 back = vec3(0.16) * (0.65 + 0.35 * abs(normalize(nr).y));
   if (uHasLive > 0.5) {
-    vec4 lc = uLiveToClip * vec4(vRest, 1.0);
+    // Where the surface is drawn now, as passthrough would show it.
+    vec4 lc = uLiveToClip * vec4(vWorld, 1.0);
     vec2 luv = lc.xy / max(lc.w, 1e-4) * 0.5 + 0.5;
     if (lc.w > 1e-4 && luv.x >= 0.0 && luv.y >= 0.0 && luv.x <= 1.0 && luv.y <= 1.0) {
       back = sRGBTransferEOTF(texture(uLive, luv)).rgb;
     }
   }
 #else
-  // Unmoved surfaces stay real. A contact shadow is premultiplied black, which darkens
-  // passthrough instead of covering it. Depth is still written so a nearer surface wins.
+  // Unmoved surfaces stay real. Depth is still written so a nearer surface wins.
   if (alpha < 0.002) {
-    if (shadeA < 0.004) {
-      gl_FragColor = vec4(0.0);
-      return;
-    }
-    gl_FragColor = vec4(0.0, 0.0, 0.0, shadeA);
+    gl_FragColor = vec4(0.0);
     return;
   }
 #endif
 
-  vec3 col = vec3(0.92);
   float w0 = k0 * max(vW.x, 1e-4);
   float w1 = k1 * max(vW.y, 1e-4);
-  if (w0 + w1 > 1e-7) {
-    vec3 a0 = photoLin(uPhoto0, uv0, uGain0);
-    vec3 a1 = photoLin(uPhoto1, uv1, uGain1);
-    col = (a0 * w0 + a1 * w1) / (w0 + w1);
-  }
-  float bentLen = length(bent);
-  if (bentLen > 1e-5) {
-    vec3 viewDir = normalize(cameraPosition - vWorld);
-    vec3 bentN = bent / bentLen;
-    vec3 restN = normalize(vRestN);
-    if (dot(bentN, viewDir) < 0.0) bentN = -bentN;
-    if (dot(restN, viewDir) < 0.0) restN = -restN;
-    vec3 L = normalize(vec3(0.1, 0.85, 0.15) + viewDir * 0.4);
-    float restNd = clamp(dot(restN, L), 0.0, 1.0) * 0.5 + 0.5;
-    float bentNd = clamp(dot(bentN, L), 0.0, 1.0) * 0.5 + 0.5;
-    float ratio = clamp(bentNd / max(restNd, 1e-3), 0.75, 1.15);
-    col *= mix(1.0, ratio, uShade);
-  }
-  float gn = hash13(vRest * 140.0 + vec3(floor(uTime * 12.0)));
-  col *= 1.0 + (gn - 0.5) * uGrain;
-
+  vec3 col = vec3(0.0);
+  if (w0 > 0.0) col += photo(uPhoto0, uv0, uGain0) * w0;
+  if (w1 > 0.0) col += photo(uPhoto1, uv1, uGain1) * w1;
 #ifdef PREVIEW
-  col = mix(back, col, alpha) * (1.0 - shadeA);
+  col = w0 + w1 > 1e-7 ? col / (w0 + w1) : vec3(0.92);
+  col = mix(back, col, alpha);
   gl_FragColor = vec4(col, 1.0);
   #include <colorspace_fragment>
 #else
-  writeColor(col, alpha);
+  writeColor(col / max(w0 + w1, 1e-7), alpha);
 #endif
 }
 `;
@@ -409,6 +333,7 @@ export function rubberMaterial(uniforms: RubberUniformSet, preview = false): Sha
     uniforms,
     vertexShader: VERTEX,
     fragmentShader: FRAGMENT,
+    name: preview ? 'jonze-stretch-preview' : 'jonze-stretch',
     defines: preview ? { PREVIEW: '' } : {},
     transparent: false,
     depthTest: true,
