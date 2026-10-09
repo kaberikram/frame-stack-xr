@@ -697,7 +697,8 @@ export class PassthroughPhoto {
     const clock = this.rvfcSeen ? this.frameClock : 'polled';
     console.info(
       `[jonze] camera frames: ${this.rvfcSeen ? 'rVFC' : 'polling'} ${this.videoW}x${this.videoH} ` +
-        `clock=${clock} tau=${(TAU[clock] + lens.latency).toFixed(3)} head=${this.headOffClock > 0 ? 'page' : 'display'}`,
+        `clock=${clock} tau=${(TAU[clock] + lens.latency).toFixed(3)} off=${this.offClock} ` +
+        `head=${this.headOffClock > 0 ? 'page' : 'display'}`,
     );
     console.info(
       `[jonze] lens f=${this.focalPx().toFixed(0)} pyr=${sign(MOUNT_DEG.pitch + lens.pitchTrim)}/` +
