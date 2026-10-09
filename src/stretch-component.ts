@@ -52,7 +52,10 @@ export const StretchLook = createComponent('StretchLook', {
     type: Types.Enum, enum: CameraSide, default: CameraSide.Auto, label: 'Camera side',
     help: 'Which visor camera the photos come from. Auto trusts the device label.',
   },
-  cameraLatency: { type: Types.Float32, default: 0.07, min: 0, max: 0.2, step: 0.005, label: 'Camera latency (s)' },
+  cameraLatency: {
+    type: Types.Float32, default: 0, min: -0.05, max: 0.1, step: 0.005, label: 'Camera latency trim (s)',
+    help: 'Added to the frame clock prior. Developer trim; 0 is the prior.',
+  },
   linearBlend: {
     type: Types.Boolean, default: true, label: 'Linear edge blend',
     help: 'Premultiply in linear light. Turn off only to compare edges on a new headset build.',

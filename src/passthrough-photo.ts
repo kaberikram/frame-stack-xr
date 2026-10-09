@@ -32,7 +32,8 @@ const LENS = { x: 0.0325, y: 0, z: -0.065 };
 const DEG = Math.PI / 180;
 
 const BANK = 8;
-const POSES = 64;
+/** About 1.4 s of head poses at 90 Hz: enough to reach back past the slowest camera stamp. */
+const POSES = 128;
 const PROBE_W = 16;
 const PROBE_H = 12;
 /** Mean linear luminance below this is a warm-up or suspended frame. */
@@ -74,6 +75,16 @@ const RVFC_STALL = 0.5;
 /** Poses older than the ring by more than this are unknown, not the oldest one. */
 const POSE_SLACK = 0.05;
 const RVFC_WAIT = 0.5;
+/** A head pose stamped with a display time this far from the page clock is stamped with the page clock. */
+const DISPLAY_SLACK = 0.25;
+
+/**
+ * Which clock stamped the newest camera frame. Each has its own prior for how long before that
+ * stamp the frame was exposed: a capture time is the exposure itself, an expected display time
+ * is the end of the camera-to-screen pipeline, and arrival or polling is in between.
+ */
+type FrameClock = 'capture' | 'expected' | 'arrival' | 'polled';
+const TAU: Record<FrameClock, number> = { capture: 0.01, expected: 0.07, arrival: 0.05, polled: 0.06 };
 
 export interface LensTuning {
   /** Multiplies the measured focal length. Developer trim; 1 is the measured lens. */
@@ -88,6 +99,7 @@ export interface LensTuning {
   dz: number;
   /** Overrides which camera the device label says it is. */
   side: CameraSideSetting;
+  /** Seconds added to the frame clock's exposure prior. Developer trim; 0 is the prior. */
   latency: number;
   exposure: number;
   warmth: number;
@@ -218,7 +230,7 @@ export class PassthroughPhoto {
   /** Tunables the system copies in from StretchLook each frame. */
   readonly lens: LensTuning = {
     scale: 1, pitchTrim: 0, yawTrim: 0, rollTrim: 0, dx: 0, dy: 0, dz: 0, side: 'auto',
-    latency: 0.07, exposure: 1.1, warmth: -0.1, tint: 0,
+    latency: 0, exposure: 1.1, warmth: -0.1, tint: 0,
   };
 
   private readonly bank: BankEntry[] = [];
@@ -246,7 +258,11 @@ export class PassthroughPhoto {
   private rvfcHandle = -1;
   private rvfcSeen = false;
   private frameSerial = 0;
-  private frameTime = 0;
+  /** The newest rVFC frame's stamp, seconds, and the clock it came from. */
+  private frameStamp = 0;
+  private frameClock: FrameClock = 'arrival';
+  /** Head poses stamped by the page clock because the XR display time was missing or off. */
+  private headOffClock = 0;
   private seenSerial = 0;
   private polledFrames = -1;
   private loggedPath = false;
@@ -289,14 +305,24 @@ export class PassthroughPhoto {
     this.probeCtx = probeCtx;
   }
 
-  /** Call every presenting frame, after the input system moved the head. */
-  recordHead(head: Object3D, now: number): void {
+  /**
+   * Call every presenting frame, after the input system moved the head. `shownMs` is the XR frame's
+   * predicted display time: the head pose is the pose for that moment, not for the page clock now.
+   */
+  recordHead(head: Object3D, shownMs: number | undefined, now: number): void {
+    let at = shownMs !== undefined ? shownMs / 1000 : NaN;
+    if (!(Math.abs(at - now) <= DISPLAY_SLACK)) {
+      at = now;
+      if (this.headOffClock++ === 0) console.warn('[jonze] XR display time missing or off the page clock; stamping head poses now');
+    }
+    // The ring must stay in time order for poseAt.
+    if (this.poseCount > 0 && at <= this.poses[this.poseHead * 8]) return;
     head.matrixWorld.decompose(this.pos, this.quat, this.tmp);
     this.poseHead = (this.poseHead + 1) % POSES;
     this.poseCount = Math.min(POSES, this.poseCount + 1);
     const o = this.poseHead * 8;
     const p = this.poses;
-    p[o] = now;
+    p[o] = at;
     p[o + 1] = this.pos.x;
     p[o + 2] = this.pos.y;
     p[o + 3] = this.pos.z;
@@ -389,13 +415,13 @@ export class PassthroughPhoto {
   }
 
   /**
-   * The live camera's projection: the head pose one camera latency ago on a headset, the preview
-   * camera on a desk. Used for the pinch-frame fallback and the desk preview.
+   * The projection of the frame the video is showing now: the head pose when that frame was exposed
+   * on a headset, the preview camera on a desk. Used for the pinch-frame fallback and the desk preview.
    */
-  projectLive(presenting: boolean, viewCamera: PerspectiveCamera, now: number): boolean {
+  projectFrame(presenting: boolean, viewCamera: PerspectiveCamera, now: number): boolean {
     if (!this.videoW) return false;
     if (presenting) {
-      if (!this.poseAt(now - this.lens.latency)) return false;
+      if (!this.poseAt(this.exposedAt(now))) return false;
       this.writeClip(this.worldToClip, this.liveCam);
     } else {
       viewCamera.updateMatrixWorld();
@@ -413,7 +439,7 @@ export class PassthroughPhoto {
     const video = this.video;
     if (!video || !this.videoW || !handsKnown) return;
     if (now - this.activeAt < WARMUP || now - this.lastAdmit < ADMIT_GAP) return;
-    let captured = now - this.lens.latency;
+    let captured = now;
     if (presenting) {
       if (this.rvfcSeen && now - this.rvfcAt > RVFC_STALL) {
         this.rvfcSeen = false;
@@ -425,13 +451,13 @@ export class PassthroughPhoto {
       if (this.rvfcSeen) {
         if (this.frameSerial === this.seenSerial) return;
         this.seenSerial = this.frameSerial;
-        captured = this.frameTime > 0 ? this.frameTime : captured;
       } else {
         if (this.rvfcHandle >= 0 && now - this.activeAt < RVFC_WAIT) return;
         const frames = video.getVideoPlaybackQuality?.().totalVideoFrames ?? -1;
         if (frames >= 0 && frames === this.polledFrames) return;
         this.polledFrames = frames;
       }
+      captured = this.exposedAt(now);
       this.notePath();
       if (!this.steady(captured - 0.06, now)) {
         this.stats.unsteady++;
@@ -546,7 +572,7 @@ export class PassthroughPhoto {
       this.lastMiss = 'no-video';
       return false;
     }
-    if (!this.projectLive(presenting, viewCamera, now)) {
+    if (!this.projectFrame(presenting, viewCamera, now)) {
       this.lastMiss = 'no-pose';
       return false;
     }
@@ -640,13 +666,24 @@ export class PassthroughPhoto {
     this.frameSerial++;
     const arrival = callbackNow / 1000;
     this.rvfcAt = arrival;
-    let at = (meta.captureTime ?? meta.expectedDisplayTime - this.lens.latency * 1000) / 1000;
-    // A capture time on another clock would pose every photo from the wrong moment.
-    if (at > arrival + CLOCK_AHEAD || at < arrival - CLOCK_BEHIND) {
-      at = arrival - this.lens.latency;
-      if (this.offClock++ === 0) console.warn('[jonze] camera captureTime off the page clock; timing frames by arrival');
+    let clock: FrameClock = 'arrival';
+    let stamp = arrival;
+    if (meta.captureTime !== undefined) {
+      clock = 'capture';
+      stamp = meta.captureTime / 1000;
+    } else if (meta.expectedDisplayTime > 0) {
+      clock = 'expected';
+      stamp = meta.expectedDisplayTime / 1000;
     }
-    this.frameTime = at;
+    // A stamp on another clock would pose every photo from the wrong moment.
+    const exposed = stamp - TAU[clock];
+    if (exposed > arrival + CLOCK_AHEAD || exposed < arrival - CLOCK_BEHIND) {
+      if (this.offClock++ === 0) console.warn(`[jonze] camera ${clock} time off the page clock; timing frames by arrival`);
+      clock = 'arrival';
+      stamp = arrival;
+    }
+    this.frameStamp = stamp;
+    this.frameClock = clock;
     this.rvfcHandle = video.requestVideoFrameCallback(this.onFrame);
   };
 
@@ -657,7 +694,11 @@ export class PassthroughPhoto {
     const lens = this.lens;
     const e = this.eyeShift;
     const sign = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}`;
-    console.info(`[jonze] camera frames: ${this.rvfcSeen ? 'rVFC' : 'polling'} ${this.videoW}x${this.videoH}`);
+    const clock = this.rvfcSeen ? this.frameClock : 'polled';
+    console.info(
+      `[jonze] camera frames: ${this.rvfcSeen ? 'rVFC' : 'polling'} ${this.videoW}x${this.videoH} ` +
+        `clock=${clock} tau=${(TAU[clock] + lens.latency).toFixed(3)} head=${this.headOffClock > 0 ? 'page' : 'display'}`,
+    );
     console.info(
       `[jonze] lens f=${this.focalPx().toFixed(0)} pyr=${sign(MOUNT_DEG.pitch + lens.pitchTrim)}/` +
         `${sign(MOUNT_DEG.yaw + lens.yawTrim)}/${sign(MOUNT_DEG.roll + lens.rollTrim)} ` +
@@ -841,6 +882,13 @@ export class PassthroughPhoto {
   }
 
   /** True when the head turned less than ~8°/s and moved less than 0.1 m/s between two times. */
+  /** When the frame the video is showing now was exposed, on the page clock. */
+  private exposedAt(now: number): number {
+    const fresh = this.rvfcSeen && this.frameStamp > 0;
+    const clock = fresh ? this.frameClock : 'polled';
+    return (fresh ? this.frameStamp : now) - TAU[clock] - this.lens.latency;
+  }
+
   private steady(from: number, to: number): boolean {
     if (to - from < 1e-3 || !this.poseAt(from)) return false;
     const ax = this.pos.x;

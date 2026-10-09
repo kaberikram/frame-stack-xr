@@ -311,7 +311,7 @@ export class RoomStretchSystem extends createSystem({
     waveLength: 0.45, waveSpeed: 7, stiffness: 90, damping: 9, depthPull: 0.35, radial: 2.5,
     ripple: 0.015, exposure: 1.1, warmth: -0.1, tint: 0,
     lensScale: 1, lensPitchTrim: 0, lensYawTrim: 0, lensRollTrim: 0, lensDx: 0, lensDy: 0, lensDz: 0,
-    cameraLatency: 0.07, cameraSide: 'auto',
+    cameraLatency: 0, cameraSide: 'auto',
     linearBlend: true,
   };
 
@@ -473,7 +473,7 @@ export class RoomStretchSystem extends createSystem({
       this.room.visible = false;
       this.player.head.getWorldPosition(this.head);
       this.player.head.getWorldQuaternion(this.headQuat);
-      this.photo.recordHead(this.player.head, now);
+      this.photo.recordHead(this.player.head, this.world.xrFrame?.predictedDisplayTime, now);
       this.refreshHands();
       const meshes = this.findMeshes();
       this.syncGrids(meshes);
@@ -511,7 +511,7 @@ export class RoomStretchSystem extends createSystem({
       this.camera.getWorldPosition(this.head);
       this.camera.getWorldQuaternion(this.headQuat);
       this.sound.stop();
-      const live = this.photo.projectLive(false, this.camera, now);
+      const live = this.photo.projectFrame(false, this.camera, now);
       this.photo.capture(false, this.camera, null, true, now);
       this.updateDemo(dt, now);
       this.overlay.setPreviewLive(video, live, this.photo.worldToClip);
@@ -1275,11 +1275,11 @@ export class RoomStretchSystem extends createSystem({
     );
     const trimmed =
       k.lensScale !== 1 || k.lensPitchTrim !== 0 || k.lensYawTrim !== 0 || k.lensRollTrim !== 0 ||
-      k.lensDx !== 0 || k.lensDy !== 0 || k.lensDz !== 0 || k.cameraSide !== 'auto';
+      k.lensDx !== 0 || k.lensDy !== 0 || k.lensDz !== 0 || k.cameraSide !== 'auto' || k.cameraLatency !== 0;
     if (trimmed) {
       console.warn(
         `[jonze] lens trims x${k.lensScale.toFixed(3)} pyr=${k.lensPitchTrim}/${k.lensYawTrim}/${k.lensRollTrim} ` +
-          `d=${k.lensDx},${k.lensDy},${k.lensDz} side=${k.cameraSide}`,
+          `d=${k.lensDx},${k.lensDy},${k.lensDz} side=${k.cameraSide} lat=${k.cameraLatency}`,
       );
     }
   }
