@@ -31,7 +31,7 @@ export function createRubberUniforms() {
     uBloom1: { value: 0 },
     uReach: { value: 0.45 },
     uRamp: { value: 0.35 },
-    uFeather: { value: 0.04 },
+    uFeather: { value: 0.07 },
     uWobble: { value: 0.035 },
     uWaveK: { value: 1 / 0.45 },
     uWaveSpeed: { value: 7 },
@@ -239,6 +239,9 @@ varying vec2 vW;
 
 ${SHARED}
 
+/** How much a moved point leans on the other grab's photo where its own covers it too. */
+const float OTHER_PHOTO = 0.02;
+
 /** Full streaks squeeze the photo 16x toward the pinch: long stripes that still vary, never one texel row. */
 const float STREAK_LOG2 = 4.0;
 
@@ -315,8 +318,11 @@ void main() {
   c0 *= max(step(0.0, dot(nr, uCamPos0 - vRest)), streaked);
   c1 *= max(step(0.0, dot(nr, uCamPos1 - vRest)), streaked);
 
-  float k0 = c0 * uFade0 * smoothstep(0.0, 0.01, vW.x);
-  float k1 = c1 * uFade1 * smoothstep(0.0, 0.01, vW.y);
+  // Both frozen photos are pictures of the same still room, so a moved point may read either one.
+  // Its own grab's photo leads; the other takes over where the first runs off its frame.
+  float k0 = c0 * uFade0;
+  float k1 = c1 * uFade1;
+  float own = max(smoothstep(0.0, 0.01, vW.x), smoothstep(0.0, 0.01, vW.y));
 #ifdef PREVIEW
   // Desk without a webcam: a faint frost keeps the demo visible.
   float frost = (1.0 - uAnyPhoto) * 0.25;
@@ -324,7 +330,7 @@ void main() {
   // Headset: no photo, nothing drawn. Passthrough stays.
   const float frost = 0.0;
 #endif
-  float alpha = shown * max(max(k0, k1), frost);
+  float alpha = shown * max(own * max(k0, k1), frost);
 
 #ifdef PREVIEW
   vec3 back = vec3(0.16) * (0.65 + 0.35 * abs(normalize(nr).y));
@@ -344,8 +350,8 @@ void main() {
   }
 #endif
 
-  float w0 = k0 * max(vW.x, 1e-4);
-  float w1 = k1 * max(vW.y, 1e-4);
+  float w0 = k0 * (max(vW.x, 0.0) + OTHER_PHOTO);
+  float w1 = k1 * (max(vW.y, 0.0) + OTHER_PHOTO);
   vec3 col = vec3(0.0);
   if (w0 > 0.0) col += photo(uPhoto0, uv0, uGain0) * w0;
   if (w1 > 0.0) col += photo(uPhoto1, uv1, uGain1) * w1;

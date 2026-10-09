@@ -269,6 +269,14 @@ function logSession(session: XRSession): void {
   );
 }
 
+/** The camera frame size, and whether it is the full square sensor or the 4:3 crop of it. */
+function frameShape(video: HTMLVideoElement | null): string {
+  const w = video?.videoWidth ?? 0;
+  const h = video?.videoHeight ?? 0;
+  const shape = w === h ? 'square' : Math.abs(w / Math.max(h, 1) - 4 / 3) < 0.01 ? '4:3 crop' : 'other crop';
+  return `${w}x${h} (${shape})`;
+}
+
 function smooth(t: number): number {
   const x = Math.min(1, Math.max(0, t));
   return x * x * (3 - 2 * x);
@@ -307,7 +315,7 @@ export class RoomStretchSystem extends createSystem({
   private refSpace: XRReferenceSpace | null = null;
   private outlineShown = true;
   private readonly look: Look = {
-    gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.15, feather: 0.04, wobble: 0.035,
+    gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.15, feather: 0.07, wobble: 0.035,
     waveLength: 0.45, waveSpeed: 7, stiffness: 90, damping: 9, depthPull: 0.35, radial: 2.5,
     ripple: 0.015, exposure: 1.1, warmth: -0.1, tint: 0,
     lensScale: 1, lensPitchTrim: 0, lensYawTrim: 0, lensRollTrim: 0, lensDx: 0, lensDy: 0, lensDz: 0,
@@ -465,7 +473,7 @@ export class RoomStretchSystem extends createSystem({
     const hasVideo = this.photo.watch(video, this.cameraTrack(video), now);
     if (hasVideo !== this.videoWas) {
       this.videoWas = hasVideo;
-      console.info(hasVideo ? `[jonze] camera video on ${video?.videoWidth}x${video?.videoHeight}` : '[jonze] camera video off');
+      console.info(hasVideo ? `[jonze] camera video on ${frameShape(video)}` : '[jonze] camera video off');
     }
     this.applyLook();
     if (presenting) {
@@ -1340,9 +1348,10 @@ export class RoomStretchSystem extends createSystem({
     entity.addComponent(CameraSource);
     entity.setValue(CameraSource, 'deviceId', chosen.deviceId);
     entity.setValue(CameraSource, 'facing', back ? CameraFacing.Back : CameraFacing.Unknown);
-    // 4:3 keeps the lens's full height; 16:9 crops ~14° off the top and bottom.
+    // The full square sensor where the firmware offers it; otherwise the nearest is the 1280x960 crop
+    // of the same lens. The constraints are ideal, so either opens.
     entity.setValue(CameraSource, 'width', 1280);
-    entity.setValue(CameraSource, 'height', 960);
+    entity.setValue(CameraSource, 'height', 1280);
     entity.setValue(CameraSource, 'frameRate', 30);
     this.cameraEntity = entity;
     this.rearmTries = 0;

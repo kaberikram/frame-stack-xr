@@ -15,7 +15,7 @@ export const StretchLook = createComponent('StretchLook', {
     type: Types.Float32, default: 0.15, min: 0, max: 3, step: 0.01, label: 'Streaks start (m)',
     help: 'Metres of pull before the grabbed column smears into streaks; full 0.35 m later. 3 turns them off.',
   },
-  feather: { type: Types.Float32, default: 0.04, min: 0, max: 0.25, step: 0.005, label: 'Photo feather' },
+  feather: { type: Types.Float32, default: 0.07, min: 0, max: 0.25, step: 0.005, label: 'Photo feather' },
   wobble: { type: Types.Float32, default: 0.035, min: 0, max: 0.06, step: 0.005, label: 'Wobble' },
   waveLength: { type: Types.Float32, default: 0.45, min: 0.05, max: 2, step: 0.05, label: 'Wobble wavelength' },
   waveSpeed: { type: Types.Float32, default: 7, min: 0, max: 30, step: 0.5, label: 'Wobble speed' },
