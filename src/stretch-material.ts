@@ -1,7 +1,7 @@
-import { DoubleSide, Matrix4, ShaderMaterial, Vector3, type Texture } from '@iwsdk/core';
+import { DoubleSide, Matrix4, ShaderMaterial, Vector2, Vector3, Vector4, type Texture } from '@iwsdk/core';
 
 /**
- * Two grabs, in world space. The room mesh bends by both, then each grab reads its own photo.
+ * Two grabs, in world space. The room mesh bends by both, then each grab reads its own photo first.
  * Slot 0 is the earlier grab; slot 1 bends what slot 0 left, so you grab what you see.
  */
 export function createRubberUniforms() {
@@ -31,7 +31,7 @@ export function createRubberUniforms() {
     uBloom1: { value: 0 },
     uReach: { value: 0.45 },
     uRamp: { value: 0.35 },
-    uFeather: { value: 0.04 },
+    uFeather: { value: 0.07 },
     uWobble: { value: 0.035 },
     uWaveK: { value: 1 / 0.45 },
     uWaveSpeed: { value: 7 },
@@ -55,10 +55,24 @@ export function createRubberUniforms() {
     /** 1 while a camera feeds photos. Without one the desk preview frosts moved surfaces; a headset draws nothing. */
     uAnyPhoto: { value: 0 },
     uLinear: { value: 1 },
-    // Desk preview only: the webcam stands in for passthrough on unmoved surfaces.
+    // Desk preview: the webcam stands in for passthrough on unmoved surfaces.
+    // `?lens=overlay` on a headset: the live camera in stripes over the room, to check alignment.
     uLive: { value: null as Texture | null },
     uLiveToClip: { value: new Matrix4() },
     uHasLive: { value: 0 },
+    uLensOn: { value: 0 },
+    // Headset depth of the real room: cuts the real hands and arms out of the stretch.
+    uEnvDepth: { value: null as Texture | null },
+    uDepthOn: { value: 0 },
+    uDepthRaw: { value: 1 },
+    uDepthNear: { value: 0.1 },
+    uEyeSize: { value: new Vector2(1, 1) },
+    uNormDepth0: { value: new Matrix4() },
+    uNormDepth1: { value: new Matrix4() },
+    /** Per hand, a hand then a forearm segment: start xyz and 1 when valid, end xyz and reach. */
+    uSegA: { value: [new Vector4(), new Vector4(), new Vector4(), new Vector4()] },
+    uSegB: { value: [new Vector4(), new Vector4(), new Vector4(), new Vector4()] },
+    uOccDebug: { value: 0 },
   };
 }
 
@@ -113,6 +127,7 @@ varying vec3 vWorld;
 varying vec3 vMid;  // after the first grab: where the second grab measures its column from
 varying vec2 vMask; // x: visible displacement (m), y: how much a squeezed zone hands back to the room
 varying vec2 vW;    // how much each grab moved this point
+varying float vViewZ; // metres in front of this eye, after the stretch
 
 const float SQUASH = 2.0;       // squeezed zones are 2 m long per metre pulled; slope stays above -0.75
 ${SHARED}
@@ -201,7 +216,9 @@ void main() {
   vWorld = p;
   vMask = vec2(seen * (1.0 - smoothstep(0.6, 1.0, hide)), ease(hide));
   vW = vec2(own0, own1);
-  gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
+  vec4 viewPos = viewMatrix * vec4(p, 1.0);
+  vViewZ = -viewPos.z;
+  gl_Position = projectionMatrix * viewPos;
 }
 `;
 
@@ -225,10 +242,29 @@ uniform vec3 uG0; uniform vec3 uD0; uniform vec3 uAxis0; uniform vec3 uN0; unifo
 uniform vec3 uG1; uniform vec3 uD1; uniform vec3 uAxis1; uniform vec3 uN1; uniform float uOn1; uniform float uBloom1;
 uniform float uReach;
 uniform float uRamp;
-#ifdef PREVIEW
+#if defined(PREVIEW) || defined(LENS_OVERLAY)
 uniform sampler2D uLive;
 uniform mat4 uLiveToClip;
 uniform float uHasLive;
+#endif
+#ifdef ENV_DEPTH
+uniform highp sampler2DArray uEnvDepth;
+uniform float uDepthOn;
+uniform float uDepthRaw;
+uniform float uDepthNear;
+uniform vec2 uEyeSize;
+uniform mat4 uNormDepth0;
+uniform mat4 uNormDepth1;
+uniform vec4 uSegA[4];
+uniform vec4 uSegB[4];
+uniform float uOccDebug;
+/** Depth nearer than this is a hole in the depth map, not a hand. */
+const float DEPTH_MIN = 0.12;
+#endif
+#ifdef LENS_OVERLAY
+uniform float uLensOn;
+/** Stripe period in pixels: 48 px of camera, 48 px of passthrough. */
+const float LENS_STRIPE = 96.0;
 #endif
 
 varying vec3 vRest;
@@ -236,8 +272,12 @@ varying vec3 vWorld;
 varying vec3 vMid;
 varying vec2 vMask;
 varying vec2 vW;
+varying float vViewZ;
 
 ${SHARED}
+
+/** How much a moved point leans on the other grab's photo where its own covers it too. */
+const float OTHER_PHOTO = 0.02;
 
 /** Full streaks squeeze the photo 16x toward the pinch: long stripes that still vary, never one texel row. */
 const float STREAK_LOG2 = 4.0;
@@ -256,6 +296,76 @@ float streakTo(inout vec3 s, vec3 base, vec3 G, vec3 D, vec3 axis, vec3 n, float
   s -= axis * (t * (1.0 - keep));
   return 1.0 - keep;
 }
+
+#ifdef ENV_DEPTH
+/** Closest distance between segments p0-p1 and q0-q1. */
+float segmentGap(vec3 p0, vec3 p1, vec3 q0, vec3 q1) {
+  vec3 d1 = p1 - p0;
+  vec3 d2 = q1 - q0;
+  vec3 r = p0 - q0;
+  float a = max(dot(d1, d1), 1e-8);
+  float e = max(dot(d2, d2), 1e-8);
+  float b = dot(d1, d2);
+  float c = dot(d1, r);
+  float f = dot(d2, r);
+  float denom = a * e - b * b;
+  float s = denom > 1e-8 ? clamp((b * f - c * e) / denom, 0.0, 1.0) : 0.0;
+  float t = (b * s + f) / e;
+  if (t < 0.0) {
+    t = 0.0;
+    s = clamp(-c / a, 0.0, 1.0);
+  } else if (t > 1.0) {
+    t = 1.0;
+    s = clamp((b - c) / a, 0.0, 1.0);
+  }
+  return length(p0 + d1 * s - q0 - d2 * t);
+}
+
+/** 1 where the line of sight to this point passes through a tracked hand or forearm, 0 well clear. */
+float handGate(vec3 world) {
+  float g = 0.0;
+  for (int i = 0; i < 4; i++) {
+    if (uSegA[i].w < 0.5) continue;
+    float d = segmentGap(cameraPosition, world, uSegA[i].xyz, uSegB[i].xyz);
+    g = max(g, 1.0 - smoothstep(0.6 * uSegB[i].w, uSegB[i].w, d));
+  }
+  return g;
+}
+
+float envMeters(vec2 uv, float layer) {
+  float t = textureLod(uEnvDepth, vec3(uv, layer), 0.0).r;
+  float m = uDepthRaw * uDepthNear / max(1.0 - t, 1e-5);
+  return m < DEPTH_MIN ? 1e4 : m;
+}
+
+/**
+ * How much a real hand or arm stands in front of this point of the stretch, from the headset's
+ * depth: 1 shows passthrough's real hand, 0 keeps the stretch. Only near tracked hands, so depth
+ * noise elsewhere never punches holes, and with a margin so a pinched sheet stays on the fingers.
+ */
+float handOcclusion(vec3 world) {
+  if (uDepthOn < 0.5) return 0.0;
+  float gate = handGate(world);
+  if (gate <= 0.0) return 0.0;
+#ifdef VIEW_ID
+  float eye = float(VIEW_ID);
+  vec2 fc = gl_FragCoord.xy;
+#else
+  float eye = step(uEyeSize.x, gl_FragCoord.x);
+  vec2 fc = gl_FragCoord.xy - vec2(eye * uEyeSize.x, 0.0);
+#endif
+  vec2 uv = ((eye < 0.5 ? uNormDepth0 : uNormDepth1) * vec4(fc / uEyeSize, 0.0, 1.0)).xy;
+  vec2 texel = 1.0 / vec2(textureSize(uEnvDepth, 0).xy);
+  // The nearest of five taps, so the cut covers the hand's edge rather than trailing inside it.
+  float real = envMeters(uv, eye);
+  real = min(real, envMeters(uv + vec2(texel.x, 0.0), eye));
+  real = min(real, envMeters(uv - vec2(texel.x, 0.0), eye));
+  real = min(real, envMeters(uv + vec2(0.0, texel.y), eye));
+  real = min(real, envMeters(uv - vec2(0.0, texel.y), eye));
+  float margin = 0.01 + 0.02 * vViewZ;
+  return gate * smoothstep(margin, margin + 0.02, vViewZ - real);
+}
+#endif
 
 float frameCover(vec4 clip, out vec2 uv) {
   uv = clip.xy / max(clip.w, 1e-4) * 0.5 + 0.5;
@@ -291,6 +401,23 @@ void main() {
   // Derivatives first: they are undefined after a non-uniform early return.
   vec3 nr = cross(dFdx(vRest), dFdy(vRest));
 
+#ifdef LENS_OVERLAY
+  // Alignment check: every other diagonal stripe is the live camera, projected where the surface is.
+  // Edges that continue across the stripes mean the camera model matches passthrough.
+  if (uLensOn > 0.5) {
+    vec4 lc = uLiveToClip * vec4(vWorld, 1.0);
+    vec2 luv = lc.xy / max(lc.w, 1e-4) * 0.5 + 0.5;
+    bool inside = lc.w > 1e-4 && luv.x >= 0.0 && luv.y >= 0.0 && luv.x <= 1.0 && luv.y <= 1.0;
+    float stripe = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / LENS_STRIPE));
+    if (!inside || stripe < 0.5) {
+      gl_FragColor = vec4(0.0);
+      return;
+    }
+    writeColor(sRGBTransferEOTF(texture(uLive, luv)).rgb, 1.0);
+    return;
+  }
+#endif
+
   // Where the photo is read. The texture rides the surface (rest position) and the streaks pull it
   // toward the grabbed column, per pixel so it is exact on any triangle.
   vec3 s = vRest;
@@ -315,8 +442,11 @@ void main() {
   c0 *= max(step(0.0, dot(nr, uCamPos0 - vRest)), streaked);
   c1 *= max(step(0.0, dot(nr, uCamPos1 - vRest)), streaked);
 
-  float k0 = c0 * uFade0 * smoothstep(0.0, 0.01, vW.x);
-  float k1 = c1 * uFade1 * smoothstep(0.0, 0.01, vW.y);
+  // Both frozen photos are pictures of the same still room, so a moved point may read either one.
+  // Its own grab's photo leads; the other takes over where the first runs off its frame.
+  float k0 = c0 * uFade0;
+  float k1 = c1 * uFade1;
+  float own = max(smoothstep(0.0, 0.01, vW.x), smoothstep(0.0, 0.01, vW.y));
 #ifdef PREVIEW
   // Desk without a webcam: a faint frost keeps the demo visible.
   float frost = (1.0 - uAnyPhoto) * 0.25;
@@ -324,7 +454,11 @@ void main() {
   // Headset: no photo, nothing drawn. Passthrough stays.
   const float frost = 0.0;
 #endif
-  float alpha = shown * max(max(k0, k1), frost);
+  float alpha = shown * max(own * max(k0, k1), frost);
+#ifdef ENV_DEPTH
+  float occ = handOcclusion(vWorld);
+  alpha = uOccDebug > 0.5 ? max(alpha, occ) : alpha * (1.0 - occ);
+#endif
 
 #ifdef PREVIEW
   vec3 back = vec3(0.16) * (0.65 + 0.35 * abs(normalize(nr).y));
@@ -344,8 +478,8 @@ void main() {
   }
 #endif
 
-  float w0 = k0 * max(vW.x, 1e-4);
-  float w1 = k1 * max(vW.y, 1e-4);
+  float w0 = k0 * (max(vW.x, 0.0) + OTHER_PHOTO);
+  float w1 = k1 * (max(vW.y, 0.0) + OTHER_PHOTO);
   vec3 col = vec3(0.0);
   if (w0 > 0.0) col += photo(uPhoto0, uv0, uGain0) * w0;
   if (w1 > 0.0) col += photo(uPhoto1, uv1, uGain1) * w1;
@@ -355,7 +489,12 @@ void main() {
   gl_FragColor = vec4(col, 1.0);
   #include <colorspace_fragment>
 #else
-  writeColor(col / max(w0 + w1, 1e-7), alpha);
+  col /= max(w0 + w1, 1e-7);
+#ifdef ENV_DEPTH
+  // ?occ=debug: the depth cut in magenta instead of a hole.
+  if (uOccDebug > 0.5) col = mix(col, vec3(1.0, 0.0, 1.0), occ);
+#endif
+  writeColor(col, alpha);
 #endif
 }
 `;
@@ -365,13 +504,17 @@ void main() {
  * depth with blending off, so the nearest surface wins and alpha 0 shows passthrough.
  * `preview` adds the webcam backdrop for the desk stand-in; the headset program never samples video.
  */
-export function rubberMaterial(uniforms: RubberUniformSet, preview = false): ShaderMaterial {
+export function rubberMaterial(uniforms: RubberUniformSet, preview = false, lensOverlay = false): ShaderMaterial {
+  const defines: Record<string, string> = {};
+  if (preview) defines.PREVIEW = '';
+  else defines.ENV_DEPTH = '';
+  if (lensOverlay) defines.LENS_OVERLAY = '';
   return new ShaderMaterial({
     uniforms,
     vertexShader: VERTEX,
     fragmentShader: FRAGMENT,
     name: preview ? 'jonze-stretch-preview' : 'jonze-stretch',
-    defines: preview ? { PREVIEW: '' } : {},
+    defines,
     transparent: false,
     depthTest: true,
     depthWrite: true,

@@ -15,17 +15,19 @@ import {
   Vector3,
   VisibilityState,
   XRMesh,
+  XRPlane,
   createSystem,
   outlineMaterial,
-  type ArrayCamera,
   type CameraDeviceInfo,
   type Entity,
 } from '@iwsdk/core';
+import { EnvDepth } from './env-depth.js';
 import { PREVIEW_FORCED, getMode } from './experience.js';
 import { HandOccluder } from './hand-occluder.js';
 import { drawHint, makeCanvas, type Canvas2D } from './labels.js';
-import { cameraMount, PassthroughPhoto, type CameraMount, type HandJoints } from './passthrough-photo.js';
+import { cameraMount, PassthroughPhoto, type CameraMount, type CameraSideSetting, type HandJoints } from './passthrough-photo.js';
 import { RoomMeshOverlay } from './room-mesh-overlay.js';
+import { RoomPlanes, type PlaneHit } from './room-planes.js';
 import { StretchLook } from './stretch-component.js';
 import { Spring, averageNormal, buildTriGrid, rayTriGrid, triangleNormal, type RayHit, type TriGrid } from './stretch-math.js';
 import type { RubberUniformSet } from './stretch-material.js';
@@ -80,6 +82,9 @@ const SETTLE_MAX = 0.12;
 const FADE_IN = 0.12;
 /** A pinch with no usable photo yet keeps trying this long (fresh pose, fresh frame) before it lets go. */
 const PHOTO_WAIT = 0.4;
+/** A plane counts as the grabbed surface when the line of sight meets it this close before or after the mesh. */
+const PLANE_IN_FRONT = 0.05;
+const PLANE_BEHIND = 0.03;
 const FOOTPRINT = 9;
 /** Streaks bloom over this many metres of pull after `stripes`. The shader and the sparkle both read it. */
 const STREAK_SPAN = 0.35;
@@ -104,14 +109,22 @@ interface Look {
   warmth: number;
   tint: number;
   lensScale: number;
-  lensPitch: number;
+  lensPitchTrim: number;
+  lensYawTrim: number;
+  lensRollTrim: number;
+  lensDx: number;
+  lensDy: number;
+  lensDz: number;
   cameraLatency: number;
+  handLag: number;
+  cameraSide: CameraSideSetting;
   linearBlend: boolean;
 }
 const NUMBER_KEYS = [
   'gain', 'reach', 'ramp', 'stripes', 'feather', 'wobble', 'waveLength', 'waveSpeed',
   'stiffness', 'damping', 'depthPull', 'radial', 'ripple', 'exposure', 'warmth',
-  'tint', 'lensScale', 'lensPitch', 'cameraLatency',
+  'tint', 'lensScale', 'lensPitchTrim', 'lensYawTrim', 'lensRollTrim', 'lensDx', 'lensDy', 'lensDz', 'cameraLatency',
+  'handLag',
 ] as const;
 
 interface Grab {
@@ -260,8 +273,23 @@ function logSession(session: XRSession): void {
   const has = (name: string) => (features.includes(name) ? 'Y' : 'n');
   console.info(
     `[jonze] session camera=${has('camera-access')} mesh=${has('mesh-detection')} plane=${has('plane-detection')} ` +
-      `hands=${has('hand-tracking')} anchors=${has('anchors')}`,
+      `hands=${has('hand-tracking')} anchors=${has('anchors')} depth=${has('depth-sensing')}` +
+      (session.depthUsage ? ` ${session.depthUsage}/${session.depthDataFormat ?? '?'}` : ''),
   );
+}
+
+/** Developer check: `?occ=debug` paints the depth cut around the hands magenta instead of cutting. */
+const OCC_DEBUG = typeof location !== 'undefined' && new URLSearchParams(location.search).get('occ') === 'debug';
+
+/** Developer check: `?lens=overlay` draws the live camera in stripes over the room at rest. */
+const LENS_OVERLAY = typeof location !== 'undefined' && new URLSearchParams(location.search).get('lens') === 'overlay';
+
+/** The camera frame size, and whether it is the full square sensor or the 4:3 crop of it. */
+function frameShape(video: HTMLVideoElement | null): string {
+  const w = video?.videoWidth ?? 0;
+  const h = video?.videoHeight ?? 0;
+  const shape = w === h ? 'square' : Math.abs(w / Math.max(h, 1) - 4 / 3) < 0.01 ? '4:3 crop' : 'other crop';
+  return `${w}x${h} (${shape})`;
 }
 
 function smooth(t: number): number {
@@ -278,6 +306,7 @@ function smooth(t: number): number {
 export class RoomStretchSystem extends createSystem({
   settings: { required: [StretchLook] },
   meshes: { required: [XRMesh] },
+  planes: { required: [XRPlane] },
 }) {
   private readonly left = makeGrab('left');
   private readonly right = makeGrab('right');
@@ -302,14 +331,16 @@ export class RoomStretchSystem extends createSystem({
   private refSpace: XRReferenceSpace | null = null;
   private outlineShown = true;
   private readonly look: Look = {
-    gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.15, feather: 0.04, wobble: 0.035,
+    gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.15, feather: 0.07, wobble: 0.035,
     waveLength: 0.45, waveSpeed: 7, stiffness: 90, damping: 9, depthPull: 0.35, radial: 2.5,
     ripple: 0.015, exposure: 1.1, warmth: -0.1, tint: 0,
-    lensScale: 1, lensPitch: -15, cameraLatency: 0.07,
+    lensScale: 1, lensPitchTrim: 0, lensYawTrim: 0, lensRollTrim: 0, lensDx: 0, lensDy: 0, lensDz: 0,
+    cameraLatency: 0, handLag: 0.03, cameraSide: 'auto',
     linearBlend: true,
   };
 
   private readonly photo = new PassthroughPhoto();
+  private readonly depth = new EnvDepth();
   private readonly sound = new StretchSound();
   private overlay!: RoomMeshOverlay;
   private hands!: HandOccluder;
@@ -357,12 +388,19 @@ export class RoomStretchSystem extends createSystem({
   private readonly localD = new Vector3();
   private readonly localHit = new Vector3();
   private readonly localN = new Vector3();
+  private readonly roomPlanes = new RoomPlanes();
+  private readonly planeHit: PlaneHit = { point: new Vector3(), normal: new Vector3(), distance: 0, label: '', horizontal: true };
+  private readonly rayDir = new Vector3();
+  private readonly meshHitWorld = new Vector3();
+  /** How the last grab found its point, for the pinch line. */
+  private hitNote = 'mesh';
   private readonly bestO = new Vector3();
   private readonly bestD = new Vector3();
   private readonly inv = new Matrix4();
 
   init(): void {
-    this.overlay = new RoomMeshOverlay(this.scene);
+    this.overlay = new RoomMeshOverlay(this.scene, LENS_OVERLAY);
+    if (LENS_OVERLAY) console.info('[jonze] lens overlay: live camera in stripes over the room at rest; hold still to read it');
     this.hands = new HandOccluder(this.scene);
     this.joints.points = this.hands.points;
     this.joints.arms = this.hands.arms;
@@ -437,6 +475,8 @@ export class RoomStretchSystem extends createSystem({
   }
 
   update(delta: number, time: number): void {
+    // Every mode: three's own depth occluder must never draw over the scene.
+    this.depth.sync(this.renderer, this.world.xrFrame, this.renderer.xr.getSession());
     const stretch = getMode() === 'stretch';
     this.syncOutline(stretch);
     if (!stretch) {
@@ -459,7 +499,7 @@ export class RoomStretchSystem extends createSystem({
     const hasVideo = this.photo.watch(video, this.cameraTrack(video), now);
     if (hasVideo !== this.videoWas) {
       this.videoWas = hasVideo;
-      console.info(hasVideo ? `[jonze] camera video on ${video?.videoWidth}x${video?.videoHeight}` : '[jonze] camera video off');
+      console.info(hasVideo ? `[jonze] camera video on ${frameShape(video)}` : '[jonze] camera video off');
     }
     this.applyLook();
     if (presenting) {
@@ -467,9 +507,10 @@ export class RoomStretchSystem extends createSystem({
       this.room.visible = false;
       this.player.head.getWorldPosition(this.head);
       this.player.head.getWorldQuaternion(this.headQuat);
-      this.photo.recordHead(this.player.head, now);
-      this.photo.measureMount(this.mount, this.player.head, (this.renderer.xr.getCamera() as ArrayCamera).cameras);
+      this.photo.recordHead(this.player.head, this.world.xrFrame?.predictedDisplayTime, now);
       this.refreshHands();
+      this.publishDepth();
+      this.roomPlanes.sync(this.queries.planes.entities);
       const meshes = this.findMeshes();
       this.syncGrids(meshes);
       this.photo.capture(true, this.camera, this.handJoints(), this.handsKnown(), now);
@@ -478,9 +519,14 @@ export class RoomStretchSystem extends createSystem({
       this.stepHand(this.left, dt);
       this.stepHand(this.right, dt);
       const active = this.left.on || this.right.on;
-      this.overlay.setActive(active);
+      if (LENS_OVERLAY) {
+        const live = !active && hasVideo && this.photo.projectFrame(true, this.camera, now);
+        this.overlay.setLive(video, live, this.photo.worldToClip);
+        this.overlay.uniforms.uLensOn.value = live ? 1 : 0;
+      }
+      this.overlay.setActive(active || this.overlay.uniforms.uLensOn.value > 0);
       this.overlay.sync(meshes);
-      this.hands.inflate = this.left.holding || this.right.holding ? 1.3 : 1;
+      this.overlay.syncPlanes(this.roomPlanes);
       this.publish(this.left, this.right, time, hasVideo);
       this.sing(this.left);
       this.sing(this.right);
@@ -506,10 +552,10 @@ export class RoomStretchSystem extends createSystem({
       this.camera.getWorldPosition(this.head);
       this.camera.getWorldQuaternion(this.headQuat);
       this.sound.stop();
-      const live = this.photo.projectLive(false, this.camera, now);
+      const live = this.photo.projectFrame(false, this.camera, now);
       this.photo.capture(false, this.camera, null, true, now);
       this.updateDemo(dt, now);
-      this.overlay.setPreviewLive(video, live, this.photo.worldToClip);
+      this.overlay.setLive(video, live, this.photo.worldToClip);
       this.publish(this.demoL, this.demoR, time, hasVideo);
     }
     this.hud.visible = true;
@@ -671,6 +717,7 @@ export class RoomStretchSystem extends createSystem({
       this.session = session;
       this.lookLogged = false;
       if (session) logSession(session);
+      this.depth.reset();
       this.clearGrabs();
       this.photo.clear();
       this.pinched = false;
@@ -732,10 +779,32 @@ export class RoomStretchSystem extends createSystem({
 
   private refreshHands(): void {
     this.hands.setActive(true);
+    this.hands.lag = this.look.handLag;
+    // With headset depth the real arm is cut out exactly; a capsule would cut a guessed one.
+    this.hands.capsules = !this.depth.on;
     this.player.updateWorldMatrix(true, false);
     this.handMap.left = this.input.xr.isPrimary('hand', 'left') ? this.input.xr.getPrimaryInputSource('left')?.hand ?? null : null;
     this.handMap.right = this.input.xr.isPrimary('hand', 'right') ? this.input.xr.getPrimaryInputSource('right')?.hand ?? null : null;
-    this.hands.update(this.world.xrFrame, this.world.xrReferenceSpace, this.player.matrixWorld, this.handMap);
+    this.hands.update(this.world.xrFrame, this.world.xrReferenceSpace, this.player.matrixWorld, this.handMap, performance.now() / 1000);
+  }
+
+  /** Headset depth and the hand segments it may cut around, for the stretch shader. */
+  private publishDepth(): void {
+    const U = this.overlay.uniforms;
+    const d = this.depth;
+    U.uDepthOn.value = d.on ? 1 : 0;
+    U.uOccDebug.value = OCC_DEBUG ? 1 : 0;
+    for (let i = 0; i < 4; i++) {
+      U.uSegA.value[i].copy(this.hands.segA[i]);
+      U.uSegB.value[i].copy(this.hands.segB[i]);
+    }
+    if (!d.on) return;
+    U.uEnvDepth.value = d.texture;
+    U.uDepthRaw.value = d.rawToMeters;
+    U.uDepthNear.value = d.near;
+    U.uEyeSize.value.copy(d.eyeSize);
+    U.uNormDepth0.value.copy(d.normDepth[0]);
+    U.uNormDepth1.value.copy(d.normDepth[1]);
   }
 
   private handJoints(): HandJoints {
@@ -812,6 +881,29 @@ export class RoomStretchSystem extends createSystem({
     return true;
   }
 
+  /**
+   * The scan is lumpy by a centimetre or two; a detected plane is flat. When the line of sight
+   * through the pinch meets a plane just around the mesh hit, grab there with the plane's normal.
+   */
+  private preferPlane(): void {
+    this.hitNote = 'mesh';
+    const mesh = this.hitMesh;
+    if (!mesh || this.roomPlanes.count === 0) return;
+    this.rayDir.copy(this.pinch).sub(this.head);
+    if (this.rayDir.lengthSq() < 1e-8) return;
+    this.rayDir.normalize();
+    mesh.updateWorldMatrix(true, false);
+    this.meshHitWorld.copy(this.localHit).applyMatrix4(mesh.matrixWorld);
+    const meshT = this.meshHitWorld.distanceTo(this.head);
+    if (!this.roomPlanes.raycast(this.head, this.rayDir, meshT + PLANE_BEHIND, this.planeHit)) return;
+    const delta = this.planeHit.distance - meshT;
+    if (delta < -PLANE_IN_FRONT) return;
+    this.inv.copy(mesh.matrixWorld).invert();
+    this.localHit.copy(this.planeHit.point).applyMatrix4(this.inv);
+    this.localN.copy(this.planeHit.normal).transformDirection(this.inv);
+    this.hitNote = `plane:${this.planeHit.label} d=${(delta * 100).toFixed(1)}cm`;
+  }
+
   private poseGrab(grab: Grab): void {
     const mesh = grab.mesh;
     if (!mesh?.parent || (!grab.holding && !grab.on)) return;
@@ -845,6 +937,7 @@ export class RoomStretchSystem extends createSystem({
       this.sound.miss(grab.slot, this.pinch.x, this.pinch.y, this.pinch.z);
       return;
     }
+    this.preferPlane();
     grab.mesh = this.hitMesh;
     grab.holding = true;
     grab.on = true;
@@ -874,7 +967,8 @@ export class RoomStretchSystem extends createSystem({
     const n = grab.normal;
     const surface = Math.abs(n.y) < 0.5 ? 'wall' : n.y > 0 ? 'table' : 'ceiling';
     console.info(
-      `[jonze] pinch ${tag} ${surface} ${this.head.distanceTo(grab.worldG).toFixed(2)}m dense=${this.overlay.ready ? 'y' : 'n'}`,
+      `[jonze] pinch ${tag} ${surface} ${this.head.distanceTo(grab.worldG).toFixed(2)}m dense=${this.overlay.ready ? 'y' : 'n'} ` +
+        `hit=${this.hitNote}`,
     );
     console.info(`[jonze] ${this.photo.pickLine(grab.slot)}`);
     grab.heldAt = now;
@@ -1266,8 +1360,17 @@ export class RoomStretchSystem extends createSystem({
     );
     console.info(
       `[jonze] look stripes=${k.stripes.toFixed(2)} ramp=${k.ramp.toFixed(2)} radial=${k.radial.toFixed(1)} ` +
-        `lens=${k.lensScale.toFixed(3)}/${k.lensPitch.toFixed(2)} lat=${k.cameraLatency.toFixed(3)}`,
+        `lat=${k.cameraLatency.toFixed(3)} hand=${k.handLag.toFixed(3)}${OCC_DEBUG ? ' occ=debug' : ''}`,
     );
+    const trimmed =
+      k.lensScale !== 1 || k.lensPitchTrim !== 0 || k.lensYawTrim !== 0 || k.lensRollTrim !== 0 ||
+      k.lensDx !== 0 || k.lensDy !== 0 || k.lensDz !== 0 || k.cameraSide !== 'auto' || k.cameraLatency !== 0;
+    if (trimmed) {
+      console.warn(
+        `[jonze] lens trims x${k.lensScale.toFixed(3)} pyr=${k.lensPitchTrim}/${k.lensYawTrim}/${k.lensRollTrim} ` +
+          `d=${k.lensDx},${k.lensDy},${k.lensDz} side=${k.cameraSide} lat=${k.cameraLatency}`,
+      );
+    }
   }
 
   private readLook(): void {
@@ -1279,6 +1382,8 @@ export class RoomStretchSystem extends createSystem({
       }
       const linear = entity.getValue(StretchLook, 'linearBlend');
       if (typeof linear === 'boolean') this.look.linearBlend = linear;
+      const side = entity.getValue(StretchLook, 'cameraSide');
+      if (side === 'left' || side === 'right' || side === 'auto') this.look.cameraSide = side;
       return;
     }
   }
@@ -1286,7 +1391,13 @@ export class RoomStretchSystem extends createSystem({
   private applyLook(): void {
     const lens = this.photo.lens;
     lens.scale = this.look.lensScale;
-    lens.pitchDeg = this.look.lensPitch;
+    lens.pitchTrim = this.look.lensPitchTrim;
+    lens.yawTrim = this.look.lensYawTrim;
+    lens.rollTrim = this.look.lensRollTrim;
+    lens.dx = this.look.lensDx;
+    lens.dy = this.look.lensDy;
+    lens.dz = this.look.lensDz;
+    lens.side = this.look.cameraSide;
     lens.latency = this.look.cameraLatency;
     lens.exposure = this.look.exposure;
     lens.warmth = this.look.warmth;
@@ -1298,14 +1409,18 @@ export class RoomStretchSystem extends createSystem({
 
   private attachCamera(devices: CameraDeviceInfo[]): boolean {
     if (getMode() !== 'stretch' || this.cameraEntity) return !!this.cameraEntity;
-    const back = CameraUtils.findByFacing(devices, CameraFacing.Back);
+    // The left room camera on purpose: the lens model is measured for it and mirrored for the right.
+    const backs = devices.filter((d) => d.facing === CameraFacing.Back);
+    const backLabels = backs.map((d) => d.label);
+    const back = backs.find((d) => cameraMount(d.label, 'back', backLabels) === 'left') ?? backs[0] ?? null;
     const chosen = back ?? devices[0];
     if (!chosen) {
       console.warn('[jonze] camera: no video inputs');
       return false;
     }
-    this.mount = cameraMount(chosen.label, back ? 'back' : 'unknown');
-    console.info(`[jonze] camera pick "${chosen.label}" mount=${this.mount}${back ? ' back' : ''} of ${devices.length}`);
+    this.mount = cameraMount(chosen.label, back ? 'back' : 'unknown', backLabels);
+    this.photo.setMount(this.mount);
+    console.info(`[jonze] camera pick "${chosen.label}" side=${this.mount} of ${devices.length} (${backs.length} back)`);
     console.debug('[jonze] camera devices', devices.map((d) => d.label).join(' | '));
     const anchor = new Group();
     anchor.name = 'passthrough-camera';
@@ -1314,9 +1429,10 @@ export class RoomStretchSystem extends createSystem({
     entity.addComponent(CameraSource);
     entity.setValue(CameraSource, 'deviceId', chosen.deviceId);
     entity.setValue(CameraSource, 'facing', back ? CameraFacing.Back : CameraFacing.Unknown);
-    // 4:3 keeps the lens's full height; 16:9 crops ~14° off the top and bottom.
+    // The full square sensor where the firmware offers it; otherwise the nearest is the 1280x960 crop
+    // of the same lens. The constraints are ideal, so either opens.
     entity.setValue(CameraSource, 'width', 1280);
-    entity.setValue(CameraSource, 'height', 960);
+    entity.setValue(CameraSource, 'height', 1280);
     entity.setValue(CameraSource, 'frameRate', 30);
     this.cameraEntity = entity;
     this.rearmTries = 0;

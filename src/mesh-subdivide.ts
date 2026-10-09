@@ -152,3 +152,152 @@ function dist2(pos: Float32Array, a: number, b: number): number {
   const dz = pos[ia + 2] - pos[ib + 2];
   return dx * dx + dy * dy + dz * dz;
 }
+
+/** Signed distance from (x, z) to a polygon's outline (x, z pairs): positive inside, negative outside. */
+export function polygonDepth(polygon: ArrayLike<number>, points: number, x: number, z: number): number {
+  let inside = false;
+  let nearSq = Infinity;
+  for (let i = 0, j = points - 1; i < points; j = i++) {
+    const xi = polygon[i * 2];
+    const zi = polygon[i * 2 + 1];
+    const xj = polygon[j * 2];
+    const zj = polygon[j * 2 + 1];
+    if (zi > z !== zj > z && x < ((xj - xi) * (z - zi)) / (zj - zi) + xi) inside = !inside;
+    const ex = xj - xi;
+    const ez = zj - zi;
+    const lenSq = ex * ex + ez * ez;
+    const t = lenSq > 1e-12 ? Math.max(0, Math.min(1, ((x - xi) * ex + (z - zi) * ez) / lenSq)) : 0;
+    const dx = x - (xi + ex * t);
+    const dz = z - (zi + ez * t);
+    nearSq = Math.min(nearSq, dx * dx + dz * dz);
+  }
+  const d = Math.sqrt(nearSq);
+  return inside ? d : -d;
+}
+
+/** A detected plane in the dense mesh's local space. */
+export interface SnapPlane {
+  /** Plane space to mesh space, column-major and rigid. Plane-space +Y is the plane's normal. */
+  matrix: ArrayLike<number>;
+  /** Outline in plane space, x and z pairs. */
+  polygon: ArrayLike<number>;
+  points: number;
+  horizontal: boolean;
+}
+
+/** Vertices within this far of a table or floor snap onto it; walls are rougher scans. */
+const SNAP_HORIZONTAL = 0.02;
+const SNAP_VERTICAL = 0.025;
+/** Only surfaces facing within 35° of the plane's normal: a table's front edge keeps its shape. */
+const SNAP_FACING = Math.cos((35 * Math.PI) / 180);
+/** The snap starts this far inside the outline and is full this much further in. */
+const SNAP_INSET = 0.01;
+const SNAP_FADE = 0.03;
+
+function smoothstep(a: number, b: number, x: number): number {
+  const t = Math.max(0, Math.min(1, (x - a) / (b - a)));
+  return t * t * (3 - 2 * t);
+}
+
+/**
+ * Pulls the vertices that lie on a detected plane exactly onto it, so a table is flat instead of
+ * lumpy by a centimetre or two. A vertex snaps when it is near the plane, its surface faces the
+ * same way and it sits inside the outline. The pull fades toward the outline and with distance
+ * from the plane, so nothing creases. Writes `rest` moved into `out`. Pure: safe in a worker.
+ */
+export function snapToPlanes(
+  rest: Float32Array,
+  indices: Uint32Array,
+  planes: readonly SnapPlane[],
+  out: Float32Array,
+): { moved: number; planes: number } {
+  out.set(rest);
+  if (planes.length === 0) return { moved: 0, planes: 0 };
+  const count = rest.length / 3;
+  const normals = new Float32Array(rest.length);
+  for (let i = 0; i < indices.length; i += 3) {
+    const a = indices[i] * 3;
+    const b = indices[i + 1] * 3;
+    const c = indices[i + 2] * 3;
+    const ux = rest[b] - rest[a];
+    const uy = rest[b + 1] - rest[a + 1];
+    const uz = rest[b + 2] - rest[a + 2];
+    const vx = rest[c] - rest[a];
+    const vy = rest[c + 1] - rest[a + 1];
+    const vz = rest[c + 2] - rest[a + 2];
+    const nx = uy * vz - uz * vy;
+    const ny = uz * vx - ux * vz;
+    const nz = ux * vy - uy * vx;
+    normals[a] += nx;
+    normals[a + 1] += ny;
+    normals[a + 2] += nz;
+    normals[b] += nx;
+    normals[b + 1] += ny;
+    normals[b + 2] += nz;
+    normals[c] += nx;
+    normals[c + 1] += ny;
+    normals[c + 2] += nz;
+  }
+  for (let v = 0; v < count; v++) {
+    const o = v * 3;
+    const len = Math.hypot(normals[o], normals[o + 1], normals[o + 2]);
+    if (len > 1e-12) {
+      normals[o] /= len;
+      normals[o + 1] /= len;
+      normals[o + 2] /= len;
+    }
+  }
+  const weight = new Float32Array(count);
+  const shift = new Float32Array(count);
+  const owner = new Int16Array(count).fill(-1);
+  for (let k = 0; k < planes.length; k++) {
+    const plane = planes[k];
+    const m = plane.matrix;
+    const tol = plane.horizontal ? SNAP_HORIZONTAL : SNAP_VERTICAL;
+    // The scan's winding is unknown: the side most nearby surfaces face is the plane's front.
+    let front = 0;
+    let back = 0;
+    for (let v = 0; v < count; v++) {
+      const o = v * 3;
+      const dist = (rest[o] - m[12]) * m[4] + (rest[o + 1] - m[13]) * m[5] + (rest[o + 2] - m[14]) * m[6];
+      if (Math.abs(dist) > tol) continue;
+      const facing = normals[o] * m[4] + normals[o + 1] * m[5] + normals[o + 2] * m[6];
+      if (facing >= SNAP_FACING) front++;
+      else if (facing <= -SNAP_FACING) back++;
+    }
+    const side = front >= back ? 1 : -1;
+    for (let v = 0; v < count; v++) {
+      const o = v * 3;
+      const rx = rest[o] - m[12];
+      const ry = rest[o + 1] - m[13];
+      const rz = rest[o + 2] - m[14];
+      const dist = rx * m[4] + ry * m[5] + rz * m[6];
+      if (Math.abs(dist) > tol) continue;
+      const facing = side * (normals[o] * m[4] + normals[o + 1] * m[5] + normals[o + 2] * m[6]);
+      if (facing < SNAP_FACING) continue;
+      const depth = polygonDepth(plane.polygon, plane.points, rx * m[0] + ry * m[1] + rz * m[2], rx * m[8] + ry * m[9] + rz * m[10]);
+      const w = Math.max(0, Math.min(1, (depth - SNAP_INSET) / SNAP_FADE)) * (1 - smoothstep(tol * 0.75, tol, Math.abs(dist)));
+      if (w <= weight[v]) continue;
+      weight[v] = w;
+      shift[v] = dist;
+      owner[v] = k;
+    }
+  }
+  let moved = 0;
+  const used = new Uint8Array(planes.length);
+  for (let v = 0; v < count; v++) {
+    const k = owner[v];
+    if (k < 0) continue;
+    const m = planes[k].matrix;
+    const s = shift[v] * weight[v];
+    const o = v * 3;
+    out[o] -= m[4] * s;
+    out[o + 1] -= m[5] * s;
+    out[o + 2] -= m[6] * s;
+    moved++;
+    used[k] = 1;
+  }
+  let usedPlanes = 0;
+  for (let k = 0; k < used.length; k++) usedPlanes += used[k];
+  return { moved, planes: usedPlanes };
+}

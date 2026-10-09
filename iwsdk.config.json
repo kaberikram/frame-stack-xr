@@ -16,7 +16,12 @@
         "handTracking": true,
         "anchors": true,
         "planeDetection": true,
-        "meshDetection": true
+        "meshDetection": true,
+        "depthSensing": {
+          "required": false,
+          "usage": "gpu-optimized",
+          "format": "float32"
+        }
       }
     },
     "input": {
