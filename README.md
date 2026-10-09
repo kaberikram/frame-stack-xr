@@ -42,5 +42,5 @@ Finish **Space Setup** on the headset first, allow the camera when the page asks
 - `src/layout.ts`: stack size, strip length, touch and hover heights.
 - The `FrameStack` component (scene JSON or the editor inspector): ghost, trail, length, lift, feather, glow.
 - The `StretchLook` component: pull gain, sideways reach, stretch ramp, where streaks start (metres of pull; 3 turns them off), photo feather, wobble, spring stiffness and damping, the burst and lift, and the pinch ripple.
-- Matching the camera to passthrough, also in `StretchLook`: photo exposure and warmth, camera focal scale and pitch, and camera latency.
+- Matching the camera to passthrough: the lens model is measured for Quest 3 (851 px at 1280 wide, tilted 11.8° down, in front of its own eye) and the left room camera is used. `StretchLook` has photo exposure and warmth, plus developer-only lens trims (focal, pitch/yaw/roll, offset, side) and camera latency; any non-neutral trim is printed to the console.
 - `MAX_LAYERS` in `src/frame-stack-system.ts`: raise it if the headset holds frame rate.

@@ -1,6 +1,7 @@
 import {
   CanvasTexture,
   ClampToEdgeWrapping,
+  Euler,
   LinearFilter,
   Matrix4,
   Quaternion,
@@ -10,19 +11,25 @@ import {
   type PerspectiveCamera,
 } from '@iwsdk/core';
 
-export type CameraMount = 'left' | 'right' | 'center' | 'view';
+/** Which visor camera feeds the photos. A webcam on a desk is `view`: its pose is the preview camera's. */
+export type CameraMount = 'left' | 'right' | 'view';
+export type CameraSideSetting = 'auto' | 'left' | 'right';
 
 /**
- * Where the passthrough camera sits in the head's frame, before pitch. The right camera's published
- * offset from the right eye is a few centimetres toward centre, up and forward, which lands near the
- * middle of the head; the left mirrors it. Eye offsets are measured live when the mount is known.
+ * Quest 3's room cameras as measured through getUserMedia: rectilinear, square pixels, fx = fy = 851 px
+ * at 1280 wide (425.5 at 640), and taller or shorter frames are centred crops of the same lens. An
+ * 800 px guess drew every photo about 6% too large.
  */
-const FROM_EYE = { x: 0.032, y: 0.02, z: -0.025 };
-const CENTER = { x: 0, y: 0.02, z: -0.025 };
-// Quest 3's getUserMedia image behaves like ~77° horizontal FOV at 1280 wide (fx ≈ fy ≈ 800).
-// Pixels are square, so other aspect ratios are crops of the same lens.
 const REF_W = 1280;
-const REF_F = 800;
+const REF_F = 851;
+/**
+ * The left camera's mount in the head frame (three.js axes: x right, y up, looking down -Z). It sits in
+ * front of its own eye on the visor, about 6.5 cm ahead of the eyes, tilted 11.8° down. The right
+ * camera mirrors yaw, roll and x. Lens x is hardware: it does not move with the IPD setting.
+ */
+const MOUNT_DEG = { pitch: -11.77, yaw: 0.22, roll: 0.14 };
+const LENS = { x: 0.0325, y: 0, z: -0.065 };
+const DEG = Math.PI / 180;
 
 const BANK = 8;
 const POSES = 64;
@@ -69,8 +76,18 @@ const POSE_SLACK = 0.05;
 const RVFC_WAIT = 0.5;
 
 export interface LensTuning {
+  /** Multiplies the measured focal length. Developer trim; 1 is the measured lens. */
   scale: number;
-  pitchDeg: number;
+  /** Degrees added to the measured mount. Developer trims; 0 is the measured mount. */
+  pitchTrim: number;
+  yawTrim: number;
+  rollTrim: number;
+  /** Metres added to the measured lens position (x mirrored per side). Developer trims. */
+  dx: number;
+  dy: number;
+  dz: number;
+  /** Overrides which camera the device label says it is. */
+  side: CameraSideSetting;
   latency: number;
   exposure: number;
   warmth: number;
@@ -157,14 +174,31 @@ interface SlotStore {
   lum: number;
 }
 
-/** Which visor camera a device label is talking about. A webcam stays `view`. */
-export function cameraMount(label: string, facing: 'back' | 'front' | 'unknown'): CameraMount {
+/**
+ * Which visor camera a device label is talking about. Quest labels end in the camera's id: "camera2 50"
+ * and "camera2 51", or older "camera 1" / "camera 2"; the lower id is the left camera. Failing that the
+ * lowest-numbered back camera among `backLabels` is taken as left. A webcam stays `view`.
+ */
+export function cameraMount(label: string, facing: 'back' | 'front' | 'unknown', backLabels: readonly string[]): CameraMount {
   const text = label.toLowerCase();
   const back = facing === 'back' || /back|environment|rear/.test(text);
   if (!back) return 'view';
-  if (/left/.test(text) || /camera\D*1\b/.test(text)) return 'left';
-  if (/right/.test(text) || /camera\D*2\b/.test(text)) return 'right';
-  return 'center';
+  if (/left/.test(text)) return 'left';
+  if (/right/.test(text)) return 'right';
+  const id = lastNumber(text);
+  if (id === 50 || id === 1) return 'left';
+  if (id === 51 || id === 2) return 'right';
+  let lowest = Infinity;
+  for (let i = 0; i < backLabels.length; i++) {
+    const n = lastNumber(backLabels[i].toLowerCase());
+    if (n < lowest) lowest = n;
+  }
+  return id <= lowest ? 'left' : 'right';
+}
+
+function lastNumber(text: string): number {
+  const match = /(\d+)\D*$/.exec(text);
+  return match ? Number(match[1]) : Infinity;
 }
 
 /**
@@ -182,7 +216,10 @@ export class PassthroughPhoto {
   lastMiss: PhotoMiss = 'none';
   private readonly pickNote: PickNote = { source: 'none', age: 0, base: 0, margin: 0, tier: 0, seen: 0, old: 0, edge: 0, hand: 0 };
   /** Tunables the system copies in from StretchLook each frame. */
-  readonly lens: LensTuning = { scale: 1, pitchDeg: -15, latency: 0.07, exposure: 1.1, warmth: -0.1, tint: 0 };
+  readonly lens: LensTuning = {
+    scale: 1, pitchTrim: 0, yawTrim: 0, rollTrim: 0, dx: 0, dy: 0, dz: 0, side: 'auto',
+    latency: 0.07, exposure: 1.1, warmth: -0.1, tint: 0,
+  };
 
   private readonly bank: BankEntry[] = [];
   private readonly stores: [SlotStore, SlotStore];
@@ -215,10 +252,14 @@ export class PassthroughPhoto {
   private loggedPath = false;
   private loggedTrack: MediaStreamTrack | null = null;
 
-  private readonly eyeShift = new Vector3(CENTER.x, CENTER.y, CENTER.z);
+  /** Camera position and rotation in the head frame, rebuilt only when the side or a trim changes. */
+  private mount: CameraMount = 'view';
+  private readonly eyeShift = new Vector3(-LENS.x, LENS.y, LENS.z);
+  private readonly mountRot = new Matrix4();
+  private readonly mountEuler = new Euler(0, 0, 0, 'YXZ');
+  private readonly mountKey = new Float64Array(8).fill(NaN);
   private readonly camWorld = new Matrix4();
   private readonly offset = new Matrix4();
-  private readonly pitch = new Matrix4();
   private readonly projection = new Matrix4();
   private readonly view = new Matrix4();
   private readonly pos = new Vector3();
@@ -227,8 +268,6 @@ export class PassthroughPhoto {
   private readonly quatC = new Quaternion();
   private readonly one = new Vector3(1, 1, 1);
   private readonly tmp = new Vector3();
-  private readonly inv = new Matrix4();
-  private readonly eyeLocal = new Matrix4();
 
   constructor() {
     for (let i = 0; i < BANK; i++) {
@@ -302,20 +341,51 @@ export class PassthroughPhoto {
     return true;
   }
 
-  /** Measures where the camera sits relative to the head when the mount is one eye's camera. */
-  measureMount(mount: CameraMount, head: Object3D, eyes: readonly Object3D[]): void {
-    if ((mount !== 'left' && mount !== 'right') || eyes.length < 2) {
-      this.eyeShift.set(CENTER.x, CENTER.y, CENTER.z);
+  /** The camera the device label names. A webcam (`view`) is posed by the preview camera instead. */
+  setMount(mount: CameraMount): void {
+    this.mount = mount;
+    this.mountKey[0] = NaN;
+  }
+
+  /** Which side the photos are posed from: the label's, unless StretchLook overrides it. */
+  get side(): 'left' | 'right' {
+    if (this.lens.side !== 'auto') return this.lens.side;
+    return this.mount === 'right' ? 'right' : 'left';
+  }
+
+  /** Focal length in pixels of the current frame. */
+  focalPx(): number {
+    return REF_F * (this.videoW / REF_W) * this.lens.scale;
+  }
+
+  /** Rebuilds the head-to-camera transform when the side or a trim changed. Cheap otherwise. */
+  private refreshMount(): void {
+    const lens = this.lens;
+    const s = this.side === 'left' ? -1 : 1;
+    const key = this.mountKey;
+    if (
+      key[0] === s && key[1] === lens.pitchTrim && key[2] === lens.yawTrim && key[3] === lens.rollTrim &&
+      key[4] === lens.dx && key[5] === lens.dy && key[6] === lens.dz
+    ) {
       return;
     }
-    const eye = mount === 'left' ? eyes[0] : eyes[eyes.length - 1];
-    this.eyeLocal.compose(eye.position, eye.quaternion, this.one);
-    this.inv.copy(head.matrix).invert().multiply(this.eyeLocal);
-    this.eyeShift.setFromMatrixPosition(this.inv);
-    const toward = mount === 'left' ? FROM_EYE.x : -FROM_EYE.x;
-    this.eyeShift.x += toward;
-    this.eyeShift.y += FROM_EYE.y;
-    this.eyeShift.z += FROM_EYE.z;
+    key[0] = s;
+    key[1] = lens.pitchTrim;
+    key[2] = lens.yawTrim;
+    key[3] = lens.rollTrim;
+    key[4] = lens.dx;
+    key[5] = lens.dy;
+    key[6] = lens.dz;
+    // Mirror image for the right camera: yaw and roll flip with x.
+    const m = -s;
+    this.mountEuler.set(
+      (MOUNT_DEG.pitch + lens.pitchTrim) * DEG,
+      m * (MOUNT_DEG.yaw + lens.yawTrim) * DEG,
+      m * (MOUNT_DEG.roll + lens.rollTrim) * DEG,
+      'YXZ',
+    );
+    this.mountRot.makeRotationFromEuler(this.mountEuler);
+    this.eyeShift.set(s * (LENS.x + lens.dx), LENS.y + lens.dy, LENS.z + lens.dz);
   }
 
   /**
@@ -583,11 +653,15 @@ export class PassthroughPhoto {
   private notePath(): void {
     if (this.loggedPath) return;
     this.loggedPath = true;
-    const f = REF_F * (this.videoW / REF_W) * this.lens.scale;
+    this.refreshMount();
+    const lens = this.lens;
     const e = this.eyeShift;
+    const sign = (v: number) => `${v >= 0 ? '+' : ''}${v.toFixed(2)}`;
+    console.info(`[jonze] camera frames: ${this.rvfcSeen ? 'rVFC' : 'polling'} ${this.videoW}x${this.videoH}`);
     console.info(
-      `[jonze] camera frames: ${this.rvfcSeen ? 'rVFC' : 'polling'} f=${f.toFixed(0)} pitch=${this.lens.pitchDeg.toFixed(2)} ` +
-        `shift=${e.x.toFixed(3)},${e.y.toFixed(3)},${e.z.toFixed(3)}`,
+      `[jonze] lens f=${this.focalPx().toFixed(0)} pyr=${sign(MOUNT_DEG.pitch + lens.pitchTrim)}/` +
+        `${sign(MOUNT_DEG.yaw + lens.yawTrim)}/${sign(MOUNT_DEG.roll + lens.rollTrim)} ` +
+        `cam=${this.side === 'left' ? 'L' : 'R'} ${e.x.toFixed(3)},${e.y.toFixed(3)},${e.z.toFixed(3)}`,
     );
   }
 
@@ -821,13 +895,16 @@ export class PassthroughPhoto {
     this.quat.set(p[o + 4], p[o + 5], p[o + 6], p[o + 7]);
   }
 
-  /** Camera projection from the pose in `pos`/`quat`. Also leaves the camera matrix in `camWorld`. */
+  /**
+   * Camera projection from the head pose in `pos`/`quat`: head, then the lens offset, then the mount
+   * rotation. Also leaves the camera matrix in `camWorld`.
+   */
   private writeClip(outClip: Matrix4, outCam: Vector3): void {
+    this.refreshMount();
     this.camWorld.compose(this.pos, this.quat, this.one);
     this.offset.makeTranslation(this.eyeShift.x, this.eyeShift.y, this.eyeShift.z);
-    this.pitch.makeRotationX((this.lens.pitchDeg * Math.PI) / 180);
-    this.camWorld.multiply(this.offset).multiply(this.pitch);
-    const f = REF_F * (this.videoW / REF_W) * this.lens.scale;
+    this.camWorld.multiply(this.offset).multiply(this.mountRot);
+    const f = this.focalPx();
     writeProjection(this.view, f, f, this.videoW * 0.5, this.videoH * 0.5, this.videoW, this.videoH);
     outCam.setFromMatrixPosition(this.camWorld);
     outClip.copy(this.camWorld).invert().premultiply(this.view);

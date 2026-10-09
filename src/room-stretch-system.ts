@@ -17,14 +17,13 @@ import {
   XRMesh,
   createSystem,
   outlineMaterial,
-  type ArrayCamera,
   type CameraDeviceInfo,
   type Entity,
 } from '@iwsdk/core';
 import { PREVIEW_FORCED, getMode } from './experience.js';
 import { HandOccluder } from './hand-occluder.js';
 import { drawHint, makeCanvas, type Canvas2D } from './labels.js';
-import { cameraMount, PassthroughPhoto, type CameraMount, type HandJoints } from './passthrough-photo.js';
+import { cameraMount, PassthroughPhoto, type CameraMount, type CameraSideSetting, type HandJoints } from './passthrough-photo.js';
 import { RoomMeshOverlay } from './room-mesh-overlay.js';
 import { StretchLook } from './stretch-component.js';
 import { Spring, averageNormal, buildTriGrid, rayTriGrid, triangleNormal, type RayHit, type TriGrid } from './stretch-math.js';
@@ -104,14 +103,20 @@ interface Look {
   warmth: number;
   tint: number;
   lensScale: number;
-  lensPitch: number;
+  lensPitchTrim: number;
+  lensYawTrim: number;
+  lensRollTrim: number;
+  lensDx: number;
+  lensDy: number;
+  lensDz: number;
   cameraLatency: number;
+  cameraSide: CameraSideSetting;
   linearBlend: boolean;
 }
 const NUMBER_KEYS = [
   'gain', 'reach', 'ramp', 'stripes', 'feather', 'wobble', 'waveLength', 'waveSpeed',
   'stiffness', 'damping', 'depthPull', 'radial', 'ripple', 'exposure', 'warmth',
-  'tint', 'lensScale', 'lensPitch', 'cameraLatency',
+  'tint', 'lensScale', 'lensPitchTrim', 'lensYawTrim', 'lensRollTrim', 'lensDx', 'lensDy', 'lensDz', 'cameraLatency',
 ] as const;
 
 interface Grab {
@@ -305,7 +310,8 @@ export class RoomStretchSystem extends createSystem({
     gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.15, feather: 0.04, wobble: 0.035,
     waveLength: 0.45, waveSpeed: 7, stiffness: 90, damping: 9, depthPull: 0.35, radial: 2.5,
     ripple: 0.015, exposure: 1.1, warmth: -0.1, tint: 0,
-    lensScale: 1, lensPitch: -15, cameraLatency: 0.07,
+    lensScale: 1, lensPitchTrim: 0, lensYawTrim: 0, lensRollTrim: 0, lensDx: 0, lensDy: 0, lensDz: 0,
+    cameraLatency: 0.07, cameraSide: 'auto',
     linearBlend: true,
   };
 
@@ -468,7 +474,6 @@ export class RoomStretchSystem extends createSystem({
       this.player.head.getWorldPosition(this.head);
       this.player.head.getWorldQuaternion(this.headQuat);
       this.photo.recordHead(this.player.head, now);
-      this.photo.measureMount(this.mount, this.player.head, (this.renderer.xr.getCamera() as ArrayCamera).cameras);
       this.refreshHands();
       const meshes = this.findMeshes();
       this.syncGrids(meshes);
@@ -1266,8 +1271,17 @@ export class RoomStretchSystem extends createSystem({
     );
     console.info(
       `[jonze] look stripes=${k.stripes.toFixed(2)} ramp=${k.ramp.toFixed(2)} radial=${k.radial.toFixed(1)} ` +
-        `lens=${k.lensScale.toFixed(3)}/${k.lensPitch.toFixed(2)} lat=${k.cameraLatency.toFixed(3)}`,
+        `lat=${k.cameraLatency.toFixed(3)}`,
     );
+    const trimmed =
+      k.lensScale !== 1 || k.lensPitchTrim !== 0 || k.lensYawTrim !== 0 || k.lensRollTrim !== 0 ||
+      k.lensDx !== 0 || k.lensDy !== 0 || k.lensDz !== 0 || k.cameraSide !== 'auto';
+    if (trimmed) {
+      console.warn(
+        `[jonze] lens trims x${k.lensScale.toFixed(3)} pyr=${k.lensPitchTrim}/${k.lensYawTrim}/${k.lensRollTrim} ` +
+          `d=${k.lensDx},${k.lensDy},${k.lensDz} side=${k.cameraSide}`,
+      );
+    }
   }
 
   private readLook(): void {
@@ -1279,6 +1293,8 @@ export class RoomStretchSystem extends createSystem({
       }
       const linear = entity.getValue(StretchLook, 'linearBlend');
       if (typeof linear === 'boolean') this.look.linearBlend = linear;
+      const side = entity.getValue(StretchLook, 'cameraSide');
+      if (side === 'left' || side === 'right' || side === 'auto') this.look.cameraSide = side;
       return;
     }
   }
@@ -1286,7 +1302,13 @@ export class RoomStretchSystem extends createSystem({
   private applyLook(): void {
     const lens = this.photo.lens;
     lens.scale = this.look.lensScale;
-    lens.pitchDeg = this.look.lensPitch;
+    lens.pitchTrim = this.look.lensPitchTrim;
+    lens.yawTrim = this.look.lensYawTrim;
+    lens.rollTrim = this.look.lensRollTrim;
+    lens.dx = this.look.lensDx;
+    lens.dy = this.look.lensDy;
+    lens.dz = this.look.lensDz;
+    lens.side = this.look.cameraSide;
     lens.latency = this.look.cameraLatency;
     lens.exposure = this.look.exposure;
     lens.warmth = this.look.warmth;
@@ -1298,14 +1320,18 @@ export class RoomStretchSystem extends createSystem({
 
   private attachCamera(devices: CameraDeviceInfo[]): boolean {
     if (getMode() !== 'stretch' || this.cameraEntity) return !!this.cameraEntity;
-    const back = CameraUtils.findByFacing(devices, CameraFacing.Back);
+    // The left room camera on purpose: the lens model is measured for it and mirrored for the right.
+    const backs = devices.filter((d) => d.facing === CameraFacing.Back);
+    const backLabels = backs.map((d) => d.label);
+    const back = backs.find((d) => cameraMount(d.label, 'back', backLabels) === 'left') ?? backs[0] ?? null;
     const chosen = back ?? devices[0];
     if (!chosen) {
       console.warn('[jonze] camera: no video inputs');
       return false;
     }
-    this.mount = cameraMount(chosen.label, back ? 'back' : 'unknown');
-    console.info(`[jonze] camera pick "${chosen.label}" mount=${this.mount}${back ? ' back' : ''} of ${devices.length}`);
+    this.mount = cameraMount(chosen.label, back ? 'back' : 'unknown', backLabels);
+    this.photo.setMount(this.mount);
+    console.info(`[jonze] camera pick "${chosen.label}" side=${this.mount} of ${devices.length} (${backs.length} back)`);
     console.debug('[jonze] camera devices', devices.map((d) => d.label).join(' | '));
     const anchor = new Group();
     anchor.name = 'passthrough-camera';

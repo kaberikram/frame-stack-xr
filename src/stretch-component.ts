@@ -1,5 +1,8 @@
 import { createComponent, Types } from '@iwsdk/core';
 
+/** Which visor camera the photos are posed from. Auto trusts the device label. */
+export const CameraSide = { Auto: 'auto', Left: 'left', Right: 'right' } as const;
+
 /**
  * Tunables for the rubber pull, on one node so they can be nudged from the editor
  * inspector while wearing the headset's output on a desk screen.
@@ -36,8 +39,19 @@ export const StretchLook = createComponent('StretchLook', {
     type: Types.Float32, default: 0, min: -0.5, max: 0.5, step: 0.01, label: 'Photo tint',
     help: 'Positive adds green, negative adds magenta.',
   },
-  lensScale: { type: Types.Float32, default: 1, min: 0.8, max: 1.2, step: 0.005, label: 'Camera focal scale' },
-  lensPitch: { type: Types.Float32, default: -15, min: -30, max: 0, step: 0.25, label: 'Camera pitch (deg)' },
+  // The camera model is measured (851 px, 11.8° down, in front of its own eye). These are developer
+  // trims on top of it, all neutral by default; any non-neutral value is printed to the console.
+  lensScale: { type: Types.Float32, default: 1, min: 0.9, max: 1.1, step: 0.002, label: 'Lens focal trim (x)' },
+  lensPitchTrim: { type: Types.Float32, default: 0, min: -5, max: 5, step: 0.05, label: 'Lens pitch trim (deg)' },
+  lensYawTrim: { type: Types.Float32, default: 0, min: -3, max: 3, step: 0.05, label: 'Lens yaw trim (deg)' },
+  lensRollTrim: { type: Types.Float32, default: 0, min: -3, max: 3, step: 0.05, label: 'Lens roll trim (deg)' },
+  lensDx: { type: Types.Float32, default: 0, min: -0.05, max: 0.05, step: 0.001, label: 'Lens x trim (m, outward)' },
+  lensDy: { type: Types.Float32, default: 0, min: -0.05, max: 0.05, step: 0.001, label: 'Lens y trim (m)' },
+  lensDz: { type: Types.Float32, default: 0, min: -0.05, max: 0.05, step: 0.001, label: 'Lens z trim (m, back)' },
+  cameraSide: {
+    type: Types.Enum, enum: CameraSide, default: CameraSide.Auto, label: 'Camera side',
+    help: 'Which visor camera the photos come from. Auto trusts the device label.',
+  },
   cameraLatency: { type: Types.Float32, default: 0.07, min: 0, max: 0.2, step: 0.005, label: 'Camera latency (s)' },
   linearBlend: {
     type: Types.Boolean, default: true, label: 'Linear edge blend',
