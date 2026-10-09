@@ -1,7 +1,7 @@
-import { DoubleSide, Matrix4, ShaderMaterial, Vector3, type Texture } from '@iwsdk/core';
+import { DoubleSide, Matrix4, ShaderMaterial, Vector2, Vector3, Vector4, type Texture } from '@iwsdk/core';
 
 /**
- * Two grabs, in world space. The room mesh bends by both, then each grab reads its own photo.
+ * Two grabs, in world space. The room mesh bends by both, then each grab reads its own photo first.
  * Slot 0 is the earlier grab; slot 1 bends what slot 0 left, so you grab what you see.
  */
 export function createRubberUniforms() {
@@ -61,6 +61,18 @@ export function createRubberUniforms() {
     uLiveToClip: { value: new Matrix4() },
     uHasLive: { value: 0 },
     uLensOn: { value: 0 },
+    // Headset depth of the real room: cuts the real hands and arms out of the stretch.
+    uEnvDepth: { value: null as Texture | null },
+    uDepthOn: { value: 0 },
+    uDepthRaw: { value: 1 },
+    uDepthNear: { value: 0.1 },
+    uEyeSize: { value: new Vector2(1, 1) },
+    uNormDepth0: { value: new Matrix4() },
+    uNormDepth1: { value: new Matrix4() },
+    /** Per hand, a hand then a forearm segment: start xyz and 1 when valid, end xyz and reach. */
+    uSegA: { value: [new Vector4(), new Vector4(), new Vector4(), new Vector4()] },
+    uSegB: { value: [new Vector4(), new Vector4(), new Vector4(), new Vector4()] },
+    uOccDebug: { value: 0 },
   };
 }
 
@@ -115,6 +127,7 @@ varying vec3 vWorld;
 varying vec3 vMid;  // after the first grab: where the second grab measures its column from
 varying vec2 vMask; // x: visible displacement (m), y: how much a squeezed zone hands back to the room
 varying vec2 vW;    // how much each grab moved this point
+varying float vViewZ; // metres in front of this eye, after the stretch
 
 const float SQUASH = 2.0;       // squeezed zones are 2 m long per metre pulled; slope stays above -0.75
 ${SHARED}
@@ -203,7 +216,9 @@ void main() {
   vWorld = p;
   vMask = vec2(seen * (1.0 - smoothstep(0.6, 1.0, hide)), ease(hide));
   vW = vec2(own0, own1);
-  gl_Position = projectionMatrix * viewMatrix * vec4(p, 1.0);
+  vec4 viewPos = viewMatrix * vec4(p, 1.0);
+  vViewZ = -viewPos.z;
+  gl_Position = projectionMatrix * viewPos;
 }
 `;
 
@@ -232,6 +247,20 @@ uniform sampler2D uLive;
 uniform mat4 uLiveToClip;
 uniform float uHasLive;
 #endif
+#ifdef ENV_DEPTH
+uniform highp sampler2DArray uEnvDepth;
+uniform float uDepthOn;
+uniform float uDepthRaw;
+uniform float uDepthNear;
+uniform vec2 uEyeSize;
+uniform mat4 uNormDepth0;
+uniform mat4 uNormDepth1;
+uniform vec4 uSegA[4];
+uniform vec4 uSegB[4];
+uniform float uOccDebug;
+/** Depth nearer than this is a hole in the depth map, not a hand. */
+const float DEPTH_MIN = 0.12;
+#endif
 #ifdef LENS_OVERLAY
 uniform float uLensOn;
 /** Stripe period in pixels: 48 px of camera, 48 px of passthrough. */
@@ -243,6 +272,7 @@ varying vec3 vWorld;
 varying vec3 vMid;
 varying vec2 vMask;
 varying vec2 vW;
+varying float vViewZ;
 
 ${SHARED}
 
@@ -266,6 +296,76 @@ float streakTo(inout vec3 s, vec3 base, vec3 G, vec3 D, vec3 axis, vec3 n, float
   s -= axis * (t * (1.0 - keep));
   return 1.0 - keep;
 }
+
+#ifdef ENV_DEPTH
+/** Closest distance between segments p0-p1 and q0-q1. */
+float segmentGap(vec3 p0, vec3 p1, vec3 q0, vec3 q1) {
+  vec3 d1 = p1 - p0;
+  vec3 d2 = q1 - q0;
+  vec3 r = p0 - q0;
+  float a = max(dot(d1, d1), 1e-8);
+  float e = max(dot(d2, d2), 1e-8);
+  float b = dot(d1, d2);
+  float c = dot(d1, r);
+  float f = dot(d2, r);
+  float denom = a * e - b * b;
+  float s = denom > 1e-8 ? clamp((b * f - c * e) / denom, 0.0, 1.0) : 0.0;
+  float t = (b * s + f) / e;
+  if (t < 0.0) {
+    t = 0.0;
+    s = clamp(-c / a, 0.0, 1.0);
+  } else if (t > 1.0) {
+    t = 1.0;
+    s = clamp((b - c) / a, 0.0, 1.0);
+  }
+  return length(p0 + d1 * s - q0 - d2 * t);
+}
+
+/** 1 where the line of sight to this point passes through a tracked hand or forearm, 0 well clear. */
+float handGate(vec3 world) {
+  float g = 0.0;
+  for (int i = 0; i < 4; i++) {
+    if (uSegA[i].w < 0.5) continue;
+    float d = segmentGap(cameraPosition, world, uSegA[i].xyz, uSegB[i].xyz);
+    g = max(g, 1.0 - smoothstep(0.6 * uSegB[i].w, uSegB[i].w, d));
+  }
+  return g;
+}
+
+float envMeters(vec2 uv, float layer) {
+  float t = textureLod(uEnvDepth, vec3(uv, layer), 0.0).r;
+  float m = uDepthRaw * uDepthNear / max(1.0 - t, 1e-5);
+  return m < DEPTH_MIN ? 1e4 : m;
+}
+
+/**
+ * How much a real hand or arm stands in front of this point of the stretch, from the headset's
+ * depth: 1 shows passthrough's real hand, 0 keeps the stretch. Only near tracked hands, so depth
+ * noise elsewhere never punches holes, and with a margin so a pinched sheet stays on the fingers.
+ */
+float handOcclusion(vec3 world) {
+  if (uDepthOn < 0.5) return 0.0;
+  float gate = handGate(world);
+  if (gate <= 0.0) return 0.0;
+#ifdef VIEW_ID
+  float eye = float(VIEW_ID);
+  vec2 fc = gl_FragCoord.xy;
+#else
+  float eye = step(uEyeSize.x, gl_FragCoord.x);
+  vec2 fc = gl_FragCoord.xy - vec2(eye * uEyeSize.x, 0.0);
+#endif
+  vec2 uv = ((eye < 0.5 ? uNormDepth0 : uNormDepth1) * vec4(fc / uEyeSize, 0.0, 1.0)).xy;
+  vec2 texel = 1.0 / vec2(textureSize(uEnvDepth, 0).xy);
+  // The nearest of five taps, so the cut covers the hand's edge rather than trailing inside it.
+  float real = envMeters(uv, eye);
+  real = min(real, envMeters(uv + vec2(texel.x, 0.0), eye));
+  real = min(real, envMeters(uv - vec2(texel.x, 0.0), eye));
+  real = min(real, envMeters(uv + vec2(0.0, texel.y), eye));
+  real = min(real, envMeters(uv - vec2(0.0, texel.y), eye));
+  float margin = 0.01 + 0.02 * vViewZ;
+  return gate * smoothstep(margin, margin + 0.02, vViewZ - real);
+}
+#endif
 
 float frameCover(vec4 clip, out vec2 uv) {
   uv = clip.xy / max(clip.w, 1e-4) * 0.5 + 0.5;
@@ -355,6 +455,10 @@ void main() {
   const float frost = 0.0;
 #endif
   float alpha = shown * max(own * max(k0, k1), frost);
+#ifdef ENV_DEPTH
+  float occ = handOcclusion(vWorld);
+  alpha = uOccDebug > 0.5 ? max(alpha, occ) : alpha * (1.0 - occ);
+#endif
 
 #ifdef PREVIEW
   vec3 back = vec3(0.16) * (0.65 + 0.35 * abs(normalize(nr).y));
@@ -385,7 +489,12 @@ void main() {
   gl_FragColor = vec4(col, 1.0);
   #include <colorspace_fragment>
 #else
-  writeColor(col / max(w0 + w1, 1e-7), alpha);
+  col /= max(w0 + w1, 1e-7);
+#ifdef ENV_DEPTH
+  // ?occ=debug: the depth cut in magenta instead of a hole.
+  if (uOccDebug > 0.5) col = mix(col, vec3(1.0, 0.0, 1.0), occ);
+#endif
+  writeColor(col, alpha);
 #endif
 }
 `;
@@ -398,6 +507,7 @@ void main() {
 export function rubberMaterial(uniforms: RubberUniformSet, preview = false, lensOverlay = false): ShaderMaterial {
   const defines: Record<string, string> = {};
   if (preview) defines.PREVIEW = '';
+  else defines.ENV_DEPTH = '';
   if (lensOverlay) defines.LENS_OVERLAY = '';
   return new ShaderMaterial({
     uniforms,

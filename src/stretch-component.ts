@@ -52,6 +52,10 @@ export const StretchLook = createComponent('StretchLook', {
     type: Types.Enum, enum: CameraSide, default: CameraSide.Auto, label: 'Camera side',
     help: 'Which visor camera the photos come from. Auto trusts the device label.',
   },
+  handLag: {
+    type: Types.Float32, default: 0.03, min: 0, max: 0.1, step: 0.005, label: 'Hand occluder lag (s)',
+    help: 'The depth-only hands trail tracking by this much to sit on the passthrough hand. Developer trim.',
+  },
   cameraLatency: {
     type: Types.Float32, default: 0, min: -0.05, max: 0.1, step: 0.005, label: 'Camera latency trim (s)',
     help: 'Added to the frame clock prior. Developer trim; 0 is the prior.',

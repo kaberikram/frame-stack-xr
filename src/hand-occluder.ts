@@ -1,4 +1,4 @@
-import { InstancedMesh, Matrix4, MeshBasicMaterial, Object3D, SphereGeometry, Vector3 } from '@iwsdk/core';
+import { CapsuleGeometry, InstancedMesh, Matrix4, MeshBasicMaterial, Object3D, SphereGeometry, Vector3, Vector4 } from '@iwsdk/core';
 
 const JOINTS = [
   'wrist',
@@ -19,13 +19,23 @@ const BONES: readonly (readonly [number, number])[] = [
 ];
 
 const JOINT_COUNT = JOINTS.length;
-/** Spheres up the forearm, metres from the wrist. A stretched wall must not paint over the arm. */
-const FOREARM = [0.08, 0.16, 0.24] as const;
+/** One capsule up each forearm: one smooth edge where three spheres left a scalloped one. */
 const FOREARM_RADIUS = 0.035;
+const FOREARM_LENGTH = 0.24;
+/** Capsule centre, metres up the arm from the wrist: it starts at the wrist and ends past 0.3 m. */
+const FOREARM_CENTER = 0.15;
 const WRIST = 0;
 const MIDDLE_METACARPAL = 10;
-const PER_HAND = JOINT_COUNT + BONES.length + FOREARM.length;
+const MIDDLE_TIP = 14;
+const PER_HAND = JOINT_COUNT + BONES.length;
 const HANDS = 2;
+/** Joint frames kept per hand for drawing the occluders a little in the past. */
+const RING = 8;
+/** Where the depth cut may act around each hand: the hand itself, then the forearm. */
+const HAND_REACH = 0.07;
+const FOREARM_REACH = 0.06;
+const FOREARM_GATE = 0.3;
+const UP = new Vector3(0, 1, 0);
 
 type Side = 'left' | 'right';
 const SIDES: readonly Side[] = ['left', 'right'];
@@ -35,8 +45,11 @@ interface FramePoses extends XRFrame {
 }
 
 /**
- * Depth-only spheres on the hand joints and forearms. Drawn before the room mesh so the real
- * hands and arms show through the virtual room. The same joints box the hands in camera frames.
+ * Depth-only spheres on the hand joints and a capsule on each forearm. Drawn before the room mesh so
+ * the real hands and arms show through the virtual room. The same joints box the hands in camera
+ * frames. The occluders trail the tracked joints by `lag`: tracking predicts the hand for the
+ * display time, while passthrough shows it a few frames late, and an occluder ahead of the real
+ * hand opens a halo of unstretched room behind it.
  */
 export class HandOccluder {
   /** Packed xyz of every tracked joint, world space. `jointCount` is how many are valid. */
@@ -53,14 +66,30 @@ export class HandOccluder {
   leftCount = 0;
   rightStart = 0;
   rightCount = 0;
-  /** Sphere scale. Raised while pulling to cover tracking and passthrough lag at the hand's edges. */
-  inflate = 1;
+  /** Seconds the occluders trail the tracked joints. Pinch and photo logic use the current joints. */
+  lag = 0.03;
+  /** Draw the forearm capsules. Off while headset depth cuts the real arm out instead. */
+  capsules = true;
+  /**
+   * Where the depth cut may act, from the trailing joints: per hand a hand segment then a forearm
+   * segment. `segA[i]` is the start and 1 in w while valid; `segB[i]` the end and the reach in w.
+   */
+  readonly segA = [new Vector4(), new Vector4(), new Vector4(), new Vector4()];
+  readonly segB = [new Vector4(), new Vector4(), new Vector4(), new Vector4()];
   readonly indexTip = { left: new Vector3(), right: new Vector3() };
   readonly thumbTip = { left: new Vector3(), right: new Vector3() };
   readonly hasPinch = { left: false, right: false };
 
   private readonly mesh: InstancedMesh;
+  private readonly arm: InstancedMesh;
   private readonly dummy = new Object3D();
+  private readonly dir = new Vector3();
+  private readonly ring = [new Float32Array(RING * JOINT_COUNT * 3), new Float32Array(RING * JOINT_COUNT * 3)];
+  private readonly ringTime = [new Float64Array(RING), new Float64Array(RING)];
+  private readonly ringHead = [-1, -1];
+  private readonly ringCount = [0, 0];
+  /** One hand's joints `lag` seconds ago, world space. */
+  private readonly drawn = new Float32Array(JOINT_COUNT * 3);
   private readonly poses = new Float32Array(JOINT_COUNT * 16);
   private readonly spaces: Record<Side, XRSpace[]> = { left: [], right: [] };
   private readonly handRef: Record<Side, XRHand | null> = { left: null, right: null };
@@ -78,11 +107,22 @@ export class HandOccluder {
     for (let i = 0; i < PER_HAND * HANDS; i++) this.mesh.setMatrixAt(i, this.dummy.matrix);
     this.mesh.instanceMatrix.needsUpdate = true;
     parent.add(this.mesh);
+    this.arm = new InstancedMesh(new CapsuleGeometry(FOREARM_RADIUS, FOREARM_LENGTH, 4, 10), mat, HANDS);
+    this.arm.frustumCulled = false;
+    this.arm.renderOrder = 0;
+    this.arm.visible = false;
+    for (let i = 0; i < HANDS; i++) this.arm.setMatrixAt(i, this.dummy.matrix);
+    this.arm.instanceMatrix.needsUpdate = true;
+    parent.add(this.arm);
   }
 
   setActive(on: boolean): void {
     this.mesh.visible = on;
+    this.arm.visible = on;
     if (!on) {
+      this.ringCount[0] = 0;
+      this.ringCount[1] = 0;
+      for (let i = 0; i < 4; i++) this.segA[i].w = 0;
       this.jointCount = 0;
       this.leftCount = 0;
       this.rightCount = 0;
@@ -98,6 +138,7 @@ export class HandOccluder {
     ref: XRReferenceSpace | null,
     playerWorld: Matrix4,
     hands: Record<Side, XRHand | null>,
+    now: number,
   ): void {
     this.jointCount = 0;
     this.leftCount = 0;
@@ -115,11 +156,15 @@ export class HandOccluder {
       const base = s * PER_HAND;
       if (!hand || !this.fillJoints(frame, ref, side, hand)) {
         this.hasPinch[side] = false;
+        this.ringCount[s] = 0;
+        this.segA[s * 2].w = 0;
+        this.segA[s * 2 + 1].w = 0;
         this.hideRange(base, PER_HAND);
+        this.hideArm(s);
         continue;
       }
       const start = this.jointCount;
-      this.writeHand(side, base, playerWorld);
+      this.writeHand(side, base, playerWorld, now);
       if (side === 'left') {
         this.leftStart = start;
         this.leftCount = JOINT_COUNT;
@@ -129,12 +174,15 @@ export class HandOccluder {
       }
     }
     this.mesh.instanceMatrix.needsUpdate = true;
+    this.arm.instanceMatrix.needsUpdate = true;
   }
 
   dispose(): void {
     this.mesh.geometry.dispose();
+    this.arm.geometry.dispose();
     (this.mesh.material as MeshBasicMaterial).dispose();
     this.mesh.removeFromParent();
+    this.arm.removeFromParent();
   }
 
   private fillJoints(frame: XRFrame, ref: XRReferenceSpace, side: Side, hand: XRHand): boolean {
@@ -179,7 +227,7 @@ export class HandOccluder {
     return list;
   }
 
-  private writeHand(side: Side, base: number, playerWorld: Matrix4): void {
+  private writeHand(side: Side, base: number, playerWorld: Matrix4, now: number): void {
     const e = playerWorld.elements;
     for (let i = 0; i < JOINT_COUNT; i++) {
       const px = this.poses[i * 16 + 12];
@@ -195,60 +243,116 @@ export class HandOccluder {
       this.points[n * 3] = x;
       this.points[n * 3 + 1] = y;
       this.points[n * 3 + 2] = z;
-      this.place(base + i, x, y, z, (i === 0 ? 0.02 : 0.013) * this.inflate);
     }
     this.thumbTip[side].set(this.local[4 * 3], this.local[4 * 3 + 1], this.local[4 * 3 + 2]);
     this.indexTip[side].set(this.local[9 * 3], this.local[9 * 3 + 1], this.local[9 * 3 + 2]);
     this.hasPinch[side] = true;
+    const h = side === 'left' ? 0 : 1;
+    this.armOk[h] = this.forearm(this.local, this.dir) ? 1 : 0;
+    if (this.armOk[h]) {
+      const o = h * 6;
+      this.arms[o] = this.local[WRIST * 3];
+      this.arms[o + 1] = this.local[WRIST * 3 + 1];
+      this.arms[o + 2] = this.local[WRIST * 3 + 2];
+      this.arms[o + 3] = this.dir.x;
+      this.arms[o + 4] = this.dir.y;
+      this.arms[o + 5] = this.dir.z;
+    }
+
+    this.record(h, now);
+    const d = this.drawn;
+    for (let i = 0; i < JOINT_COUNT; i++) {
+      this.place(base + i, d[i * 3], d[i * 3 + 1], d[i * 3 + 2], i === 0 ? 0.02 : 0.013);
+    }
     for (let i = 0; i < BONES.length; i++) {
       const [a, b] = BONES[i];
-      const ax = this.local[a * 3];
-      const ay = this.local[a * 3 + 1];
-      const az = this.local[a * 3 + 2];
       this.place(
         base + JOINT_COUNT + i,
-        (ax + this.local[b * 3]) * 0.5,
-        (ay + this.local[b * 3 + 1]) * 0.5,
-        (az + this.local[b * 3 + 2]) * 0.5,
-        0.012 * this.inflate,
+        (d[a * 3] + d[b * 3]) * 0.5,
+        (d[a * 3 + 1] + d[b * 3 + 1]) * 0.5,
+        (d[a * 3 + 2] + d[b * 3 + 2]) * 0.5,
+        0.012,
       );
     }
-    this.writeForearm(side === 'left' ? 0 : 1, base + JOINT_COUNT + BONES.length);
-  }
-
-  /** Up the arm from the wrist, away from the knuckles. Needs no joint orientation. */
-  private writeForearm(hand: number, base: number): void {
     const w = WRIST * 3;
-    const m = MIDDLE_METACARPAL * 3;
-    let dx = this.local[w] - this.local[m];
-    let dy = this.local[w + 1] - this.local[m + 1];
-    let dz = this.local[w + 2] - this.local[m + 2];
-    const len = Math.hypot(dx, dy, dz);
-    if (len < 1e-4) {
-      this.hideRange(base, FOREARM.length);
+    const t = MIDDLE_TIP * 3;
+    const hand = this.segA[h * 2];
+    hand.set(d[w], d[w + 1], d[w + 2], 1);
+    this.segB[h * 2].set(d[t], d[t + 1], d[t + 2], HAND_REACH);
+    const arm = this.segA[h * 2 + 1];
+    if (!this.forearm(d, this.dir)) {
+      arm.w = 0;
+      this.hideArm(h);
       return;
     }
-    dx /= len;
-    dy /= len;
-    dz /= len;
-    const o = hand * 6;
-    this.arms[o] = this.local[w];
-    this.arms[o + 1] = this.local[w + 1];
-    this.arms[o + 2] = this.local[w + 2];
-    this.arms[o + 3] = dx;
-    this.arms[o + 4] = dy;
-    this.arms[o + 5] = dz;
-    this.armOk[hand] = 1;
-    for (let i = 0; i < FOREARM.length; i++) {
-      const d = FOREARM[i];
-      this.place(
-        base + i,
-        this.local[w] + dx * d,
-        this.local[w + 1] + dy * d,
-        this.local[w + 2] + dz * d,
-        FOREARM_RADIUS * this.inflate,
-      );
+    arm.set(d[w], d[w + 1], d[w + 2], 1);
+    this.segB[h * 2 + 1].set(
+      d[w] + this.dir.x * FOREARM_GATE,
+      d[w + 1] + this.dir.y * FOREARM_GATE,
+      d[w + 2] + this.dir.z * FOREARM_GATE,
+      FOREARM_REACH,
+    );
+    if (!this.capsules) {
+      this.hideArm(h);
+      return;
     }
+    this.dummy.position.set(
+      d[w] + this.dir.x * FOREARM_CENTER,
+      d[w + 1] + this.dir.y * FOREARM_CENTER,
+      d[w + 2] + this.dir.z * FOREARM_CENTER,
+    );
+    this.dummy.quaternion.setFromUnitVectors(UP, this.dir);
+    this.dummy.scale.set(1, 1, 1);
+    this.dummy.updateMatrix();
+    this.arm.setMatrixAt(h, this.dummy.matrix);
+    this.dummy.quaternion.identity();
+  }
+
+  /** Up the arm from the wrist, away from the knuckles, into `out`. Needs no joint orientation. */
+  private forearm(joints: Float32Array, out: Vector3): boolean {
+    const w = WRIST * 3;
+    const m = MIDDLE_METACARPAL * 3;
+    out.set(joints[w] - joints[m], joints[w + 1] - joints[m + 1], joints[w + 2] - joints[m + 2]);
+    const len = out.length();
+    if (len < 1e-4) return false;
+    out.multiplyScalar(1 / len);
+    return true;
+  }
+
+  /** Pushes this frame's joints for hand `h` and leaves the joints `lag` ago in `drawn`. */
+  private record(h: number, now: number): void {
+    const ring = this.ring[h];
+    const times = this.ringTime[h];
+    const head = (this.ringHead[h] + 1) % RING;
+    this.ringHead[h] = head;
+    this.ringCount[h] = Math.min(RING, this.ringCount[h] + 1);
+    ring.set(this.local, head * JOINT_COUNT * 3);
+    times[head] = now;
+    const target = now - this.lag;
+    const n = this.ringCount[h];
+    let newer = head;
+    let older = head;
+    let f = 0;
+    for (let i = 0; i < n; i++) {
+      const idx = (head - i + RING) % RING;
+      older = idx;
+      if (times[idx] <= target) {
+        const span = times[newer] - times[idx];
+        f = span > 1e-6 ? (target - times[idx]) / span : 0;
+        break;
+      }
+      newer = idx;
+    }
+    // Ring younger than the lag: `older` is the oldest frame and `f` stays 0.
+    const a = older * JOINT_COUNT * 3;
+    const b = newer * JOINT_COUNT * 3;
+    for (let i = 0; i < JOINT_COUNT * 3; i++) this.drawn[i] = ring[a + i] + (ring[b + i] - ring[a + i]) * f;
+  }
+
+  private hideArm(h: number): void {
+    this.dummy.scale.set(0, 0, 0);
+    this.dummy.updateMatrix();
+    this.arm.setMatrixAt(h, this.dummy.matrix);
   }
 
   private place(index: number, x: number, y: number, z: number, radius: number): void {
