@@ -15,6 +15,7 @@ import {
   Vector3,
   VisibilityState,
   XRMesh,
+  XRPlane,
   createSystem,
   outlineMaterial,
   type CameraDeviceInfo,
@@ -26,6 +27,7 @@ import { HandOccluder } from './hand-occluder.js';
 import { drawHint, makeCanvas, type Canvas2D } from './labels.js';
 import { cameraMount, PassthroughPhoto, type CameraMount, type CameraSideSetting, type HandJoints } from './passthrough-photo.js';
 import { RoomMeshOverlay } from './room-mesh-overlay.js';
+import { RoomPlanes, type PlaneHit } from './room-planes.js';
 import { StretchLook } from './stretch-component.js';
 import { Spring, averageNormal, buildTriGrid, rayTriGrid, triangleNormal, type RayHit, type TriGrid } from './stretch-math.js';
 import type { RubberUniformSet } from './stretch-material.js';
@@ -80,6 +82,9 @@ const SETTLE_MAX = 0.12;
 const FADE_IN = 0.12;
 /** A pinch with no usable photo yet keeps trying this long (fresh pose, fresh frame) before it lets go. */
 const PHOTO_WAIT = 0.4;
+/** A plane counts as the grabbed surface when the line of sight meets it this close before or after the mesh. */
+const PLANE_IN_FRONT = 0.05;
+const PLANE_BEHIND = 0.03;
 const FOOTPRINT = 9;
 /** Streaks bloom over this many metres of pull after `stripes`. The shader and the sparkle both read it. */
 const STREAK_SPAN = 0.35;
@@ -301,6 +306,7 @@ function smooth(t: number): number {
 export class RoomStretchSystem extends createSystem({
   settings: { required: [StretchLook] },
   meshes: { required: [XRMesh] },
+  planes: { required: [XRPlane] },
 }) {
   private readonly left = makeGrab('left');
   private readonly right = makeGrab('right');
@@ -382,6 +388,12 @@ export class RoomStretchSystem extends createSystem({
   private readonly localD = new Vector3();
   private readonly localHit = new Vector3();
   private readonly localN = new Vector3();
+  private readonly roomPlanes = new RoomPlanes();
+  private readonly planeHit: PlaneHit = { point: new Vector3(), normal: new Vector3(), distance: 0, label: '', horizontal: true };
+  private readonly rayDir = new Vector3();
+  private readonly meshHitWorld = new Vector3();
+  /** How the last grab found its point, for the pinch line. */
+  private hitNote = 'mesh';
   private readonly bestO = new Vector3();
   private readonly bestD = new Vector3();
   private readonly inv = new Matrix4();
@@ -498,6 +510,7 @@ export class RoomStretchSystem extends createSystem({
       this.photo.recordHead(this.player.head, this.world.xrFrame?.predictedDisplayTime, now);
       this.refreshHands();
       this.publishDepth();
+      this.roomPlanes.sync(this.queries.planes.entities);
       const meshes = this.findMeshes();
       this.syncGrids(meshes);
       this.photo.capture(true, this.camera, this.handJoints(), this.handsKnown(), now);
@@ -513,6 +526,7 @@ export class RoomStretchSystem extends createSystem({
       }
       this.overlay.setActive(active || this.overlay.uniforms.uLensOn.value > 0);
       this.overlay.sync(meshes);
+      this.overlay.syncPlanes(this.roomPlanes);
       this.publish(this.left, this.right, time, hasVideo);
       this.sing(this.left);
       this.sing(this.right);
@@ -867,6 +881,29 @@ export class RoomStretchSystem extends createSystem({
     return true;
   }
 
+  /**
+   * The scan is lumpy by a centimetre or two; a detected plane is flat. When the line of sight
+   * through the pinch meets a plane just around the mesh hit, grab there with the plane's normal.
+   */
+  private preferPlane(): void {
+    this.hitNote = 'mesh';
+    const mesh = this.hitMesh;
+    if (!mesh || this.roomPlanes.count === 0) return;
+    this.rayDir.copy(this.pinch).sub(this.head);
+    if (this.rayDir.lengthSq() < 1e-8) return;
+    this.rayDir.normalize();
+    mesh.updateWorldMatrix(true, false);
+    this.meshHitWorld.copy(this.localHit).applyMatrix4(mesh.matrixWorld);
+    const meshT = this.meshHitWorld.distanceTo(this.head);
+    if (!this.roomPlanes.raycast(this.head, this.rayDir, meshT + PLANE_BEHIND, this.planeHit)) return;
+    const delta = this.planeHit.distance - meshT;
+    if (delta < -PLANE_IN_FRONT) return;
+    this.inv.copy(mesh.matrixWorld).invert();
+    this.localHit.copy(this.planeHit.point).applyMatrix4(this.inv);
+    this.localN.copy(this.planeHit.normal).transformDirection(this.inv);
+    this.hitNote = `plane:${this.planeHit.label} d=${(delta * 100).toFixed(1)}cm`;
+  }
+
   private poseGrab(grab: Grab): void {
     const mesh = grab.mesh;
     if (!mesh?.parent || (!grab.holding && !grab.on)) return;
@@ -900,6 +937,7 @@ export class RoomStretchSystem extends createSystem({
       this.sound.miss(grab.slot, this.pinch.x, this.pinch.y, this.pinch.z);
       return;
     }
+    this.preferPlane();
     grab.mesh = this.hitMesh;
     grab.holding = true;
     grab.on = true;
@@ -929,7 +967,8 @@ export class RoomStretchSystem extends createSystem({
     const n = grab.normal;
     const surface = Math.abs(n.y) < 0.5 ? 'wall' : n.y > 0 ? 'table' : 'ceiling';
     console.info(
-      `[jonze] pinch ${tag} ${surface} ${this.head.distanceTo(grab.worldG).toFixed(2)}m dense=${this.overlay.ready ? 'y' : 'n'}`,
+      `[jonze] pinch ${tag} ${surface} ${this.head.distanceTo(grab.worldG).toFixed(2)}m dense=${this.overlay.ready ? 'y' : 'n'} ` +
+        `hit=${this.hitNote}`,
     );
     console.info(`[jonze] ${this.photo.pickLine(grab.slot)}`);
     grab.heldAt = now;
