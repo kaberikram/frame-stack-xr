@@ -269,6 +269,9 @@ function logSession(session: XRSession): void {
   );
 }
 
+/** Developer check: `?lens=overlay` draws the live camera in stripes over the room at rest. */
+const LENS_OVERLAY = typeof location !== 'undefined' && new URLSearchParams(location.search).get('lens') === 'overlay';
+
 /** The camera frame size, and whether it is the full square sensor or the 4:3 crop of it. */
 function frameShape(video: HTMLVideoElement | null): string {
   const w = video?.videoWidth ?? 0;
@@ -376,7 +379,8 @@ export class RoomStretchSystem extends createSystem({
   private readonly inv = new Matrix4();
 
   init(): void {
-    this.overlay = new RoomMeshOverlay(this.scene);
+    this.overlay = new RoomMeshOverlay(this.scene, LENS_OVERLAY);
+    if (LENS_OVERLAY) console.info('[jonze] lens overlay: live camera in stripes over the room at rest; hold still to read it');
     this.hands = new HandOccluder(this.scene);
     this.joints.points = this.hands.points;
     this.joints.arms = this.hands.arms;
@@ -491,7 +495,12 @@ export class RoomStretchSystem extends createSystem({
       this.stepHand(this.left, dt);
       this.stepHand(this.right, dt);
       const active = this.left.on || this.right.on;
-      this.overlay.setActive(active);
+      if (LENS_OVERLAY) {
+        const live = !active && hasVideo && this.photo.projectFrame(true, this.camera, now);
+        this.overlay.setLive(video, live, this.photo.worldToClip);
+        this.overlay.uniforms.uLensOn.value = live ? 1 : 0;
+      }
+      this.overlay.setActive(active || this.overlay.uniforms.uLensOn.value > 0);
       this.overlay.sync(meshes);
       this.hands.inflate = this.left.holding || this.right.holding ? 1.3 : 1;
       this.publish(this.left, this.right, time, hasVideo);
@@ -522,7 +531,7 @@ export class RoomStretchSystem extends createSystem({
       const live = this.photo.projectFrame(false, this.camera, now);
       this.photo.capture(false, this.camera, null, true, now);
       this.updateDemo(dt, now);
-      this.overlay.setPreviewLive(video, live, this.photo.worldToClip);
+      this.overlay.setLive(video, live, this.photo.worldToClip);
       this.publish(this.demoL, this.demoR, time, hasVideo);
     }
     this.hud.visible = true;

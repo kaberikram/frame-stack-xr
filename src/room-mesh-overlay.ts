@@ -33,7 +33,7 @@ function setShown(object: Object3D, on: boolean): void {
  */
 export class RoomMeshOverlay {
   readonly uniforms: RubberUniformSet;
-  /** Headset program. It never samples video. */
+  /** Headset program. It samples video only for the `?lens=overlay` check. */
   readonly material: ShaderMaterial;
   /** Desk stand-in program, with the webcam as the unmoved backdrop. */
   readonly previewMaterial: ShaderMaterial;
@@ -54,9 +54,9 @@ export class RoomMeshOverlay {
   private video: HTMLVideoElement | null = null;
   private videoTex: VideoTexture | null = null;
 
-  constructor(private readonly parent: Object3D) {
+  constructor(private readonly parent: Object3D, lensOverlay = false) {
     this.uniforms = createRubberUniforms();
-    this.material = rubberMaterial(this.uniforms);
+    this.material = rubberMaterial(this.uniforms, false, lensOverlay);
     this.previewMaterial = rubberMaterial(this.uniforms, true);
   }
 
@@ -125,8 +125,11 @@ export class RoomMeshOverlay {
     }
   }
 
-  /** Desk preview only: the webcam behind the stand-in room. Never called while presenting. */
-  setPreviewLive(video: HTMLVideoElement | null, hasLive: boolean, liveToClip: Matrix4): void {
+  /**
+   * The live camera and its projection: the webcam behind the desk stand-in room, or the stripes of
+   * the headset's `?lens=overlay` check.
+   */
+  setLive(video: HTMLVideoElement | null, hasLive: boolean, liveToClip: Matrix4): void {
     this.attachVideo(video);
     this.uniforms.uHasLive.value = hasLive && this.videoTex ? 1 : 0;
     this.uniforms.uLiveToClip.value.copy(liveToClip);

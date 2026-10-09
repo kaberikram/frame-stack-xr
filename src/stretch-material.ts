@@ -55,10 +55,12 @@ export function createRubberUniforms() {
     /** 1 while a camera feeds photos. Without one the desk preview frosts moved surfaces; a headset draws nothing. */
     uAnyPhoto: { value: 0 },
     uLinear: { value: 1 },
-    // Desk preview only: the webcam stands in for passthrough on unmoved surfaces.
+    // Desk preview: the webcam stands in for passthrough on unmoved surfaces.
+    // `?lens=overlay` on a headset: the live camera in stripes over the room, to check alignment.
     uLive: { value: null as Texture | null },
     uLiveToClip: { value: new Matrix4() },
     uHasLive: { value: 0 },
+    uLensOn: { value: 0 },
   };
 }
 
@@ -225,10 +227,15 @@ uniform vec3 uG0; uniform vec3 uD0; uniform vec3 uAxis0; uniform vec3 uN0; unifo
 uniform vec3 uG1; uniform vec3 uD1; uniform vec3 uAxis1; uniform vec3 uN1; uniform float uOn1; uniform float uBloom1;
 uniform float uReach;
 uniform float uRamp;
-#ifdef PREVIEW
+#if defined(PREVIEW) || defined(LENS_OVERLAY)
 uniform sampler2D uLive;
 uniform mat4 uLiveToClip;
 uniform float uHasLive;
+#endif
+#ifdef LENS_OVERLAY
+uniform float uLensOn;
+/** Stripe period in pixels: 48 px of camera, 48 px of passthrough. */
+const float LENS_STRIPE = 96.0;
 #endif
 
 varying vec3 vRest;
@@ -293,6 +300,23 @@ void writeColor(vec3 lin, float alpha) {
 void main() {
   // Derivatives first: they are undefined after a non-uniform early return.
   vec3 nr = cross(dFdx(vRest), dFdy(vRest));
+
+#ifdef LENS_OVERLAY
+  // Alignment check: every other diagonal stripe is the live camera, projected where the surface is.
+  // Edges that continue across the stripes mean the camera model matches passthrough.
+  if (uLensOn > 0.5) {
+    vec4 lc = uLiveToClip * vec4(vWorld, 1.0);
+    vec2 luv = lc.xy / max(lc.w, 1e-4) * 0.5 + 0.5;
+    bool inside = lc.w > 1e-4 && luv.x >= 0.0 && luv.y >= 0.0 && luv.x <= 1.0 && luv.y <= 1.0;
+    float stripe = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / LENS_STRIPE));
+    if (!inside || stripe < 0.5) {
+      gl_FragColor = vec4(0.0);
+      return;
+    }
+    writeColor(sRGBTransferEOTF(texture(uLive, luv)).rgb, 1.0);
+    return;
+  }
+#endif
 
   // Where the photo is read. The texture rides the surface (rest position) and the streaks pull it
   // toward the grabbed column, per pixel so it is exact on any triangle.
@@ -371,13 +395,16 @@ void main() {
  * depth with blending off, so the nearest surface wins and alpha 0 shows passthrough.
  * `preview` adds the webcam backdrop for the desk stand-in; the headset program never samples video.
  */
-export function rubberMaterial(uniforms: RubberUniformSet, preview = false): ShaderMaterial {
+export function rubberMaterial(uniforms: RubberUniformSet, preview = false, lensOverlay = false): ShaderMaterial {
+  const defines: Record<string, string> = {};
+  if (preview) defines.PREVIEW = '';
+  if (lensOverlay) defines.LENS_OVERLAY = '';
   return new ShaderMaterial({
     uniforms,
     vertexShader: VERTEX,
     fragmentShader: FRAGMENT,
     name: preview ? 'jonze-stretch-preview' : 'jonze-stretch',
-    defines: preview ? { PREVIEW: '' } : {},
+    defines,
     transparent: false,
     depthTest: true,
     depthWrite: true,
