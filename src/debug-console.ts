@@ -88,11 +88,8 @@ const SHADER_ERROR = /ERROR: *\d+:(\d+): *(.*)/;
 const SHADER_SOURCE = /^> *\d+: *(.*)$/m;
 
 const PARAM = typeof location === 'undefined' ? null : new URLSearchParams(location.search).get('debug');
-/**
- * Browser hints about choices made on purpose, and three's note that IWSDK's window-resize handler
- * can't resize the canvas mid-session (the XR layer owns it then): shown, but as plain lines.
- */
-const BENIGN = /willReadFrequently|Can't change size while VR device is presenting/;
+/** Browser hints about choices made on purpose: shown, but as plain lines, not warnings. */
+const BENIGN = /willReadFrequently/;
 /** One-shot session lines that must stay on the panel however much else is logged after them. */
 const PINNED = /^(build|session|depth|camera pick|camera frames|lens f=|xr multiview)\b/;
 
@@ -191,8 +188,6 @@ class ConsoleLines {
 }
 
 const lines = new ConsoleLines();
-/** A live readout drawn in the panel header, set by setConsoleStatus. */
-let status = '';
 let installed = false;
 let alwaysOn = false;
 let pageOn = false;
@@ -200,21 +195,6 @@ let busy = false;
 let page: HTMLDivElement | null = null;
 const pageRows: HTMLDivElement[] = [];
 let pageTimer = 0;
-
-/**
- * Shows `text` in the panel header, between the build and the error counts: a live readout such as
- * frame timing. Repaints with the next panel paint, so callers should change it about once a second.
- */
-export function setConsoleStatus(text: string): void {
-  if (text === status) return;
-  status = text;
-  lines.panelDirty = true;
-}
-
-/** True when the console is on, so callers can skip work for a readout nobody sees. */
-export function consoleShown(): boolean {
-  return installed && wanted();
-}
 
 /** Call once, first thing in index.ts. Safe to call again. */
 export function installDebugConsole(): void {
@@ -520,21 +500,14 @@ export class DebugConsoleSystem extends createSystem({}) {
     ctx.font = FONT_HEADER;
     ctx.textAlign = 'left';
     ctx.fillStyle = INK.muted;
-    const title = `${BUILD_TAG} · ${getMode()}`;
-    ctx.fillText(title, PAD, HEADER_H / 2);
-    const titleW = ctx.measureText(title).width;
+    ctx.fillText(`console ${BUILD_TAG} · ${getMode()}`, PAD, HEADER_H / 2);
     ctx.textAlign = 'right';
     if (lines.errors > 0) ctx.fillStyle = COLORS[Level.Error];
-    const counts = `${lines.errors} err  ${lines.warns} warn${lines.dropped ? `  ${lines.dropped} dropped` : ''}`;
-    ctx.fillText(counts, w - PAD, HEADER_H / 2);
-    if (status) {
-      // In the gap between the title and the counts, condensed rather than clipped.
-      const from = PAD + titleW + 24;
-      const to = w - PAD - ctx.measureText(counts).width - 24;
-      ctx.textAlign = 'left';
-      ctx.fillStyle = TAGGED;
-      if (to > from) ctx.fillText(status, from, HEADER_H / 2, to - from);
-    }
+    ctx.fillText(
+      `${lines.errors} err  ${lines.warns} warn${lines.dropped ? `  ${lines.dropped} dropped` : ''}`,
+      w - PAD,
+      HEADER_H / 2,
+    );
 
     ctx.font = FONT_TIME;
     for (let i = 0; i < lines.count; i++) {

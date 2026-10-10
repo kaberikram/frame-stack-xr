@@ -1,4 +1,4 @@
-import { chunkMesh, snapToPlanes, subdivideMesh, type SnapPlane } from './mesh-subdivide.js';
+import { snapToPlanes, subdivideMesh, type SnapPlane } from './mesh-subdivide.js';
 
 interface SubdivideRequest {
   kind: 'subdivide';
@@ -25,8 +25,6 @@ interface SubdivideReply {
   positions: Float32Array;
   /** Only on a subdivide reply; a snap keeps the mesh's triangles. */
   indices: Uint32Array | null;
-  /** With the indices: CHUNK_STRIDE floats per chunk of the index buffer. */
-  chunks: Float32Array | null;
   edge: number;
   triangles: number;
   moved: number;
@@ -41,31 +39,28 @@ interface WorkerScope {
 const scope = self as unknown as WorkerScope;
 
 /** The last dense mesh before snapping, so new planes snap from the scan rather than from a snap. */
-let rest: { id: number; positions: Float32Array; indices: Uint32Array; edge: number; chunks: Float32Array } | null = null;
+let rest: { id: number; positions: Float32Array; indices: Uint32Array; edge: number } | null = null;
 
 scope.onmessage = (event) => {
   const request = event.data;
   if (request.kind === 'subdivide') {
     const out = subdivideMesh(request.positions, request.indices, request.edge, request.maxTriangles, request.focus);
-    const chunked = chunkMesh(out.positions, out.indices);
-    rest = { id: request.id, positions: out.positions, indices: chunked.indices, edge: out.edge, chunks: chunked.chunks };
+    rest = { id: request.id, positions: out.positions, indices: out.indices, edge: out.edge };
   } else if (!rest || rest.id !== request.id) {
     return;
   }
   const positions = new Float32Array(rest.positions.length);
   const snap = snapToPlanes(rest.positions, rest.indices, request.planes, positions);
   const indices = request.kind === 'subdivide' ? rest.indices.slice() : null;
-  const chunks = request.kind === 'subdivide' ? rest.chunks.slice() : null;
   const reply: SubdivideReply = {
     kind: request.kind,
     id: rest.id,
     positions,
     indices,
-    chunks,
     edge: rest.edge,
     triangles: rest.indices.length / 3,
     moved: snap.moved,
     planes: snap.planes,
   };
-  scope.postMessage(reply, indices && chunks ? [positions.buffer, indices.buffer, chunks.buffer] : [positions.buffer]);
+  scope.postMessage(reply, indices ? [positions.buffer, indices.buffer] : [positions.buffer]);
 };
