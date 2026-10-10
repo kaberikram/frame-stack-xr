@@ -28,8 +28,11 @@ import {
 import { PREVIEW_FORCED, getMode } from './experience.js';
 import { INK, MONO, makeCanvas, type Canvas2D } from './labels.js';
 
-/** Shown on the first line with the page-load time, so a cached page can't pass for a new build. */
-const BUILD_TAG = 'jonze-2';
+/**
+ * Shown on the first line with the page-load time, and in the panel header: the commit this build
+ * came from, so a headset recording proves which deploy was live and a cached page can't pass for a new one.
+ */
+const BUILD_TAG = `jonze-${__BUILD_SHA__}`;
 
 const ROWS = 16;
 /** Longer lines end in an ellipsis. Up to this many still fit a row, slightly condensed. */
