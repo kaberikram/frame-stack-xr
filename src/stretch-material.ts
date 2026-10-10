@@ -569,12 +569,16 @@ void main() {
 #else
 #ifdef ENV_DEPTH
   float gate = 0.0;
-  float occ = handOcclusion(vWorld, gate);
-  // Developer views draw wherever the room is, moved or not.
-  vec4 dbg = uOccDebug > 0.5 ? occDebug(vWorld, occ, gate) : vec4(0.0);
-  if (alpha < 0.002 && dbg.a > 0.002) {
-    writeColor(dbg.rgb, dbg.a);
-    return;
+  float occ = 0.0;
+  vec4 dbg = vec4(0.0);
+  // Developer views draw wherever the room is, moved or not. Otherwise only moved points are tested.
+  if (uOccDebug > 0.5) {
+    occ = handOcclusion(vWorld, gate);
+    dbg = occDebug(vWorld, occ, gate);
+    if (alpha < 0.002 && dbg.a > 0.002) {
+      writeColor(dbg.rgb, dbg.a);
+      return;
+    }
   }
 #endif
   // Unmoved surfaces stay real. Depth is still written so a nearer surface wins.
@@ -594,7 +598,10 @@ void main() {
   alpha = shown * max(own * max(p0.a * uFade0, p1.a * uFade1), frost);
 #ifdef ENV_DEPTH
   // Debug views paint the cut instead of cutting.
-  if (uOccDebug < 0.5) alpha *= 1.0 - occ;
+  if (uOccDebug < 0.5) {
+    occ = handOcclusion(vWorld, gate);
+    alpha *= 1.0 - occ;
+  }
 #endif
 #ifdef PREVIEW
   col = cover > 1e-7 ? col : vec3(0.92);
