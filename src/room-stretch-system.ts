@@ -34,6 +34,8 @@ import type { RubberUniformSet } from './stretch-material.js';
 import { StretchSound } from './stretch-sound.js';
 
 type Side = 'left' | 'right';
+/** What held a cone's height: it followed the hand, sat just behind the fingers, hit its cap, or the photo's edge. */
+type LiftLimit = 'hand' | 'tip' | 'cap' | 'cover';
 const SIDES: readonly Side[] = ['left', 'right'];
 
 /** Hand travel below half of this does nothing; full response at one and a half. */
@@ -62,43 +64,57 @@ const FOLLOW_MAX = 2.5;
 /** The pinch ray must meet the grabbed plane within ~78° of its normal to slide. */
 const GRAZE = 0.2;
 /**
- * Pulling toward you: the share of the way to your head the hand has come, less this much, and less
- * this much of the sideways travel (a shoulder sweep shortens reach too), both as shares of the reach
- * at the pinch. The pinched spot comes that share of the way to your head, as a cone on the line of
- * sight through your fingers: up to TENT_FRAC of the way, and never more than TENT_MAX.
+ * Pulling toward you: the cone comes at most TENT_FRAC of the slid spot's way to your head, and never
+ * more than TENT_MAX. The burst ignores the first TOWARD_DEAD share of the reach at the pinch.
  */
 const TOWARD_DEAD = 0.02;
-const TOWARD_LATERAL = 0.15;
 const TENT_FRAC = 0.7;
 const TENT_MAX = 1.2;
+/**
+ * How wide the cone's foot is per metre of rise (stretch-material.ts tentR): wide enough that its
+ * steepest slope along the surface, from the lift's in-plane share and the gather, stays under 0.9.
+ */
+function tentSpread(liftIn: number): number {
+  return Math.max(0.6, (1.8 * liftIn + 0.35) / 0.9);
+}
 /** The burst along the surface, now a side note to the cone: this share of before, and at most this far. */
 const BURST_SHARE = 0.35;
 const EXPLODE_MAX = 0.3;
 /** The cone's tip stops this far behind the fingers; a photo is measured this far around the pinch. */
 const TIP_CLEAR = 0.05;
 const COVER_MAX = 2;
-/** The cone carries the pinched spot's colours into it from this share of the way, fully this much later. */
-const TENT_STREAK_FROM = 0.08;
-const TENT_STREAK_SPAN = 0.25;
 /**
- * Fingertip spikes: an index fingertip this close to a surface (no pinch) draws it up. The spike
- * starts at SPIKE_RANGE, is full by SPIKE_FULL, and its tip stops SPIKE_KEEP short of the finger, so a
- * fingertip resting on the table raises nothing. Its radius grows from SPIKE_RADIUS with its height.
+ * The cover is measured to this uv margin. A bank photo may hold the grab point only 0.06 in from its
+ * edge (CENTER_MIN), so measuring to SLIDE_MARGIN (0.1) found no cover at all and the cone never rose.
  */
-const SPIKE_RANGE = 0.09;
-const SPIKE_FULL = 0.03;
+const COVER_MARGIN = 0.02;
+/**
+ * A long cone carries the pinched spot's colours up into its tip, from this share of the way, fully
+ * this much later. Late, so most pulls read as cloth with its own texture rather than taffy.
+ */
+const TENT_STREAK_FROM = 0.25;
+const TENT_STREAK_SPAN = 0.3;
+/**
+ * Fingertip vacuum: an index fingertip this close to a surface (no pinch) sucks it up. The pull
+ * starts at SPIKE_RANGE and is full by SPIKE_FULL; the surface then reaches SPIKE_REACH of the way to
+ * the tip, stopping at least SPIKE_KEEP short, so a fingertip resting on the table raises nothing.
+ * About 4.7 cm at 15 cm, 6.5 cm at 10-12 cm. Its base radius grows from SPIKE_RADIUS with its height.
+ */
+const SPIKE_RANGE = 0.22;
+const SPIKE_FULL = 0.08;
+const SPIKE_REACH = 0.85;
 const SPIKE_KEEP = 0.012;
-const SPIKE_RADIUS = 0.1;
-const SPIKE_WIDEN = 0.8;
+const SPIKE_RADIUS = 0.12;
+const SPIKE_WIDEN = 0.6;
 /** Below this height there is no spike to draw. */
 const SPIKE_MIN = 2e-4;
-/** The spike rises with this spring (stiff, nearly critical) and falls back with the look's own wobble. */
-const SPIKE_STIFF = 500;
-const SPIKE_DAMP = 38;
+/** The surface reaches up with this spring (a little under critical, so it overshoots) and falls back with the look's own wobble. */
+const SPIKE_STIFF = 320;
+const SPIKE_DAMP = 22;
 /** A table plane counts under a spike only this far below the hit: where the dense room was snapped onto it. */
 const SPIKE_CLUTTER = 0.02;
 /** A spike's photo ring, and how soon a failed freeze may be tried again. */
-const SPIKE_FOOTPRINT = 0.08;
+const SPIKE_FOOTPRINT = 0.15;
 const SPIKE_RETRY = 0.4;
 /** The spike's foot glides after the fingertip with this time constant (s). */
 const SPIKE_GLIDE = 0.04;
@@ -248,6 +264,9 @@ interface Grab {
   capped: boolean;
   /** How far the grab's photo reaches around it in the surface (measureCover). */
   coverR: number;
+  /** What held the cone this frame (aim), and at its peak: your fingers, the cap, or the photo's cover. */
+  liftWhy: LiftLimit;
+  peakWhy: LiftLimit;
   /**
    * The index fingertip held close to a surface, no pinch: where the spike rises from (`hoverC`, on
    * the surface under the tip), the surface normal it rises along, its height now and wanted.
@@ -266,7 +285,10 @@ interface Grab {
   /** For the console line each spike prints when it settles. */
   hoverAt: number;
   hoverPeak: number;
+  /** The gap when the spike began, the closest it came, and this frame's. */
+  hoverFrom: number;
   hoverGap: number;
+  hoverLast: number;
   hoverSurface: string;
 }
 
@@ -342,6 +364,8 @@ function makeGrab(side: Side): Grab {
     span: 0,
     capped: false,
     coverR: COVER_MAX,
+    liftWhy: 'hand',
+    peakWhy: 'hand',
     hovering: false,
     hoverC: new Vector3(),
     hoverN: new Vector3(0, 1, 0),
@@ -353,7 +377,9 @@ function makeGrab(side: Side): Grab {
     hoverRetryAt: 0,
     hoverAt: 0,
     hoverPeak: 0,
+    hoverFrom: 1,
     hoverGap: 1,
+    hoverLast: 1,
     hoverSurface: '',
   };
 }
@@ -1244,7 +1270,8 @@ export class RoomStretchSystem extends createSystem({
       grab.hovering = true;
       grab.hoverAt = now;
       grab.hoverPeak = 0;
-      grab.hoverGap = SPIKE_RANGE;
+      grab.hoverFrom = grab.hoverLast;
+      grab.hoverGap = grab.hoverLast;
     }
     if (!grab.hovering) return;
     const rising = want > 0;
@@ -1284,9 +1311,10 @@ export class RoomStretchSystem extends createSystem({
       grab.hoverC.lerp(foot, f);
       grab.hoverN.lerp(n, f).normalize();
     }
+    grab.hoverLast = gap;
     if (gap < grab.hoverGap) grab.hoverGap = gap;
     grab.hoverSurface = Math.abs(n.y) < 0.5 ? 'wall' : n.y > 0 ? 'table' : 'ceiling';
-    return (1 - smooth((gap - SPIKE_FULL) / (SPIKE_RANGE - SPIKE_FULL))) * (gap - SPIKE_KEEP);
+    return (1 - smooth((gap - SPIKE_FULL) / (SPIKE_RANGE - SPIKE_FULL))) * SPIKE_REACH * (gap - SPIKE_KEEP);
   }
 
   /**
@@ -1309,7 +1337,7 @@ export class RoomStretchSystem extends createSystem({
   private endSpike(grab: Grab, now: number, keep: boolean): void {
     if (grab.hoverPeak > 0.003) {
       console.info(
-        `[jonze] hover ${grab.side === 'left' ? 'L' : 'R'} ${grab.hoverSurface} gap ${(grab.hoverGap * 100).toFixed(1)}cm ` +
+        `[jonze] hover ${grab.side === 'left' ? 'L' : 'R'} ${grab.hoverSurface} from ${(grab.hoverFrom * 100).toFixed(0)} to ${(grab.hoverGap * 100).toFixed(1)}cm ` +
           `peak ${(grab.hoverPeak * 100).toFixed(1)}cm photo ${grab.hoverPhoto ? 'bank' : 'none'} ${(now - grab.hoverAt).toFixed(1)}s` +
           (keep ? ' -> pinch' : ''),
       );
@@ -1362,7 +1390,10 @@ export class RoomStretchSystem extends createSystem({
       grab.lift.copy(this.head).sub(grab.worldG).sub(grab.D).normalize();
       const slid = grab.D.length();
       if (slid > grab.peakSlide) grab.peakSlide = slid;
-      if (b > grab.peakLift) grab.peakLift = b;
+      if (b > grab.peakLift) {
+        grab.peakLift = b;
+        grab.peakWhy = grab.liftWhy;
+      }
       if (e > grab.peakBurst) grab.peakBurst = e;
     } else if (grab.on) {
       this.stepSprings(grab, dt, this.look.stiffness, this.look.damping);
@@ -1453,14 +1484,9 @@ export class RoomStretchSystem extends createSystem({
       this.keepInPhoto(grab, slide);
       grab.target.copy(slide);
     }
-    const along = travel.dot(grab.ray0);
-    const lateral = Math.sqrt(Math.max(0, moved * moved - along * along));
     const reach0 = Math.max(0.1, grab.reach0);
-    // Travel back along the line of sight at the pinch, so a pull toward the chest counts in full,
-    // not only what it brings the hand nearer the eyes.
-    const share = Math.max(0, -along / reach0 - TOWARD_DEAD - (TOWARD_LATERAL * lateral) / reach0);
-    const u = Math.min(TENT_FRAC, share * this.look.depthPull) * ease;
-    const toward = Math.min(TENT_FRAC, share) * ease * reach0;
+    // The burst still reads how far the hand came toward your head.
+    const toward = Math.max(0, reach0 - reach - TOWARD_DEAD * reach0) * ease;
     const off = travel.dot(n);
     const straight = moved > 1e-3 ? smooth((off / moved - STRAIGHT_FROM) / (STRAIGHT_FULL - STRAIGHT_FROM)) : 0;
     const wall = 1 - smooth((Math.abs(n.y) - WALL_UP) / WALL_FADE);
@@ -1469,14 +1495,20 @@ export class RoomStretchSystem extends createSystem({
     const slid = grab.target.length();
     if (slid + e > PULL_MAX) e = Math.max(0, PULL_MAX - slid);
     grab.explodeTo = e;
-    // The cone: the slid spot comes the same share of its way to your head as your hand came of its
-    // way, so it stays on the line of sight through your fingers at a depth that follows theirs.
+    // The cone, like cloth pinched between your fingers: its tip on your line of sight through
+    // them, at the depth that keeps the pinch's own proportion of hand to surface. Pinched with the
+    // hand on the surface, the tip is at your fingertips and lifting your hand lifts it; pinched on a
+    // far wall, it comes the same share of its way as your hand came of its own. Always just behind
+    // your fingers, and with its foot inside the photo frozen for it.
     const depth = this.tmp.copy(grab.worldG).add(grab.target).distanceTo(this.head);
-    // Its tip stays behind your fingers, and its foot inside the photo frozen for it.
+    const tip = Math.max(reach + TIP_CLEAR, (reach * grab.dist) / reach0);
+    const want = Math.max(0, depth - tip) * this.look.depthPull * ease;
+    const cap = Math.min(TENT_MAX, TENT_FRAC * depth);
     const liftIn = Math.sqrt(Math.max(0, 1 - grab.lift.dot(n) ** 2));
     const edge = this.overlay.uniforms.uCore.value + 0.1 + 0.55 * e;
-    const covered = Math.max(0, grab.coverR - edge - e) / Math.max(0.6, 1.2 * liftIn);
-    grab.liftTo = Math.min(TENT_MAX, depth * u, Math.max(0, depth - reach - TIP_CLEAR), covered);
+    const covered = Math.max(0, grab.coverR - edge - e) / tentSpread(liftIn);
+    grab.liftTo = Math.min(want, cap, covered);
+    grab.liftWhy = want <= cap && want <= covered ? (tip === reach + TIP_CLEAR ? 'tip' : 'hand') : cap <= covered ? 'cap' : 'cover';
   }
 
   /**
@@ -1498,7 +1530,7 @@ export class RoomStretchSystem extends createSystem({
       for (let i = 0; i < 7; i++) {
         const mid = (lo + hi) * 0.5;
         this.tmp.copy(grab.worldG).addScaledVector(axis, sign * mid);
-        if (this.photo.slotContains(grab.slot, this.tmp, SLIDE_MARGIN)) lo = mid;
+        if (this.photo.slotContains(grab.slot, this.tmp, COVER_MARGIN)) lo = mid;
         else hi = mid;
       }
       cover = Math.min(cover, lo);
@@ -1535,8 +1567,8 @@ export class RoomStretchSystem extends createSystem({
     const limit = (grab.clipped ? ' clip' : '') + (grab.capped ? ' cap' : '');
     console.info(
       `[jonze] pull ${grab.side === 'left' ? 'L' : 'R'} ${held.toFixed(1)}s${limit} ${grab.dist.toFixed(1)}m ` +
-        `D${short(grab.peakSlide)} x${ratio.toFixed(1)} lift${short(grab.peakLift)} ` +
-        `burst${short(grab.peakBurst)} bloom${short(grab.peakBloom)} chain=${grab.chain ? 'y' : 'n'}`,
+        `D${short(grab.peakSlide)} x${ratio.toFixed(1)} lift${short(grab.peakLift)}(${grab.peakWhy}) ` +
+        `burst${short(grab.peakBurst)} bloom${short(grab.peakBloom)}${grab.chain ? ' chain' : ''}`,
     );
     this.logOnset(grab);
   }
@@ -1615,6 +1647,7 @@ export class RoomStretchSystem extends createSystem({
     grab.peakBloom = 0;
     grab.clipped = false;
     grab.coverR = COVER_MAX;
+    grab.peakWhy = 'hand';
     for (let i = 0; i < grab.springs.length; i++) grab.springs[i].reset(0);
   }
 
