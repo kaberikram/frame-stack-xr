@@ -85,6 +85,8 @@ const SHADER_ERROR = /ERROR: *\d+:(\d+): *(.*)/;
 const SHADER_SOURCE = /^> *\d+: *(.*)$/m;
 
 const PARAM = typeof location === 'undefined' ? null : new URLSearchParams(location.search).get('debug');
+/** Browser hints about choices made on purpose: shown, but as plain lines, not warnings. */
+const BENIGN = /willReadFrequently/;
 /** One-shot session lines that must stay on the panel however much else is logged after them. */
 const PINNED = /^(build|session|depth|camera pick|camera frames|lens f=|xr multiview)\b/;
 
@@ -110,6 +112,7 @@ class ConsoleLines {
   presenting = false;
 
   push(level: Level, raw: string, now: number): void {
+    if (level === Level.Warn && BENIGN.test(raw)) level = Level.Log;
     let line = raw;
     let tagged = 0;
     if (line.startsWith(TAG)) {

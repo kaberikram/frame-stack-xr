@@ -872,12 +872,13 @@ export class RoomStretchSystem extends createSystem({
     const xr = this.renderer.xr;
     const cam = xr.getCamera();
     if (cam.cameras.length < 2) return;
-    this.xrLogged = true;
-    cam.updateMatrixWorld(true);
+    // three poses the eyes when it renders; until a frame has been drawn they all sit at the origin.
     const mid = this.tmpA.setFromMatrixPosition(cam.matrixWorld);
     const left = this.tmpB.setFromMatrixPosition(cam.cameras[0].matrixWorld);
     const right = this.tmpC.setFromMatrixPosition(cam.cameras[1].matrixWorld);
     const apart = left.distanceTo(right);
+    if (apart < 0.01) return;
+    this.xrLogged = true;
     left.add(right).multiplyScalar(0.5);
     console.info(
       `[jonze] xr multiview=${(xr as { isMultiview?: boolean }).isMultiview ? 'Y' : 'n'} eyes ${apart.toFixed(3)}m apart, ` +
