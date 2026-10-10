@@ -12,8 +12,8 @@ export const StretchLook = createComponent('StretchLook', {
   reach: { type: Types.Float32, default: 0.45, min: 0.05, max: 2, step: 0.01, label: 'Sideways reach' },
   ramp: { type: Types.Float32, default: 0.35, min: 0.05, max: 2, step: 0.01, label: 'Stretch ramp' },
   stripes: {
-    type: Types.Float32, default: 0.15, min: 0, max: 3, step: 0.01, label: 'Streaks start (m)',
-    help: 'Metres of pull before the grabbed column smears into streaks; full 0.35 m later. 3 turns them off.',
+    type: Types.Float32, default: 11, min: 0, max: 90, step: 0.5, label: 'Streaks start (deg)',
+    help: 'Degrees of pull, seen from your head, before the grabbed column smears into streaks; full 25 deg later. 90 turns them off.',
   },
   feather: { type: Types.Float32, default: 0.07, min: 0, max: 0.25, step: 0.005, label: 'Photo feather' },
   wobble: { type: Types.Float32, default: 0.035, min: 0, max: 0.06, step: 0.005, label: 'Wobble' },

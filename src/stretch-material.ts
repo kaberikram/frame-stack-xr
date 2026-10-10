@@ -1,4 +1,5 @@
 import { DoubleSide, Matrix4, ShaderMaterial, Vector2, Vector3, Vector4, type Texture } from '@iwsdk/core';
+import { SEGMENTS } from './hand-occluder.js';
 
 /**
  * Two grabs, in world space. The room mesh bends by both, then each grab reads its own photo first.
@@ -30,7 +31,11 @@ export function createRubberUniforms() {
     uOn1: { value: 0 },
     uBloom1: { value: 0 },
     uReach: { value: 0.45 },
-    uRamp: { value: 0.35 },
+    /** Each grab's ramp: the stretch runs this far back from the pinch, longer for far surfaces. */
+    uRamp0: { value: 0.35 },
+    uRamp1: { value: 0.35 },
+    /** 1 when the later grab began on the surface the earlier one had already moved: it bends what you see. */
+    uChain1: { value: 0 },
     uFeather: { value: 0.07 },
     uWobble: { value: 0.035 },
     uWaveK: { value: 1 / 0.45 },
@@ -50,6 +55,15 @@ export function createRubberUniforms() {
     uGain1: { value: new Vector3(1, 1, 1) },
     uHasPhoto0: { value: 0 },
     uHasPhoto1: { value: 0 },
+    // Each slot's fill: a second photo read where the slot's own is masked (hands) or off its frame.
+    uFill0: { value: null as Texture | null },
+    uFill1: { value: null as Texture | null },
+    uFillToClip0: { value: new Matrix4() },
+    uFillToClip1: { value: new Matrix4() },
+    uFillCam0: { value: new Vector3() },
+    uFillCam1: { value: new Vector3() },
+    uHasFill0: { value: 0 },
+    uHasFill1: { value: 0 },
     uFade0: { value: 0 },
     uFade1: { value: 0 },
     /** 1 while a camera feeds photos. Without one the desk preview frosts moved surfaces; a headset draws nothing. */
@@ -69,9 +83,10 @@ export function createRubberUniforms() {
     uEyeSize: { value: new Vector2(1, 1) },
     uNormDepth0: { value: new Matrix4() },
     uNormDepth1: { value: new Matrix4() },
-    /** Per hand, a hand then a forearm segment: start xyz and 1 when valid, end xyz and reach. */
-    uSegA: { value: [new Vector4(), new Vector4(), new Vector4(), new Vector4()] },
-    uSegB: { value: [new Vector4(), new Vector4(), new Vector4(), new Vector4()] },
+    /** Per hand, three hand segments then the forearm: start xyz and kind (0 off, 1 hand, 2 arm), end xyz and reach. */
+    uSegA: { value: Array.from({ length: SEGMENTS }, () => new Vector4()) },
+    uSegB: { value: Array.from({ length: SEGMENTS }, () => new Vector4()) },
+    /** 0 off, 1 `?occ=debug` (cut magenta, gate cyan), 2 `?occ=delta` (real depth against the room). */
     uOccDebug: { value: 0 },
   };
 }
@@ -80,7 +95,7 @@ export type RubberUniformSet = ReturnType<typeof createRubberUniforms>;
 
 /**
  * The taffy band, shared by both stages so the streaks always sit exactly where the mesh stretched.
- * Needs uReach and uRamp declared above it.
+ * Needs uReach declared above it.
  */
 const SHARED = /* glsl */ `
 const float SIDE_GROW = 0.5;    // the band widens 0.5 m per metre pulled, so small triangles never flip
@@ -101,8 +116,8 @@ float taffyFlat(float dn) {
 }
 
 /** Behind the pinch (t < 0): 1 at the pinch, easing to 0 at the anchor one ramp back. */
-float taffyBehind(float t) {
-  return 1.0 - ease(min(-t / max(uRamp, 1e-3), 1.0));
+float taffyBehind(float t, float ramp) {
+  return 1.0 - ease(min(-t / max(ramp, 1e-3), 1.0));
 }
 `;
 
@@ -112,7 +127,9 @@ uniform float uA0; uniform float uE0; uniform float uB0; uniform float uRip0; un
 uniform vec3 uG1; uniform vec3 uD1; uniform vec3 uAxis1; uniform vec3 uN1; uniform vec3 uLift1;
 uniform float uA1; uniform float uE1; uniform float uB1; uniform float uRip1; uniform float uOn1;
 uniform float uReach;
-uniform float uRamp;
+uniform float uRamp0;
+uniform float uRamp1;
+uniform float uChain1;
 uniform float uWobble;
 uniform float uWaveK;
 uniform float uWaveSpeed;
@@ -140,7 +157,7 @@ ${SHARED}
  * hand back to the real room.
  */
 void pinch(inout vec3 p, inout float seen, inout float hide, out float own,
-           vec3 G, vec3 D, vec3 axis, vec3 n, vec3 lift, float A, float E, float B, float rip) {
+           vec3 G, vec3 D, vec3 axis, vec3 n, vec3 lift, float A, float E, float B, float rip, float ramp) {
   vec3 q = p - G;
   float len = length(D);
   float e = max(E, 0.0);
@@ -158,8 +175,8 @@ void pinch(inout vec3 p, inout float seen, inout float hide, out float own,
   float along;
   float belly = 0.0;
   if (t < 0.0) {
-    along = taffyBehind(t);
-    belly = sin(3.14159265 * min(-t / max(uRamp, 1e-3), 1.0));
+    along = taffyBehind(t, ramp);
+    belly = sin(3.14159265 * min(-t / max(ramp, 1e-3), 1.0));
   } else {
     along = 1.0 - smoothstep(A, A + squash, t);
   }
@@ -209,9 +226,14 @@ void main() {
   float hide = 0.0;
   float own0 = 0.0;
   float own1 = 0.0;
-  if (uOn0 > 0.5) pinch(p, seen, hide, own0, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0);
-  vMid = p;
-  if (uOn1 > 0.5) pinch(p, seen, hide, own1, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1);
+  if (uOn0 > 0.5) pinch(p, seen, hide, own0, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0, uRamp0);
+  // A later grab that began on the already-moved surface bends what you saw; two grabs that began
+  // together each bend the rest surface and their moves add, so neither squeezes into the other.
+  vec3 base1 = uChain1 > 0.5 ? p : rest;
+  vec3 p1 = base1;
+  if (uOn1 > 0.5) pinch(p1, seen, hide, own1, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1, uRamp1);
+  p += p1 - base1;
+  vMid = base1;
   vRest = rest;
   vWorld = p;
   vMask = vec2(seen * (1.0 - smoothstep(0.6, 1.0, hide)), ease(hide));
@@ -233,6 +255,14 @@ uniform vec3 uGain0;
 uniform vec3 uGain1;
 uniform float uHasPhoto0;
 uniform float uHasPhoto1;
+uniform sampler2D uFill0;
+uniform sampler2D uFill1;
+uniform mat4 uFillToClip0;
+uniform mat4 uFillToClip1;
+uniform vec3 uFillCam0;
+uniform vec3 uFillCam1;
+uniform float uHasFill0;
+uniform float uHasFill1;
 uniform float uFade0;
 uniform float uFade1;
 uniform float uAnyPhoto;
@@ -241,7 +271,8 @@ uniform float uLinear;
 uniform vec3 uG0; uniform vec3 uD0; uniform vec3 uAxis0; uniform vec3 uN0; uniform float uOn0; uniform float uBloom0;
 uniform vec3 uG1; uniform vec3 uD1; uniform vec3 uAxis1; uniform vec3 uN1; uniform float uOn1; uniform float uBloom1;
 uniform float uReach;
-uniform float uRamp;
+uniform float uRamp0;
+uniform float uRamp1;
 #if defined(PREVIEW) || defined(LENS_OVERLAY)
 uniform sampler2D uLive;
 uniform mat4 uLiveToClip;
@@ -255,9 +286,11 @@ uniform float uDepthNear;
 uniform vec2 uEyeSize;
 uniform mat4 uNormDepth0;
 uniform mat4 uNormDepth1;
-uniform vec4 uSegA[4];
-uniform vec4 uSegB[4];
+uniform vec4 uSegA[${SEGMENTS}];
+uniform vec4 uSegB[${SEGMENTS}];
 uniform float uOccDebug;
+/** The gate fades out over this much beyond a segment's reach. */
+const float GATE_SOFT = 0.015;
 /** Depth nearer than this is a hole in the depth map, not a hand. */
 const float DEPTH_MIN = 0.12;
 #endif
@@ -283,23 +316,24 @@ const float OTHER_PHOTO = 0.02;
 const float STREAK_LOG2 = 4.0;
 
 /**
- * Moves the photo lookup 's' toward the grabbed column for the part of the band behind the pinch,
- * by how far this grab's streaks have bloomed. Squeezing by 'keep' (0 < keep <= 1) never folds the
- * picture. Returns how streaked this point is.
+ * How far to move the photo lookup toward the grabbed column for the part of the band behind the
+ * pinch, by how far this grab's streaks have bloomed. Squeezing by 'keep' (0 < keep <= 1) never
+ * folds the picture. xyz is the offset, w the band weight it was made at.
  */
-float streakTo(inout vec3 s, vec3 base, vec3 G, vec3 D, vec3 axis, vec3 n, float bloom) {
+vec4 streakOffset(vec3 base, vec3 G, vec3 D, vec3 axis, vec3 n, float bloom, float ramp, out float streak) {
+  streak = 0.0;
   vec3 q = base - G;
   float t = dot(q, axis);
-  if (t >= 0.0) return 0.0;
-  float w = taffySide(q, t, axis, length(D)) * taffyBehind(t) * taffyFlat(dot(q, n));
+  if (t >= 0.0) return vec4(0.0);
+  float w = taffySide(q, t, axis, length(D)) * taffyBehind(t, ramp) * taffyFlat(dot(q, n));
   float keep = exp2(-STREAK_LOG2 * bloom * ease(2.0 * w));
-  s -= axis * (t * (1.0 - keep));
-  return 1.0 - keep;
+  streak = 1.0 - keep;
+  return vec4(-axis * (t * streak), w);
 }
 
 #ifdef ENV_DEPTH
-/** Closest distance between segments p0-p1 and q0-q1. */
-float segmentGap(vec3 p0, vec3 p1, vec3 q0, vec3 q1) {
+/** Closest distance between segments p0-p1 and q0-q1; the closest point on q0-q1 goes to 'onQ'. */
+float segmentClosest(vec3 p0, vec3 p1, vec3 q0, vec3 q1, out vec3 onQ) {
   vec3 d1 = p1 - p0;
   vec3 d2 = q1 - q0;
   vec3 r = p0 - q0;
@@ -318,17 +352,39 @@ float segmentGap(vec3 p0, vec3 p1, vec3 q0, vec3 q1) {
     t = 1.0;
     s = clamp((b - c) / a, 0.0, 1.0);
   }
-  return length(p0 + d1 * s - q0 - d2 * t);
+  onQ = q0 + d2 * t;
+  return length(p0 + d1 * s - onQ);
 }
 
-/** 1 where the line of sight to this point passes through a tracked hand or forearm, 0 well clear. */
-float handGate(vec3 world) {
+/** This eye's position. Under multiview viewMatrix is per eye; cameraPosition is the pair's midpoint. */
+vec3 eyePosition() {
+  return -(transpose(mat3(viewMatrix)) * viewMatrix[3].xyz);
+}
+
+/**
+ * 1 where the line of sight to this point passes through a tracked hand or forearm, 0 well clear.
+ * Also returns how far in front of this eye that hand is there, and how thick it is.
+ */
+float handGate(vec3 world, out float handZ, out float band) {
+  vec3 eye = eyePosition();
   float g = 0.0;
-  for (int i = 0; i < 4; i++) {
-    if (uSegA[i].w < 0.5) continue;
-    float d = segmentGap(cameraPosition, world, uSegA[i].xyz, uSegB[i].xyz);
-    g = max(g, 1.0 - smoothstep(0.6 * uSegB[i].w, uSegB[i].w, d));
+  float nearest = 1e9;
+  vec3 at = world;
+  band = 0.04;
+  for (int i = 0; i < ${SEGMENTS}; i++) {
+    float kind = uSegA[i].w;
+    if (kind < 0.5) continue;
+    vec3 onSeg;
+    float d = segmentClosest(eye, world, uSegA[i].xyz, uSegB[i].xyz, onSeg);
+    float gi = 1.0 - smoothstep(uSegB[i].w, uSegB[i].w + GATE_SOFT, d);
+    if (gi > g || (gi == g && gi > 0.0 && d < nearest)) {
+      g = gi;
+      nearest = d;
+      at = onSeg;
+      band = kind > 1.5 ? 0.04 : 0.045;
+    }
   }
+  handZ = -(viewMatrix * vec4(at, 1.0)).z;
   return g;
 }
 
@@ -338,15 +394,8 @@ float envMeters(vec2 uv, float layer) {
   return m < DEPTH_MIN ? 1e4 : m;
 }
 
-/**
- * How much a real hand or arm stands in front of this point of the stretch, from the headset's
- * depth: 1 shows passthrough's real hand, 0 keeps the stretch. Only near tracked hands, so depth
- * noise elsewhere never punches holes, and with a margin so a pinched sheet stays on the fingers.
- */
-float handOcclusion(vec3 world) {
-  if (uDepthOn < 0.5) return 0.0;
-  float gate = handGate(world);
-  if (gate <= 0.0) return 0.0;
+/** The headset's depth of the real room at this pixel, metres; 1e4 where it has none. */
+float realDepth() {
 #ifdef VIEW_ID
   float eye = float(VIEW_ID);
   vec2 fc = gl_FragCoord.xy;
@@ -355,15 +404,49 @@ float handOcclusion(vec3 world) {
   vec2 fc = gl_FragCoord.xy - vec2(eye * uEyeSize.x, 0.0);
 #endif
   vec2 uv = ((eye < 0.5 ? uNormDepth0 : uNormDepth1) * vec4(fc / uEyeSize, 0.0, 1.0)).xy;
-  vec2 texel = 1.0 / vec2(textureSize(uEnvDepth, 0).xy);
-  // The nearest of five taps, so the cut covers the hand's edge rather than trailing inside it.
+  // The nearest of five taps half a texel apart: covers the hand's edge without dilating it a texel.
+  vec2 texel = 0.5 / vec2(textureSize(uEnvDepth, 0).xy);
   float real = envMeters(uv, eye);
   real = min(real, envMeters(uv + vec2(texel.x, 0.0), eye));
   real = min(real, envMeters(uv - vec2(texel.x, 0.0), eye));
   real = min(real, envMeters(uv + vec2(0.0, texel.y), eye));
   real = min(real, envMeters(uv - vec2(0.0, texel.y), eye));
+  return real;
+}
+
+/**
+ * How much a real hand or arm stands in front of this point of the stretch, from the headset's
+ * depth: 1 shows passthrough's real hand, 0 keeps the stretch. Only along the line of sight to a
+ * tracked hand, and only where the real surface is at that hand's depth: a mug or a lamp beside
+ * the hand is in front of the room too, but it is not the hand.
+ */
+float handOcclusion(vec3 world, out float gate) {
+  float handZ;
+  float band;
+  gate = handGate(world, handZ, band);
+  if (gate <= 0.0 || uDepthOn < 0.5) return 0.0;
+  float real = realDepth();
+  float atHand = 1.0 - smoothstep(band, band + 0.02, abs(real - handZ));
   float margin = 0.01 + 0.02 * vViewZ;
-  return gate * smoothstep(margin, margin + 0.02, vViewZ - real);
+  return gate * atHand * smoothstep(margin, margin + 0.02, vViewZ - real);
+}
+
+/**
+ * Developer views, straight colour and alpha. ?occ=debug: the cut magenta, the gate a faint
+ * cyan. ?occ=delta: real depth minus the room's, red where the real surface is nearer, blue where
+ * it is farther, white where they agree, over a +-8 cm range.
+ */
+vec4 occDebug(vec3 world, float occ, float gate) {
+  if (uOccDebug > 1.5) {
+    if (uDepthOn < 0.5) return vec4(0.0);
+    float real = realDepth();
+    if (real > 1e3) return vec4(0.0);
+    float d = clamp((vViewZ - real) / 0.08, -1.0, 1.0);
+    vec3 c = d > 0.0 ? mix(vec3(1.0), vec3(1.0, 0.1, 0.1), d) : mix(vec3(1.0), vec3(0.1, 0.3, 1.0), -d);
+    return vec4(c, 0.6);
+  }
+  vec3 c = occ > 0.01 ? vec3(1.0, 0.0, 1.0) : vec3(0.0, 1.0, 1.0);
+  return vec4(c, max(occ, 0.2 * gate));
 }
 #endif
 
@@ -375,11 +458,38 @@ float frameCover(vec4 clip, out vec2 uv) {
 }
 
 /**
- * The photos are SRGBColorSpace textures, stored as SRGB8_ALPHA8, so the sampler already returns
- * linear light. Decoding again crushed every photo to a flat grey. textureLod needs no derivatives.
+ * How much of a photo covers this point: inside its frame, and seen from the camera's side of the
+ * surface. Streaks read the grabbed column, so they skip the facing test for surfaces seen edge-on.
  */
-vec3 photo(sampler2D tex, vec2 uv, vec3 gain) {
-  return textureLod(tex, uv, 0.0).rgb * gain;
+float photoCover(mat4 toClip, vec3 cam, float has, vec3 p, vec3 nr, float streaked, out vec2 uv) {
+  float c = has * frameCover(toClip * vec4(p, 1.0), uv);
+  return c * max(step(0.0, dot(nr, cam - vRest)), streaked);
+}
+
+/**
+ * A premultiplied photo texel in linear light. The GPU decodes sRGB per channel after premultiplying,
+ * so a half-transparent edge texel of a hand cut-out came back too dark; that is undone here. Opaque
+ * and empty texels need nothing.
+ */
+vec4 photoTexel(sampler2D tex, vec2 uv) {
+  vec4 t = textureLod(tex, uv, 0.0);
+  if (t.a > 0.004 && t.a < 0.996) {
+    vec3 encoded = sRGBTransferOETF(vec4(t.rgb, 1.0)).rgb / t.a;
+    t.rgb = sRGBTransferEOTF(vec4(encoded, 1.0)).rgb * t.a;
+  }
+  return t;
+}
+
+/**
+ * One slot's picture: its own photo, then its fill wherever the first is masked or off its frame.
+ * The photos are premultiplied SRGB8_ALPHA8, so the sampler returns linear light times alpha
+ * (decoding again crushed every photo to a flat grey). Returns gain * rgb premultiplied, and
+ * coverage in alpha. textureLod needs no derivatives.
+ */
+vec4 slotPicture(sampler2D own, vec2 uv, float c, sampler2D fill, vec2 fuv, float cf, vec3 gain) {
+  vec4 a = c > 0.0 ? photoTexel(own, uv) * c : vec4(0.0);
+  if (cf > 0.0 && a.a < 0.999) a += photoTexel(fill, fuv) * (cf * (1.0 - a.a));
+  return vec4(a.rgb * gain, a.a);
 }
 
 /**
@@ -409,10 +519,8 @@ void main() {
     vec2 luv = lc.xy / max(lc.w, 1e-4) * 0.5 + 0.5;
     bool inside = lc.w > 1e-4 && luv.x >= 0.0 && luv.y >= 0.0 && luv.x <= 1.0 && luv.y <= 1.0;
     float stripe = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / LENS_STRIPE));
-    if (!inside || stripe < 0.5) {
-      gl_FragColor = vec4(0.0);
-      return;
-    }
+    // Discarded, not drawn clear: a clear stripe would still write depth and cut what is behind it.
+    if (!inside || stripe < 0.5) discard;
     writeColor(sRGBTransferEOTF(texture(uLive, luv)).rgb, 1.0);
     return;
   }
@@ -420,32 +528,41 @@ void main() {
 
   // Where the photo is read. The texture rides the surface (rest position) and the streaks pull it
   // toward the grabbed column, per pixel so it is exact on any triangle.
-  vec3 s = vRest;
-  float st = 0.0;
-  if (uOn0 > 0.5 && uBloom0 > 0.0 && vW.x > 0.0) st = streakTo(s, vRest, uG0, uD0, uAxis0, uN0, uBloom0);
-  if (uOn1 > 0.5 && uBloom1 > 0.0 && vW.y > 0.0) st = max(st, streakTo(s, vMid, uG1, uD1, uAxis1, uN1, uBloom1));
+  // Where two grabs' streaks overlap, their pulls on the lookup are averaged, each weighted by its own
+  // size, not added: added, they ran past each other into a mirrored strip. Weighted by size, each
+  // fades out exactly where its pull does, so the blend has no seam at either pinch.
+  float st0 = 0.0;
+  float st1 = 0.0;
+  vec4 o0 = uOn0 > 0.5 && uBloom0 > 0.0 && vW.x > 0.0 ? streakOffset(vRest, uG0, uD0, uAxis0, uN0, uBloom0, uRamp0, st0) : vec4(0.0);
+  vec4 o1 = uOn1 > 0.5 && uBloom1 > 0.0 && vW.y > 0.0 ? streakOffset(vMid, uG1, uD1, uAxis1, uN1, uBloom1, uRamp1, st1) : vec4(0.0);
+  float m0 = length(o0.xyz);
+  float m1 = length(o1.xyz);
+  vec3 s = vRest + (o0.xyz * m0 + o1.xyz * m1) / max(m0 + m1, 1e-5);
+  float st = max(st0, st1);
   // A squeezed zone reads the photo where it is drawn, which is what passthrough shows there,
   // so it fades into the real room without a seam.
   s = mix(s, vWorld, vMask.y);
   st *= 1.0 - vMask.y;
-  float shown = max(smoothstep(0.003, 0.03, vMask.x), smoothstep(0.05, 0.2, st));
+  float shown = max(smoothstep(0.002, 0.02, vMask.x), smoothstep(0.05, 0.2, st));
   // Where the surface barely moved, read the photo where it now sits too: the fade then crossfades
   // one picture with passthrough instead of two offset ones.
   vec3 sr = mix(vWorld, s, shown);
 
+  float streaked = step(0.5, st);
   vec2 uv0;
   vec2 uv1;
-  float c0 = uHasPhoto0 * frameCover(uWorldToClip0 * vec4(sr, 1.0), uv0);
-  float c1 = uHasPhoto1 * frameCover(uWorldToClip1 * vec4(sr, 1.0), uv1);
-  // Streaks read the grabbed column, so they skip the test for surfaces the camera saw edge-on.
-  float streaked = step(0.5, st);
-  c0 *= max(step(0.0, dot(nr, uCamPos0 - vRest)), streaked);
-  c1 *= max(step(0.0, dot(nr, uCamPos1 - vRest)), streaked);
+  vec2 fuv0;
+  vec2 fuv1;
+  float c0 = photoCover(uWorldToClip0, uCamPos0, uHasPhoto0, sr, nr, streaked, uv0);
+  float c1 = photoCover(uWorldToClip1, uCamPos1, uHasPhoto1, sr, nr, streaked, uv1);
+  float cf0 = photoCover(uFillToClip0, uFillCam0, uHasFill0, sr, nr, streaked, fuv0);
+  float cf1 = photoCover(uFillToClip1, uFillCam1, uHasFill1, sr, nr, streaked, fuv1);
 
-  // Both frozen photos are pictures of the same still room, so a moved point may read either one.
-  // Its own grab's photo leads; the other takes over where the first runs off its frame.
-  float k0 = c0 * uFade0;
-  float k1 = c1 * uFade1;
+  // Both slots are pictures of the same still room, so a moved point may read either one.
+  // Its own grab's photo leads; the other takes over where the first is masked or runs off its frame.
+  // Coverage before masks bounds the alpha, so unmoved surfaces leave before any texture is read.
+  float k0 = max(c0, cf0) * uFade0;
+  float k1 = max(c1, cf1) * uFade1;
   float own = max(smoothstep(0.0, 0.01, vW.x), smoothstep(0.0, 0.01, vW.y));
 #ifdef PREVIEW
   // Desk without a webcam: a faint frost keeps the demo visible.
@@ -455,10 +572,6 @@ void main() {
   const float frost = 0.0;
 #endif
   float alpha = shown * max(own * max(k0, k1), frost);
-#ifdef ENV_DEPTH
-  float occ = handOcclusion(vWorld);
-  alpha = uOccDebug > 0.5 ? max(alpha, occ) : alpha * (1.0 - occ);
-#endif
 
 #ifdef PREVIEW
   vec3 back = vec3(0.16) * (0.65 + 0.35 * abs(normalize(nr).y));
@@ -471,6 +584,20 @@ void main() {
     }
   }
 #else
+#ifdef ENV_DEPTH
+  float gate = 0.0;
+  float occ = 0.0;
+  vec4 dbg = vec4(0.0);
+  // Developer views draw wherever the room is, moved or not. Otherwise only moved points are tested.
+  if (uOccDebug > 0.5) {
+    occ = handOcclusion(vWorld, gate);
+    dbg = occDebug(vWorld, occ, gate);
+    if (alpha < 0.002 && dbg.a > 0.002) {
+      writeColor(dbg.rgb, dbg.a);
+      return;
+    }
+  }
+#endif
   // Unmoved surfaces stay real. Depth is still written so a nearer surface wins.
   if (alpha < 0.002) {
     gl_FragColor = vec4(0.0);
@@ -478,21 +605,34 @@ void main() {
   }
 #endif
 
-  float w0 = k0 * (max(vW.x, 0.0) + OTHER_PHOTO);
-  float w1 = k1 * (max(vW.y, 0.0) + OTHER_PHOTO);
-  vec3 col = vec3(0.0);
-  if (w0 > 0.0) col += photo(uPhoto0, uv0, uGain0) * w0;
-  if (w1 > 0.0) col += photo(uPhoto1, uv1, uGain1) * w1;
+  // Masked texels carry alpha 0: they drop out of both the colour and the alpha, never smear.
+  vec4 p0 = k0 > 0.0 ? slotPicture(uPhoto0, uv0, c0, uFill0, fuv0, cf0, uGain0) : vec4(0.0);
+  vec4 p1 = k1 > 0.0 ? slotPicture(uPhoto1, uv1, c1, uFill1, fuv1, cf1, uGain1) : vec4(0.0);
+  float w0 = uFade0 * (max(vW.x, 0.0) + OTHER_PHOTO);
+  float w1 = uFade1 * (max(vW.y, 0.0) + OTHER_PHOTO);
+  float cover = p0.a * w0 + p1.a * w1;
+  vec3 col = (p0.rgb * w0 + p1.rgb * w1) / max(cover, 1e-7);
+  alpha = shown * max(own * max(p0.a * uFade0, p1.a * uFade1), frost);
+#ifdef ENV_DEPTH
+  // Debug views paint the cut instead of cutting.
+  if (uOccDebug < 0.5) {
+    occ = handOcclusion(vWorld, gate);
+    alpha *= 1.0 - occ;
+  }
+#endif
 #ifdef PREVIEW
-  col = w0 + w1 > 1e-7 ? col / (w0 + w1) : vec3(0.92);
+  col = cover > 1e-7 ? col : vec3(0.92);
   col = mix(back, col, alpha);
   gl_FragColor = vec4(col, 1.0);
   #include <colorspace_fragment>
 #else
-  col /= max(w0 + w1, 1e-7);
 #ifdef ENV_DEPTH
-  // ?occ=debug: the depth cut in magenta instead of a hole.
-  if (uOccDebug > 0.5) col = mix(col, vec3(1.0, 0.0, 1.0), occ);
+  if (dbg.a > 0.0) {
+    // Over the stretch, premultiplied: a debug colour over a masked hole stays its own colour.
+    vec4 over = vec4(dbg.rgb * dbg.a, dbg.a) + vec4(col * alpha, alpha) * (1.0 - dbg.a);
+    alpha = over.a;
+    col = over.rgb / max(over.a, 1e-5);
+  }
 #endif
   writeColor(col, alpha);
 #endif

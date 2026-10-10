@@ -8,6 +8,8 @@ interface SubdivideRequest {
   edge: number;
   maxTriangles: number;
   planes: SnapPlane[];
+  /** Where you stood: edges are finest around it. */
+  focus: number[] | null;
 }
 
 /** Re-snap the last dense mesh to a new set of planes. `id` is that mesh's subdivide id. */
@@ -42,7 +44,7 @@ let rest: { id: number; positions: Float32Array; indices: Uint32Array; edge: num
 scope.onmessage = (event) => {
   const request = event.data;
   if (request.kind === 'subdivide') {
-    const out = subdivideMesh(request.positions, request.indices, request.edge, request.maxTriangles);
+    const out = subdivideMesh(request.positions, request.indices, request.edge, request.maxTriangles, request.focus);
     rest = { id: request.id, positions: out.positions, indices: out.indices, edge: out.edge };
   } else if (!rest || rest.id !== request.id) {
     return;

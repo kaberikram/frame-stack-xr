@@ -15,21 +15,33 @@ import {
 export type CameraMount = 'left' | 'right' | 'view';
 export type CameraSideSetting = 'auto' | 'left' | 'right';
 
+/** URL developer trims for checking the lens in the headset without a build: `?lensf=863&yaw=-0.23&pitch=&tau=`. */
+const URL_PARAMS = typeof location === 'undefined' ? null : new URLSearchParams(location.search);
+function urlNumber(name: string): number | null {
+  const raw = URL_PARAMS?.get(name);
+  if (raw === null || raw === undefined || raw === '') return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
 /**
- * Quest 3's room cameras as measured through getUserMedia: rectilinear, square pixels, fx = fy = 851 px
- * at 1280 wide (425.5 at 640), and taller or shorter frames are centred crops of the same lens. An
- * 800 px guess drew every photo about 6% too large.
+ * Quest 3's room cameras through getUserMedia: rectilinear, square pixels, and taller or shorter
+ * frames are centred crops of the same lens. fx = fy = 863 px at 1280 wide: the lab figure of 851
+ * drew the far wall 1.4% too large in the `?lens=overlay` check. An 800 px guess was 6% too large.
  */
 const REF_W = 1280;
-const REF_F = 851;
+const REF_F = urlNumber('lensf') ?? 863;
 /**
  * The left camera's mount in the head frame (three.js axes: x right, y up, looking down -Z). It sits in
  * front of its own eye on the visor, about 6.5 cm ahead of the eyes, tilted 11.8° down. The right
- * camera mirrors yaw, roll and x. Lens x is hardware: it does not move with the IPD setting.
+ * camera mirrors yaw, roll and x. Lens x is hardware: it does not move with the IPD setting. Yaw is
+ * the lab's +0.22° turned 0.45° right, which centred the far wall in the overlay check.
  */
-const MOUNT_DEG = { pitch: -11.77, yaw: 0.22, roll: 0.14 };
+const MOUNT_DEG = { pitch: urlNumber('pitch') ?? -11.77, yaw: urlNumber('yaw') ?? -0.23, roll: 0.14 };
 const LENS = { x: 0.0325, y: 0, z: -0.065 };
 const DEG = Math.PI / 180;
+/** Any lens value taken from the URL, for the lens line. */
+const URL_LENS = ['lensf', 'yaw', 'pitch', 'tau'].filter((name) => urlNumber(name) !== null).join(',');
 
 const BANK = 8;
 /** About 1.4 s of head poses at 90 Hz: enough to reach back past the slowest camera stamp. */
@@ -51,9 +63,24 @@ const REFRESH_GAP = 0.5;
 const MAX_AGE = 20;
 /** A photo must hold the whole grab footprint this far inside its edges. */
 const MARGIN = 0.08;
-/** Failing that, a hand-free photo still has to hold the grab point this far in. */
+/**
+ * Failing that, a photo still has to hold the grab point this far in: a share of how far the
+ * footprint spreads in that photo, between these bounds, so a near footprint isn't held to a far one's margin.
+ */
 const CENTER_MARGIN = 0.15;
+const CENTER_MIN = 0.06;
+const CENTER_SHARE = 0.3;
 const HAND_PAD = 0.25;
+/** Hand masks: each joint's disc is its occluder radius plus this, for tracking and exposure lag. */
+const MASK_PAD = 0.025;
+const MASK_JOINT = 0.013;
+const MASK_WRIST = 0.02;
+/** With masked frames, only the grab spot and this ring around it must be clear of hands. */
+const CLEAN_RING = 0.08;
+/** Most footprint points a freeze is given (the grab point and its ring). */
+const FOOTPRINT_MAX = 32;
+/** A probe mean younger than this stands in for measuring the live frame at a pinch. */
+const MEAN_FRESH = 2;
 /** Hand or arm cover below this counts as a clean frame. */
 const CLEANER = 0.02;
 /** Hand and arm cover is measured over nearly the whole frame, on a coarse grid of sample points. */
@@ -84,7 +111,7 @@ const DISPLAY_SLACK = 0.25;
  * is the end of the camera-to-screen pipeline, and arrival or polling is in between.
  */
 type FrameClock = 'capture' | 'expected' | 'arrival' | 'polled';
-const TAU: Record<FrameClock, number> = { capture: 0.01, expected: 0.07, arrival: 0.05, polled: 0.06 };
+const TAU: Record<FrameClock, number> = { capture: urlNumber('tau') ?? 0.025, expected: 0.07, arrival: 0.05, polled: 0.06 };
 
 export interface LensTuning {
   /** Multiplies the measured focal length. Developer trim; 1 is the measured lens. */
@@ -130,6 +157,11 @@ interface PickNote {
   hand: number;
 }
 
+/** Where the hands were at an earlier moment: the joints to cut out of a frame exposed then. */
+export interface JointHistory {
+  jointsAt(time: number): HandJoints | null;
+}
+
 /** Packed world-space joints, with where each hand's run starts and how long it is. */
 export interface HandJoints {
   points: Float32Array;
@@ -160,6 +192,20 @@ interface BankEntry {
   readonly hands: Float32Array;
   /** uv capsule of each forearm: u0, v0, u1, v1, radius per hand. radius < 0 means none. */
   readonly arms: Float32Array;
+  /** Hands and forearms are cut out of the canvas: alpha 0 where they were. */
+  masked: boolean;
+}
+
+/** A second photo behind a slot's own, read only where that one is masked or off its frame. */
+export interface FillPhoto {
+  texture: CanvasTexture | null;
+  has: boolean;
+  /** Its texture has reached the GPU, so its pixels match `toClip`. */
+  ready: boolean;
+  readonly toClip: Matrix4;
+  readonly cam: Vector3;
+  /** Bank seconds-old when chosen, for the photo line. */
+  age: number;
 }
 
 export interface PhotoSlot {
@@ -168,11 +214,14 @@ export interface PhotoSlot {
   has: boolean;
   /** Its texture has actually reached the GPU. Uploads are deferred under multiview. */
   ready: boolean;
-  /** The live frame with the pinching hand painted out: stretch it, but never streak the painted strip. */
-  painted: boolean;
+  /** Hands are cut out of this photo. A live frame always is: stretch it, but never streak the hole. */
+  masked: boolean;
+  /** It is the live frame from the pinch, not a bank photo. */
+  live: boolean;
   readonly toClip: Matrix4;
   readonly cam: Vector3;
   readonly gain: Vector3;
+  readonly fill: FillPhoto;
 }
 
 interface SlotStore {
@@ -233,8 +282,21 @@ export class PassthroughPhoto {
     latency: 0, exposure: 1.1, warmth: -0.1, tint: 0,
   };
 
+  /** Textures created since the last drain: the system uploads them once, so a pinch never allocates. */
+  readonly warmList: CanvasTexture[] = [];
+  /**
+   * The hands' recent past. Tracking predicts the hands for the display time, but a camera frame
+   * was exposed ~0.1 s earlier: its masks and hand boxes must come from where the hands were then.
+   */
+  history: JointHistory | null = null;
+
   private readonly bank: BankEntry[] = [];
   private readonly stores: [SlotStore, SlotStore];
+  private readonly fillStores: [SlotStore, SlotStore];
+  /** Bank entries a freeze chose as fills, copied in at the start of the next frame. */
+  private readonly pendingFill: [BankEntry | null, BankEntry | null] = [null, null];
+  private readonly inner = new Float32Array(FOOTPRINT_MAX * 3);
+  private measuredAt = -Infinity;
   private readonly probe: HTMLCanvasElement;
   private readonly probeCtx: CanvasRenderingContext2D;
   private readonly probeMean: MeanRgb = { r: 0, g: 0, b: 0, lum: 0 };
@@ -293,14 +355,17 @@ export class PassthroughPhoto {
       this.bank.push({
         canvas, ctx, used: false, w: 0, h: 0, time: 0, r: 0, g: 0, b: 0, lum: 0,
         toClip: new Matrix4(), cam: new Vector3(), dir: new Vector3(), hands: new Float32Array(8), arms: new Float32Array(10),
+        masked: false,
       });
     }
     this.stores = [makeStore(), makeStore()];
+    this.fillStores = [makeStore(), makeStore()];
     this.slots = [makeSlot(), makeSlot()];
     this.probe = document.createElement('canvas');
     this.probe.width = PROBE_W;
     this.probe.height = PROBE_H;
-    const probeCtx = this.probe.getContext('2d', { willReadFrequently: true });
+    // GPU-backed on purpose: a CPU canvas would read the whole camera frame back for a 16x12 mean.
+    const probeCtx = this.probe.getContext('2d');
     if (!probeCtx) throw new Error('2D canvas is unavailable');
     this.probeCtx = probeCtx;
   }
@@ -358,6 +423,8 @@ export class PassthroughPhoto {
       this.videoH = video.videoHeight;
       this.activeAt = now;
       for (let i = 0; i < this.bank.length; i++) this.bank[i].used = false;
+      this.measuredAt = -Infinity;
+      this.prepare(this.videoW, this.videoH);
       console.info(`[jonze] camera frame ${this.videoW}x${this.videoH}`);
     }
     if (track && track !== this.loggedTrack) {
@@ -436,6 +503,8 @@ export class PassthroughPhoto {
    * be tracked isn't, since it could be anywhere in the picture. `steady` covers the desk preview.
    */
   capture(presenting: boolean, viewCamera: PerspectiveCamera, joints: HandJoints | null, handsKnown: boolean, now: number): void {
+    // Before anything can overwrite a bank entry that a freeze picked as a fill.
+    this.flushFills();
     const video = this.video;
     if (!video || !this.videoW || !handsKnown) return;
     if (now - this.activeAt < WARMUP || now - this.lastAdmit < ADMIT_GAP) return;
@@ -458,6 +527,7 @@ export class PassthroughPhoto {
         this.polledFrames = frames;
       }
       captured = this.exposedAt(now);
+      joints = this.history?.jointsAt(captured) ?? joints;
       this.notePath();
       if (!this.steady(captured - 0.06, now)) {
         this.stats.unsteady++;
@@ -472,7 +542,7 @@ export class PassthroughPhoto {
     const entry = this.pick(presenting, viewCamera, joints, now);
     this.lastAdmit = now;
     if (!entry) return;
-    if (!this.measure(video)) {
+    if (!this.measure(video, now)) {
       this.stats.dark++;
       return;
     }
@@ -483,7 +553,9 @@ export class PassthroughPhoto {
       entry.canvas.width = this.videoW;
       entry.canvas.height = this.videoH;
     }
+    entry.ctx.clearRect(0, 0, this.videoW, this.videoH);
     entry.ctx.drawImage(video, 0, 0, this.videoW, this.videoH);
+    entry.masked = this.maskHands(entry.ctx, this.videoW, this.videoH, entry.toClip, joints);
     entry.used = true;
     entry.w = this.videoW;
     entry.h = this.videoH;
@@ -498,9 +570,10 @@ export class PassthroughPhoto {
 
   /**
    * Freezes a photo into slot `k` for a grab whose footprint is `count` world points, the grab
-   * point first. Prefers a recent bank frame with no hand on the footprint: one that holds all of
-   * it, else one that holds the grab point well inside (the rest feathers out). Only then the live
-   * frame, which has the pinching hand in it. False when nothing usable exists.
+   * point first. Prefers a recent bank frame with no hand on the grab spot: one that holds all of
+   * the footprint, else one that holds the grab point well inside (the rest feathers out). Only then
+   * the live frame, with its hands cut out. Either way a second bank photo is lined up behind it as
+   * a fill for whatever the first is missing. False when nothing usable exists.
    */
   freeze(
     k: 0 | 1,
@@ -518,6 +591,7 @@ export class PassthroughPhoto {
     note.old = 0;
     note.edge = 0;
     note.hand = 0;
+    const inner = this.innerRing(footprint, count);
     let best: BankEntry | null = null;
     let bestScore = -Infinity;
     let bestMargin = 0;
@@ -527,25 +601,26 @@ export class PassthroughPhoto {
       const entry = this.bank[i];
       if (!entry.used) continue;
       note.seen++;
-      if (now - entry.time > MAX_AGE) {
-        note.old++;
-        continue;
-      }
+      const age = now - entry.time;
+      // The room is still: an old photo is only less likely to match, so it is scored down, not dropped.
+      const old = age > MAX_AGE;
+      if (old) note.old++;
       const center = footprintMargin(entry.toClip, footprint, 1);
-      if (center < CENTER_MARGIN) {
+      const need = Math.min(CENTER_MARGIN, Math.max(CENTER_MIN, CENTER_SHARE * footprintSpread(entry.toClip, footprint, count)));
+      if (center < need) {
         note.edge++;
         continue;
       }
-      if (touchesHands(entry, footprint, count)) {
+      if (touchesHands(entry, inner, count)) {
         note.hand++;
         continue;
       }
       const margin = footprintMargin(entry.toClip, footprint, count);
-      const tier = margin >= MARGIN ? 2 : 1;
+      const tier = margin >= MARGIN && !old ? 2 : 1;
       const held = margin >= MARGIN ? margin : center;
       // Within a tier: fresh, and taken from near where you stand, so edges don't double.
       const base = entry.cam.distanceTo(eye);
-      const score = tier * 10 + held / ((1 + (now - entry.time) / 6) * (1 + base / BASE_HALF));
+      const score = tier * 10 + held / ((1 + age / 6) * (1 + base / BASE_HALF));
       if (score > bestScore) {
         bestScore = score;
         best = entry;
@@ -554,17 +629,20 @@ export class PassthroughPhoto {
         bestBase = base;
       }
     }
+    const slot = this.slots[k];
     if (best) {
       this.fill(k, best.canvas, best.w, best.h, best);
-      this.slots[k].painted = false;
-      this.slots[k].toClip.copy(best.toClip);
-      this.slots[k].cam.copy(best.cam);
+      slot.masked = best.masked;
+      slot.live = false;
+      slot.toClip.copy(best.toClip);
+      slot.cam.copy(best.cam);
       note.source = 'bank';
       note.base = bestBase;
       note.age = now - best.time;
       note.margin = bestMargin;
       note.tier = bestTier;
       this.lastMiss = 'none';
+      this.chooseFill(k, footprint, count, best, now, eye);
       return true;
     }
     const video = this.video;
@@ -581,7 +659,9 @@ export class PassthroughPhoto {
       this.lastMiss = 'off-frame';
       return false;
     }
-    if (!this.measure(video)) {
+    // A pinch frame must stay light: the last capture's mean stands in for a fresh readback.
+    const fresh = now - this.measuredAt < MEAN_FRESH && this.probeMean.lum >= DARK;
+    if (!fresh && !this.measure(video, now)) {
       this.lastMiss = 'dark';
       return false;
     }
@@ -592,9 +672,14 @@ export class PassthroughPhoto {
     note.margin = margin;
     note.tier = 0;
     this.fill(k, video, this.videoW, this.videoH, this.probeMean);
-    this.slots[k].painted = this.smearHands(k, joints);
-    this.slots[k].toClip.copy(this.worldToClip);
-    this.slots[k].cam.copy(this.liveCam);
+    const store = this.stores[k];
+    const then = presenting ? this.history?.jointsAt(this.exposedAt(now)) ?? joints : joints;
+    // Its grabbed column sits next to the hand, so `live` alone keeps streaks off without a fill.
+    slot.masked = this.maskHands(store.ctx, store.w, store.h, this.worldToClip, then);
+    slot.live = true;
+    slot.toClip.copy(this.worldToClip);
+    slot.cam.copy(this.liveCam);
+    this.chooseFill(k, footprint, count, null, now, eye);
     return true;
   }
 
@@ -605,11 +690,14 @@ export class PassthroughPhoto {
     const bank = `${n.seen}/${BANK} o${n.old} e${n.edge} h${n.hand}`;
     const st = this.stats;
     const health = `a${st.admitted} d${st.dark} u${st.unsteady} x${st.dirtier}`;
+    const fill = this.slots[k].fill;
+    const behind = this.pendingFill[k] || fill.has ? ` +fill ${fill.age.toFixed(0)}s` : '';
     if (n.source === 'bank') {
-      return `photo ${side}: bank ${n.age.toFixed(1)}s base=${n.base.toFixed(2)}m t${n.tier} | ${bank}`;
+      const masked = this.slots[k].masked ? ' masked' : '';
+      return `photo ${side}: bank ${n.age.toFixed(1)}s base=${n.base.toFixed(2)}m t${n.tier}${masked}${behind} | ${bank}`;
     }
     if (n.source === 'live') {
-      return `photo ${side}: live${this.slots[k].painted ? ' painted' : ''} | ${bank} | ${health}`;
+      return `photo ${side}: live${this.slots[k].masked ? ' masked' : ''}${behind} | ${bank} | ${health}`;
     }
     return `photo ${side}: none (${this.lastMiss}) | ${bank} | ${health}`;
   }
@@ -628,13 +716,16 @@ export class PassthroughPhoto {
 
   drop(k: 0 | 1): void {
     this.slots[k].has = false;
+    this.slots[k].fill.has = false;
+    this.pendingFill[k] = null;
   }
 
   /** Forget every frame: a new session, a recentred space, or a restarted camera. */
   clear(): void {
     for (let i = 0; i < this.bank.length; i++) this.bank[i].used = false;
-    this.slots[0].has = false;
-    this.slots[1].has = false;
+    this.drop(0);
+    this.drop(1);
+    this.measuredAt = -Infinity;
     this.poseCount = 0;
     this.poseHead = -1;
     this.lastAdmit = -Infinity;
@@ -654,6 +745,8 @@ export class PassthroughPhoto {
     for (let k = 0; k < 2; k++) {
       this.slots[k].texture?.dispose();
       this.slots[k].texture = null;
+      this.slots[k].fill.texture?.dispose();
+      this.slots[k].fill.texture = null;
     }
   }
 
@@ -703,22 +796,39 @@ export class PassthroughPhoto {
     console.info(
       `[jonze] lens f=${this.focalPx().toFixed(0)} pyr=${sign(MOUNT_DEG.pitch + lens.pitchTrim)}/` +
         `${sign(MOUNT_DEG.yaw + lens.yawTrim)}/${sign(MOUNT_DEG.roll + lens.rollTrim)} ` +
-        `cam=${this.side === 'left' ? 'L' : 'R'} ${e.x.toFixed(3)},${e.y.toFixed(3)},${e.z.toFixed(3)}`,
+        `cam=${this.side === 'left' ? 'L' : 'R'} ${e.x.toFixed(3)},${e.y.toFixed(3)},${e.z.toFixed(3)}` +
+        (URL_LENS ? ` url=${URL_LENS}` : ''),
     );
+  }
+
+  /**
+   * Sizes every slot and fill canvas to the camera frame and makes their textures now, at camera
+   * start, so the first pinch neither allocates nor uploads into fresh storage.
+   */
+  private prepare(w: number, h: number): void {
+    for (let k = 0; k < 2; k++) {
+      const slot = this.slots[k];
+      if (sizeStore(this.stores[k], w, h) || !slot.texture) {
+        slot.texture?.dispose();
+        slot.texture = makeTexture(this.stores[k].canvas, slot);
+        this.warmList.push(slot.texture);
+      }
+      const fill = slot.fill;
+      if (sizeStore(this.fillStores[k], w, h) || !fill.texture) {
+        fill.texture?.dispose();
+        fill.texture = makeTexture(this.fillStores[k].canvas, fill);
+        this.warmList.push(fill.texture);
+      }
+    }
   }
 
   /** Copies a source into slot `k`'s own canvas, rebuilding its texture when the size changes. */
   private fill(k: 0 | 1, source: CanvasImageSource, w: number, h: number, rgb: MeanRgb): void {
     const store = this.stores[k];
     const slot = this.slots[k];
-    if (store.w !== w || store.h !== h || !slot.texture) {
-      store.canvas.width = w;
-      store.canvas.height = h;
-      store.w = w;
-      store.h = h;
-      slot.texture?.dispose();
-      slot.texture = makeTexture(store.canvas, slot);
-    }
+    if (store.w !== w || store.h !== h || !slot.texture) this.prepare(w, h);
+    // Masked sources have holes: what the canvas held before must not show through them.
+    store.ctx.clearRect(0, 0, w, h);
     store.ctx.drawImage(source, 0, 0, w, h);
     store.r = rgb.r;
     store.g = rgb.g;
@@ -742,7 +852,8 @@ export class PassthroughPhoto {
   }
 
   /** Mean linear RGB of the video, from a tiny copy. False when the frame is still black. */
-  private measure(video: HTMLVideoElement): boolean {
+  private measure(video: HTMLVideoElement, now: number): boolean {
+    this.measuredAt = now;
     this.probeCtx.drawImage(video, 0, 0, PROBE_W, PROBE_H);
     const data = this.probeCtx.getImageData(0, 0, PROBE_W, PROBE_H).data;
     let r = 0;
@@ -782,17 +893,30 @@ export class PassthroughPhoto {
     }
     let chosen: BankEntry | null = null;
     const incoming = coverage(this.boxesFor(joints, toClip), this.armsFor(joints, toClip));
+    // Every entry of this view: the cleanest-first copy, and at most one masked companion.
+    let first: BankEntry | null = null;
+    let twin: BankEntry | null = null;
     for (let i = 0; i < this.bank.length; i++) {
       const entry = this.bank[i];
       if (!entry.used || entry.dir.dot(dir) <= SAME_VIEW || entry.cam.distanceToSquared(cam) > SAME_PLACE_SQ) continue;
-      const age = now - entry.time;
-      if (age < REFRESH_GAP) return null;
-      if (age < MAX_AGE && incoming > CLEANER && incoming > coverage(entry.hands, entry.arms)) {
-        this.stats.dirtier++;
-        return null;
+      if (now - entry.time < REFRESH_GAP) return null;
+      if (!first || coverage(entry.hands, entry.arms) < coverage(first.hands, first.arms)) {
+        twin = first;
+        first = entry;
+      } else if (!twin) {
+        twin = entry;
       }
-      chosen = entry;
-      break;
+    }
+    if (first) {
+      const age = now - first.time;
+      if (age < MAX_AGE && incoming > CLEANER && incoming > coverage(first.hands, first.arms)) {
+        // Keep the cleaner view; with room to spare keep this one too as its one companion, since
+        // its hands are masked. The companion is refreshed in place, never multiplied.
+        const spare = twin ?? this.freeEntry();
+        if (!spare) this.stats.dirtier++;
+        return spare;
+      }
+      chosen = first;
     }
     if (!chosen) {
       for (let i = 0; i < this.bank.length; i++) {
@@ -872,14 +996,131 @@ export class PassthroughPhoto {
     box[o + 3] = v1 + padV;
   }
 
-  /** Stretches a strip of nearby pixels across each hand box. True when anything was painted. */
-  private smearHands(k: 0 | 1, joints: HandJoints | null): boolean {
-    if (!joints) return false;
-    const store = this.stores[k];
-    const box = this.boxesFor(joints, this.worldToClip);
-    const left = paintOutHand(store, box, 0);
-    const right = paintOutHand(store, box, 4);
-    return left || right;
+  /**
+   * Cuts the hands and forearms out of a frame drawn with `clip`: a disc on every joint and a
+   * round-capped stroke up each forearm, made transparent. A stretch reads alpha 0 as "no picture
+   * here", falls back to another photo, and otherwise shows passthrough. True when anything was cut.
+   */
+  private maskHands(ctx: CanvasRenderingContext2D, w: number, h: number, clip: Matrix4, joints: HandJoints | null): boolean {
+    if (!joints || (joints.leftCount <= 0 && joints.rightCount <= 0)) return false;
+    const e = clip.elements;
+    const pxPerM = this.fxOverW() * w;
+    let any = false;
+    ctx.save();
+    ctx.globalCompositeOperation = 'destination-out';
+    ctx.fillStyle = '#000';
+    ctx.strokeStyle = '#000';
+    ctx.beginPath();
+    for (let side = 0; side < 2; side++) {
+      const start = side === 0 ? joints.leftStart : joints.rightStart;
+      const count = side === 0 ? joints.leftCount : joints.rightCount;
+      for (let i = start; i < start + count; i++) {
+        const x = joints.points[i * 3];
+        const y = joints.points[i * 3 + 1];
+        const z = joints.points[i * 3 + 2];
+        const cw = e[3] * x + e[7] * y + e[11] * z + e[15];
+        if (cw <= 1e-4) continue;
+        const px = (((e[0] * x + e[4] * y + e[8] * z + e[12]) / cw) * 0.5 + 0.5) * w;
+        const py = (0.5 - ((e[1] * x + e[5] * y + e[9] * z + e[13]) / cw) * 0.5) * h;
+        const r = ((i === start ? MASK_WRIST : MASK_JOINT) + MASK_PAD) * pxPerM / cw;
+        ctx.moveTo(px + r, py);
+        ctx.arc(px, py, r, 0, Math.PI * 2);
+        any = true;
+      }
+    }
+    ctx.fill();
+    ctx.lineCap = 'round';
+    const arms = this.scratchArms;
+    for (let side = 0; side < 2; side++) {
+      writeArm(arms, clip, joints, side, this.fxOverW());
+      const o = side * 5;
+      if (arms[o + 4] < 0) continue;
+      ctx.lineWidth = 2 * arms[o + 4] * w;
+      ctx.beginPath();
+      ctx.moveTo(arms[o] * w, (1 - arms[o + 1]) * h);
+      ctx.lineTo(arms[o + 2] * w, (1 - arms[o + 3]) * h);
+      ctx.stroke();
+      any = true;
+    }
+    ctx.restore();
+    return any;
+  }
+
+  /**
+   * Lines up a second bank photo behind slot `k`'s own: the one that best holds the grab spot,
+   * other than `except`. Copied in next frame, so the pinch frame carries one copy, not two. A live
+   * photo (`except` null) is cut out at the grab spot itself, and its streaks read exactly there, so
+   * its fill must be clear of hands there.
+   */
+  private chooseFill(k: 0 | 1, footprint: Float32Array, count: number, except: BankEntry | null, now: number, eye: Vector3): void {
+    this.slots[k].fill.has = false;
+    this.pendingFill[k] = null;
+    let best: BankEntry | null = null;
+    let bestScore = 0;
+    for (let i = 0; i < this.bank.length; i++) {
+      const entry = this.bank[i];
+      if (!entry.used || entry === except) continue;
+      const center = footprintMargin(entry.toClip, footprint, 1);
+      if (center < 0.02) continue;
+      // freeze() left the grab spot's inner ring in `inner`.
+      if (except === null && touchesHands(entry, this.inner, count)) continue;
+      const age = now - entry.time;
+      const score = center / ((1 + age / 6) * (1 + entry.cam.distanceTo(eye) / BASE_HALF));
+      if (score > bestScore) {
+        bestScore = score;
+        best = entry;
+      }
+    }
+    if (!best) return;
+    this.pendingFill[k] = best;
+    this.slots[k].fill.age = now - best.time;
+  }
+
+  /** Copies the fills chosen last frame into their slots. */
+  private flushFills(): void {
+    for (let k = 0; k < 2; k++) {
+      const entry = this.pendingFill[k];
+      if (!entry) continue;
+      this.pendingFill[k] = null;
+      const store = this.fillStores[k];
+      const fill = this.slots[k].fill;
+      if (!entry.used || !this.slots[k].has) continue;
+      if (store.w !== entry.w || store.h !== entry.h || !fill.texture) this.prepare(entry.w, entry.h);
+      store.ctx.clearRect(0, 0, store.w, store.h);
+      store.ctx.drawImage(entry.canvas, 0, 0, store.w, store.h);
+      fill.toClip.copy(entry.toClip);
+      fill.cam.copy(entry.cam);
+      fill.has = true;
+      fill.ready = false;
+      if (fill.texture) fill.texture.needsUpdate = true;
+    }
+  }
+
+  /** An unused bank entry, or null when all eight hold photos. */
+  private freeEntry(): BankEntry | null {
+    for (let i = 0; i < this.bank.length; i++) if (!this.bank[i].used) return this.bank[i];
+    return null;
+  }
+
+  /** The footprint shrunk to CLEAN_RING around its grab point, in a scratch buffer. */
+  private innerRing(footprint: Float32Array, count: number): Float32Array {
+    const out = this.inner;
+    const cx = footprint[0];
+    const cy = footprint[1];
+    const cz = footprint[2];
+    out[0] = cx;
+    out[1] = cy;
+    out[2] = cz;
+    for (let i = 1; i < count && i < FOOTPRINT_MAX; i++) {
+      const dx = footprint[i * 3] - cx;
+      const dy = footprint[i * 3 + 1] - cy;
+      const dz = footprint[i * 3 + 2] - cz;
+      const k = CLEAN_RING / Math.max(1e-6, Math.hypot(dx, dy, dz));
+      out[i * 3] = cx + dx * k;
+      out[i * 3 + 1] = cy + dy * k;
+      out[i * 3 + 2] = cz + dz * k;
+    }
+    return out;
   }
 
   /** True when the head turned less than ~8°/s and moved less than 0.1 m/s between two times. */
@@ -1057,41 +1298,31 @@ function coverage(box: Float32Array, arms: Float32Array): number {
   return covered / (COVER_GRID * COVER_GRID);
 }
 
-function paintOutHand(store: SlotStore, box: Float32Array, o: number): boolean {
-  if (box[o] > box[o + 2]) return false;
-  const { ctx, canvas, w, h } = store;
-  const x0 = Math.max(0, Math.min(w - 1, Math.floor(box[o] * w)));
-  const x1 = Math.max(0, Math.min(w, Math.ceil(box[o + 2] * w)));
-  const y0 = Math.max(0, Math.min(h - 1, Math.floor((1 - box[o + 3]) * h)));
-  const y1 = Math.max(0, Math.min(h, Math.ceil((1 - box[o + 1]) * h)));
-  const dw = x1 - x0;
-  const dh = y1 - y0;
-  if (dw < 2 || dh < 2) return false;
-  const sw = Math.max(4, Math.round(dw * 0.08));
-  let sx = x0 - sw - 2;
-  if (sx < 0) sx = x1 + 2;
-  if (sx >= 0 && sx + sw <= w) {
-    ctx.drawImage(canvas, sx, y0, sw, dh, x0, y0, dw, dh);
-    return true;
-  }
-  const sh = Math.max(4, Math.round(Math.min(12, dh)));
-  let sy = y0 - sh - 2;
-  if (sy < 0) sy = y1 + 2;
-  if (sy < 0 || sy + sh > h) return false;
-  ctx.drawImage(canvas, x0, sy, dw, sh, x0, y0, dw, dh);
-  return true;
-}
-
 function makeSlot(): PhotoSlot {
   return {
-    texture: null, has: false, ready: false, painted: false,
+    texture: null, has: false, ready: false, masked: false, live: false,
     toClip: new Matrix4(), cam: new Vector3(), gain: new Vector3(1, 1, 1),
+    fill: { texture: null, has: false, ready: false, toClip: new Matrix4(), cam: new Vector3(), age: 0 },
   };
 }
 
-/** Created at the frame's real size: three allocates immutable storage on the first upload. */
-function makeTexture(canvas: HTMLCanvasElement, slot: PhotoSlot): CanvasTexture {
+/** Resizes a store's canvas to w x h. True when it changed, so its texture must be remade. */
+function sizeStore(store: SlotStore, w: number, h: number): boolean {
+  if (store.w === w && store.h === h) return false;
+  store.canvas.width = w;
+  store.canvas.height = h;
+  store.w = w;
+  store.h = h;
+  return true;
+}
+
+/**
+ * Created at the frame's real size: three allocates immutable storage on the first upload.
+ * Premultiplied, so the hand masks' alpha filters cleanly; the shader divides it back out.
+ */
+function makeTexture(canvas: HTMLCanvasElement, slot: { ready: boolean }): CanvasTexture {
   const tex = new CanvasTexture(canvas);
+  tex.premultiplyAlpha = true;
   tex.colorSpace = SRGBColorSpace;
   tex.minFilter = LinearFilter;
   tex.magFilter = LinearFilter;
@@ -1123,6 +1354,30 @@ function footprintMargin(clip: Matrix4, points: Float32Array, count: number): nu
     if (low < 0) return low;
   }
   return low;
+}
+
+/** How far the footprint's ring spreads from its grab point in a frame's uv. */
+function footprintSpread(clip: Matrix4, points: Float32Array, count: number): number {
+  const e = clip.elements;
+  const x0 = points[0];
+  const y0 = points[1];
+  const z0 = points[2];
+  const w0 = e[3] * x0 + e[7] * y0 + e[11] * z0 + e[15];
+  if (w0 <= 1e-4) return 0;
+  const u0 = (e[0] * x0 + e[4] * y0 + e[8] * z0 + e[12]) / w0;
+  const v0 = (e[1] * x0 + e[5] * y0 + e[9] * z0 + e[13]) / w0;
+  let far = 0;
+  for (let i = 1; i < count; i++) {
+    const x = points[i * 3];
+    const y = points[i * 3 + 1];
+    const z = points[i * 3 + 2];
+    const w = e[3] * x + e[7] * y + e[11] * z + e[15];
+    if (w <= 1e-4) continue;
+    const du = (e[0] * x + e[4] * y + e[8] * z + e[12]) / w - u0;
+    const dv = (e[1] * x + e[5] * y + e[9] * z + e[13]) / w - v0;
+    far = Math.max(far, 0.5 * Math.hypot(du, dv));
+  }
+  return far;
 }
 
 /** True when any footprint point lands in a hand box or forearm capsule of that frame. */

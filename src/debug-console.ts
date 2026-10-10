@@ -85,13 +85,20 @@ const SHADER_ERROR = /ERROR: *\d+:(\d+): *(.*)/;
 const SHADER_SOURCE = /^> *\d+: *(.*)$/m;
 
 const PARAM = typeof location === 'undefined' ? null : new URLSearchParams(location.search).get('debug');
+/** Browser hints about choices made on purpose: shown, but as plain lines, not warnings. */
+const BENIGN = /willReadFrequently/;
+/** One-shot session lines that must stay on the panel however much else is logged after them. */
+const PINNED = /^(build|session|depth|camera pick|camera frames|lens f=|xr multiview)\b/;
 
 /** The last ROWS lines, oldest first, in arrays allocated once. */
 class ConsoleLines {
   readonly text: string[] = new Array<string>(ROWS).fill('');
   readonly level = new Uint8Array(ROWS);
   readonly tagged = new Uint8Array(ROWS);
-  /** Which line a full buffer drops first: log 0, info 1, warn 2, [jonze] 3, [jonze] warn 4, error 5. */
+  /**
+   * Which line a full buffer drops first: log 0, info 1, [jonze] 3, any warn 4, the newest session line
+   * of each kind 5, error 6. An older copy of a session line drops back to 3.
+   */
   readonly rank = new Uint8Array(ROWS);
   readonly repeat = new Uint32Array(ROWS);
   readonly time = new Float64Array(ROWS);
@@ -108,6 +115,7 @@ class ConsoleLines {
   presenting = false;
 
   push(level: Level, raw: string, now: number): void {
+    if (level === Level.Warn && BENIGN.test(raw)) level = Level.Log;
     let line = raw;
     let tagged = 0;
     if (line.startsWith(TAG)) {
@@ -129,7 +137,13 @@ class ConsoleLines {
       }
       return;
     }
-    const rank = level === Level.Error ? 5 : tagged ? (level === Level.Warn ? 4 : 3) : level;
+    const pinned = tagged && level < Level.Warn ? PINNED.exec(line) : null;
+    if (pinned) {
+      for (let i = 0; i < this.count; i++) {
+        if (this.rank[i] === 5 && this.text[i].startsWith(pinned[1])) this.rank[i] = 3;
+      }
+    }
+    const rank = level === Level.Error ? 6 : level === Level.Warn ? 4 : pinned ? 5 : tagged ? 3 : level;
     let at = this.count;
     if (at < ROWS) {
       this.count++;
