@@ -40,9 +40,22 @@ const SIDES: readonly Side[] = ['left', 'right'];
 const DEAD = 0.03;
 /** Rigid chunk that rides ahead of the pinch, metres. */
 const AHEAD = 0.3;
-/** Slides beyond SLIDE_SOFT ease into SLIDE_MAX. */
+/**
+ * Slides beyond a soft cap ease into a hard one. Both scale with what is being stretched: the span
+ * between two hands on one surface, or one hand's ramp. They never exceed these.
+ */
 const SLIDE_SOFT = 1;
 const SLIDE_MAX = 1.5;
+const SOFT_PER_SPAN = 2;
+const MAX_PER_SPAN = 3;
+/** Two grabs whose normals are within ~25° are on one surface and share a span. */
+const SAME_SURFACE = Math.cos((25 * Math.PI) / 180);
+/** Ramps stay as set up to this distance and grow in proportion beyond it, so far pulls bend alike. */
+const RAMP_NEAR = 0.8;
+/** The smoothing step never exceeds this: a long frame cannot land a whole pull at once. */
+const STEP_MAX = 1 / 50;
+/** The surface never follows faster than this, m/s. */
+const FOLLOW_MAX = 2.5;
 /** The pinch ray must meet the grabbed plane within ~78° of its normal to slide. */
 const GRAZE = 0.2;
 /** Toward-you travel ignored, and how much sideways travel cancels it (a shoulder sweep shortens reach too). */
@@ -88,8 +101,12 @@ const ONSET_FRAMES = 12;
 const PLANE_IN_FRONT = 0.05;
 const PLANE_BEHIND = 0.03;
 const FOOTPRINT = 9;
-/** Streaks bloom over this many metres of pull after `stripes`. The shader and the sparkle both read it. */
-const STREAK_SPAN = 0.35;
+/**
+ * Streaks bloom over this many degrees of pull, as seen from the head, after `stripes` degrees.
+ * In angle, so a far table streaks after the same hand move as a near one. The shader and the sparkle both read it.
+ */
+const STREAK_SPAN_DEG = 25;
+const DEG = Math.PI / 180;
 const CARD_DISTANCE = 1.2;
 const CARD_RISE = Math.sin((10 * Math.PI) / 180);
 
@@ -167,7 +184,7 @@ interface Grab {
   rippleT: number;
   lostT: number;
   fade: number;
-  /** 0 until `stripes` m of pull, 1 by STREAK_SPAN more. What is drawn and what is heard both read it. */
+  /** 0 until `stripes` degrees of pull, 1 by STREAK_SPAN_DEG more. What is drawn and what is heard both read it. */
   bloom: number;
   /** For the one console line each pull prints when it lets go. */
   heldAt: number;
@@ -185,6 +202,14 @@ interface Grab {
   /** The last aim(): hand travel since the pinch, and the dead-zone ease it gave. */
   moved: number;
   ease: number;
+  /** Head to grab point at the pinch, and the ramp that sets. */
+  dist: number;
+  ramp: number;
+  /** Began on a surface the other grab had already moved, so it bends what was seen. */
+  chain: boolean;
+  /** What the slide caps were measured against (span between hands, or the ramp), and whether they bit. */
+  span: number;
+  capped: boolean;
 }
 
 const enum Card {
@@ -253,6 +278,11 @@ function makeGrab(side: Side): Grab {
     pinchUpdateMs: 0,
     moved: 0,
     ease: 0,
+    dist: 1,
+    ramp: 0.35,
+    chain: false,
+    span: 0,
+    capped: false,
   };
 }
 
@@ -348,7 +378,7 @@ export class RoomStretchSystem extends createSystem({
   private refSpace: XRReferenceSpace | null = null;
   private outlineShown = true;
   private readonly look: Look = {
-    gain: 1, reach: 0.45, ramp: 0.35, stripes: 0.15, feather: 0.07, wobble: 0.035,
+    gain: 1, reach: 0.45, ramp: 0.35, stripes: 11, feather: 0.07, wobble: 0.035,
     waveLength: 0.45, waveSpeed: 7, stiffness: 90, damping: 9, depthPull: 0.35, radial: 2.5,
     ripple: 0.015, exposure: 1.1, warmth: -0.1, tint: 0,
     lensScale: 1, lensPitchTrim: 0, lensYawTrim: 0, lensRollTrim: 0, lensDx: 0, lensDy: 0, lensDz: 0,
@@ -978,9 +1008,14 @@ export class RoomStretchSystem extends createSystem({
     grab.localNormal.copy(this.localN);
     grab.hand0.copy(this.pinch);
     grab.reach0 = this.pinch.distanceTo(this.head);
+    const other = grab === this.left ? this.right : this.left;
+    grab.chain = other.on && other.D.length() > 0.02;
+    grab.capped = false;
     grab.ray0.copy(this.pinch).sub(this.head).normalize();
     grab.rippleT = 0;
     this.poseGrab(grab);
+    grab.dist = Math.max(0.2, this.head.distanceTo(grab.worldG));
+    grab.ramp = this.look.ramp * Math.max(1, grab.dist / RAMP_NEAR);
     grab.lift.copy(this.head).sub(grab.worldG).normalize();
     this.writeFootprint(grab);
     const freezeAt = performance.now();
@@ -1047,11 +1082,17 @@ export class RoomStretchSystem extends createSystem({
         if (grab.lostT > LOST_RELEASE) this.release(grab);
       }
     }
+    // A long frame (a pinch-frame hitch) must not land the whole pull at once: smooth by a capped
+    // step and cap the speed, so the stretch still grows over a few frames. Velocities use real time.
+    const step = Math.min(dt, STEP_MAX);
     if (grab.holding) {
-      const f = 1 - Math.exp(-dt / FOLLOW);
+      const f = 1 - Math.exp(-step / FOLLOW);
       const inv = 1 / Math.max(dt, 1e-3);
       grab.Dprev.copy(grab.D);
       grab.D.lerp(grab.target, f);
+      const jump = this.tmp.copy(grab.D).sub(grab.Dprev);
+      const most = FOLLOW_MAX * step;
+      if (jump.lengthSq() > most * most) grab.D.copy(grab.Dprev).addScaledVector(jump, most / jump.length());
       grab.Dvel.copy(grab.D).sub(grab.Dprev).multiplyScalar(inv);
       const e = grab.E + (grab.explodeTo - grab.E) * f;
       grab.Evel = (e - grab.E) * inv;
@@ -1071,7 +1112,7 @@ export class RoomStretchSystem extends createSystem({
     if (len > 1e-4) grab.axis.copy(grab.D).multiplyScalar(1 / len);
     grab.rippleT = Math.min(grab.rippleT + dt, 10);
     const slot = this.photo.slots[grab.slot];
-    grab.fade = slot.has && slot.ready ? Math.min(1, grab.fade + dt / FADE_IN) : 0;
+    grab.fade = slot.has && slot.ready ? Math.min(1, grab.fade + step / FADE_IN) : 0;
     if (grab.holding && grab.onsetCount < ONSET_FRAMES) {
       const o = grab.onsetCount++ * 4;
       grab.onset[o] = this.frameDt * 1000;
@@ -1142,9 +1183,13 @@ export class RoomStretchSystem extends createSystem({
       const slide = this.tmp2.copy(this.head).addScaledVector(ray, k).sub(grab.worldG);
       slide.addScaledVector(n, -slide.dot(n)).multiplyScalar(this.look.gain * ease);
       const len = slide.length();
-      if (len > SLIDE_SOFT) {
-        const room = SLIDE_MAX - SLIDE_SOFT;
-        slide.multiplyScalar((SLIDE_SOFT + room * (1 - Math.exp(-(len - SLIDE_SOFT) / room))) / len);
+      const span = this.slideSpan(grab);
+      const soft = Math.min(SLIDE_SOFT, SOFT_PER_SPAN * span);
+      const hard = Math.min(SLIDE_MAX, MAX_PER_SPAN * span);
+      if (len > soft) {
+        const room = Math.max(1e-3, hard - soft);
+        slide.multiplyScalar((soft + room * (1 - Math.exp(-(len - soft) / room))) / len);
+        grab.capped = true;
       }
       this.keepInPhoto(grab, slide);
       grab.target.copy(slide);
@@ -1163,13 +1208,30 @@ export class RoomStretchSystem extends createSystem({
     grab.liftTo = Math.min(LIFT_MAX, this.look.depthPull * toward);
   }
 
+  /**
+   * What a slide is measured against: the distance between the two hands when both hold the same
+   * surface (pulling them apart stretches what is between them), else this grab's ramp.
+   */
+  private slideSpan(grab: Grab): number {
+    const other = grab === this.left ? this.right : this.left;
+    let span = grab.ramp;
+    if (other.holding && other.mesh === grab.mesh && Math.abs(other.normal.dot(grab.normal)) > SAME_SURFACE) {
+      span = Math.max(0.1, other.worldG.distanceTo(grab.worldG));
+    }
+    grab.span = span;
+    return span;
+  }
+
   /** One line per pull, when it lets go: how far it went and whether streaks or the photo edge came in. */
   private logPull(grab: Grab): void {
     const held = performance.now() / 1000 - grab.heldAt;
+    const short = (v: number) => v.toFixed(2).replace(/^0\./, '.');
+    const ratio = grab.span > 1e-3 ? grab.peakSlide / grab.span : 0;
+    const limit = (grab.clipped ? ' clip' : '') + (grab.capped ? ' cap' : '');
     console.info(
-      `[jonze] pull ${grab.side === 'left' ? 'L' : 'R'} ${held.toFixed(1)}s slide=${grab.peakSlide.toFixed(2)} ` +
-        `lift=${grab.peakLift.toFixed(2)} burst=${grab.peakBurst.toFixed(2)} bloom=${grab.peakBloom.toFixed(2)}` +
-        (grab.clipped ? ' clip' : ''),
+      `[jonze] pull ${grab.side === 'left' ? 'L' : 'R'} ${held.toFixed(1)}s ${grab.dist.toFixed(1)}m ` +
+        `slide=${short(grab.peakSlide)} x${ratio.toFixed(1)} lift=${short(grab.peakLift)} ` +
+        `burst=${short(grab.peakBurst)} bloom=${short(grab.peakBloom)} chain=${grab.chain ? 'y' : 'n'}${limit}`,
     );
     this.logOnset(grab);
   }
@@ -1292,7 +1354,6 @@ export class RoomStretchSystem extends createSystem({
     this.writeGrab(U, 0, aFirst ? a : b);
     this.writeGrab(U, 1, aFirst ? b : a);
     U.uReach.value = this.look.reach;
-    U.uRamp.value = this.look.ramp;
     U.uFeather.value = this.look.feather;
     U.uWobble.value = this.look.wobble;
     U.uWaveK.value = 1 / Math.max(this.look.waveLength, 0.05);
@@ -1328,7 +1389,10 @@ export class RoomStretchSystem extends createSystem({
     const sk = grab.holding || len < 1e-4 ? 1 : Math.max(0, grab.D.dot(grab.axisRel) / len);
     // A live frame's grabbed column is the hand's hole: without a fill behind it, it only stretches.
     const streaks = !slot.live || hasFill > 0;
-    grab.bloom = grab.on && streaks ? smooth((len * sk - this.look.stripes) / STREAK_SPAN) : 0;
+    const angle = Math.atan2(len * sk, grab.dist) / DEG;
+    grab.bloom = grab.on && streaks ? smooth((angle - this.look.stripes) / STREAK_SPAN_DEG) : 0;
+    (first ? U.uRamp0 : U.uRamp1).value = grab.ramp;
+    if (!first) U.uChain1.value = grab.chain ? 1 : 0;
     if (grab.holding && grab.bloom > grab.peakBloom) grab.peakBloom = grab.bloom;
     if (first) {
       U.uA0.value = grab.A;
@@ -1435,7 +1499,7 @@ export class RoomStretchSystem extends createSystem({
         `feather=${k.feather.toFixed(3)} wobble=${k.wobble.toFixed(3)} lin=${k.linearBlend ? 1 : 0}`,
     );
     console.info(
-      `[jonze] look stripes=${k.stripes.toFixed(2)} ramp=${k.ramp.toFixed(2)} radial=${k.radial.toFixed(1)} ` +
+      `[jonze] look stripes=${k.stripes.toFixed(0)}deg ramp=${k.ramp.toFixed(2)} radial=${k.radial.toFixed(1)} ` +
         `lat=${k.cameraLatency.toFixed(3)} hand=${k.handLag.toFixed(3)}${OCC_DEBUG ? ' occ=debug' : ''}`,
     );
     const trimmed =

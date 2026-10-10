@@ -30,7 +30,11 @@ export function createRubberUniforms() {
     uOn1: { value: 0 },
     uBloom1: { value: 0 },
     uReach: { value: 0.45 },
-    uRamp: { value: 0.35 },
+    /** Each grab's ramp: the stretch runs this far back from the pinch, longer for far surfaces. */
+    uRamp0: { value: 0.35 },
+    uRamp1: { value: 0.35 },
+    /** 1 when the later grab began on the surface the earlier one had already moved: it bends what you see. */
+    uChain1: { value: 0 },
     uFeather: { value: 0.07 },
     uWobble: { value: 0.035 },
     uWaveK: { value: 1 / 0.45 },
@@ -89,7 +93,7 @@ export type RubberUniformSet = ReturnType<typeof createRubberUniforms>;
 
 /**
  * The taffy band, shared by both stages so the streaks always sit exactly where the mesh stretched.
- * Needs uReach and uRamp declared above it.
+ * Needs uReach declared above it.
  */
 const SHARED = /* glsl */ `
 const float SIDE_GROW = 0.5;    // the band widens 0.5 m per metre pulled, so small triangles never flip
@@ -110,8 +114,8 @@ float taffyFlat(float dn) {
 }
 
 /** Behind the pinch (t < 0): 1 at the pinch, easing to 0 at the anchor one ramp back. */
-float taffyBehind(float t) {
-  return 1.0 - ease(min(-t / max(uRamp, 1e-3), 1.0));
+float taffyBehind(float t, float ramp) {
+  return 1.0 - ease(min(-t / max(ramp, 1e-3), 1.0));
 }
 `;
 
@@ -121,7 +125,9 @@ uniform float uA0; uniform float uE0; uniform float uB0; uniform float uRip0; un
 uniform vec3 uG1; uniform vec3 uD1; uniform vec3 uAxis1; uniform vec3 uN1; uniform vec3 uLift1;
 uniform float uA1; uniform float uE1; uniform float uB1; uniform float uRip1; uniform float uOn1;
 uniform float uReach;
-uniform float uRamp;
+uniform float uRamp0;
+uniform float uRamp1;
+uniform float uChain1;
 uniform float uWobble;
 uniform float uWaveK;
 uniform float uWaveSpeed;
@@ -149,7 +155,7 @@ ${SHARED}
  * hand back to the real room.
  */
 void pinch(inout vec3 p, inout float seen, inout float hide, out float own,
-           vec3 G, vec3 D, vec3 axis, vec3 n, vec3 lift, float A, float E, float B, float rip) {
+           vec3 G, vec3 D, vec3 axis, vec3 n, vec3 lift, float A, float E, float B, float rip, float ramp) {
   vec3 q = p - G;
   float len = length(D);
   float e = max(E, 0.0);
@@ -167,8 +173,8 @@ void pinch(inout vec3 p, inout float seen, inout float hide, out float own,
   float along;
   float belly = 0.0;
   if (t < 0.0) {
-    along = taffyBehind(t);
-    belly = sin(3.14159265 * min(-t / max(uRamp, 1e-3), 1.0));
+    along = taffyBehind(t, ramp);
+    belly = sin(3.14159265 * min(-t / max(ramp, 1e-3), 1.0));
   } else {
     along = 1.0 - smoothstep(A, A + squash, t);
   }
@@ -218,9 +224,14 @@ void main() {
   float hide = 0.0;
   float own0 = 0.0;
   float own1 = 0.0;
-  if (uOn0 > 0.5) pinch(p, seen, hide, own0, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0);
-  vMid = p;
-  if (uOn1 > 0.5) pinch(p, seen, hide, own1, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1);
+  if (uOn0 > 0.5) pinch(p, seen, hide, own0, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0, uRamp0);
+  // A later grab that began on the already-moved surface bends what you saw; two grabs that began
+  // together each bend the rest surface and their moves add, so neither squeezes into the other.
+  vec3 base1 = uChain1 > 0.5 ? p : rest;
+  vec3 p1 = base1;
+  if (uOn1 > 0.5) pinch(p1, seen, hide, own1, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1, uRamp1);
+  p += p1 - base1;
+  vMid = base1;
   vRest = rest;
   vWorld = p;
   vMask = vec2(seen * (1.0 - smoothstep(0.6, 1.0, hide)), ease(hide));
@@ -258,7 +269,8 @@ uniform float uLinear;
 uniform vec3 uG0; uniform vec3 uD0; uniform vec3 uAxis0; uniform vec3 uN0; uniform float uOn0; uniform float uBloom0;
 uniform vec3 uG1; uniform vec3 uD1; uniform vec3 uAxis1; uniform vec3 uN1; uniform float uOn1; uniform float uBloom1;
 uniform float uReach;
-uniform float uRamp;
+uniform float uRamp0;
+uniform float uRamp1;
 #if defined(PREVIEW) || defined(LENS_OVERLAY)
 uniform sampler2D uLive;
 uniform mat4 uLiveToClip;
@@ -300,18 +312,19 @@ const float OTHER_PHOTO = 0.02;
 const float STREAK_LOG2 = 4.0;
 
 /**
- * Moves the photo lookup 's' toward the grabbed column for the part of the band behind the pinch,
- * by how far this grab's streaks have bloomed. Squeezing by 'keep' (0 < keep <= 1) never folds the
- * picture. Returns how streaked this point is.
+ * How far to move the photo lookup toward the grabbed column for the part of the band behind the
+ * pinch, by how far this grab's streaks have bloomed. Squeezing by 'keep' (0 < keep <= 1) never
+ * folds the picture. xyz is the offset, w the band weight it was made at.
  */
-float streakTo(inout vec3 s, vec3 base, vec3 G, vec3 D, vec3 axis, vec3 n, float bloom) {
+vec4 streakOffset(vec3 base, vec3 G, vec3 D, vec3 axis, vec3 n, float bloom, float ramp, out float streak) {
+  streak = 0.0;
   vec3 q = base - G;
   float t = dot(q, axis);
-  if (t >= 0.0) return 0.0;
-  float w = taffySide(q, t, axis, length(D)) * taffyBehind(t) * taffyFlat(dot(q, n));
+  if (t >= 0.0) return vec4(0.0);
+  float w = taffySide(q, t, axis, length(D)) * taffyBehind(t, ramp) * taffyFlat(dot(q, n));
   float keep = exp2(-STREAK_LOG2 * bloom * ease(2.0 * w));
-  s -= axis * (t * (1.0 - keep));
-  return 1.0 - keep;
+  streak = 1.0 - keep;
+  return vec4(-axis * (t * streak), w);
 }
 
 #ifdef ENV_DEPTH
@@ -450,15 +463,19 @@ void main() {
 
   // Where the photo is read. The texture rides the surface (rest position) and the streaks pull it
   // toward the grabbed column, per pixel so it is exact on any triangle.
-  vec3 s = vRest;
-  float st = 0.0;
-  if (uOn0 > 0.5 && uBloom0 > 0.0 && vW.x > 0.0) st = streakTo(s, vRest, uG0, uD0, uAxis0, uN0, uBloom0);
-  if (uOn1 > 0.5 && uBloom1 > 0.0 && vW.y > 0.0) st = max(st, streakTo(s, vMid, uG1, uD1, uAxis1, uN1, uBloom1));
+  // Where two grabs' streaks overlap, their pulls on the lookup are averaged by band weight, not
+  // added: added, they ran past each other into a mirrored strip.
+  float st0 = 0.0;
+  float st1 = 0.0;
+  vec4 o0 = uOn0 > 0.5 && uBloom0 > 0.0 && vW.x > 0.0 ? streakOffset(vRest, uG0, uD0, uAxis0, uN0, uBloom0, uRamp0, st0) : vec4(0.0);
+  vec4 o1 = uOn1 > 0.5 && uBloom1 > 0.0 && vW.y > 0.0 ? streakOffset(vMid, uG1, uD1, uAxis1, uN1, uBloom1, uRamp1, st1) : vec4(0.0);
+  vec3 s = vRest + (o0.xyz * o0.w + o1.xyz * o1.w) / max(o0.w + o1.w, 1e-4);
+  float st = max(st0, st1);
   // A squeezed zone reads the photo where it is drawn, which is what passthrough shows there,
   // so it fades into the real room without a seam.
   s = mix(s, vWorld, vMask.y);
   st *= 1.0 - vMask.y;
-  float shown = max(smoothstep(0.003, 0.03, vMask.x), smoothstep(0.05, 0.2, st));
+  float shown = max(smoothstep(0.002, 0.02, vMask.x), smoothstep(0.05, 0.2, st));
   // Where the surface barely moved, read the photo where it now sits too: the fade then crossfades
   // one picture with passthrough instead of two offset ones.
   vec3 sr = mix(vWorld, s, shown);
