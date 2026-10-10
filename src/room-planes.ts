@@ -34,6 +34,8 @@ export interface PlaneHit {
   horizontal: boolean;
   /** How far the plane hit is from the mesh hit along the line of sight, metres (+ behind). */
   delta: number;
+  /** Which of `RoomPlanes.planes` it is, for its outline. */
+  index: number;
 }
 
 /** The nearest plane that did not qualify, for the pinch line. */
@@ -165,6 +167,7 @@ export class RoomPlanes {
     if (out.normal.dot(dir) > 0) out.normal.negate();
     out.label = plane.label;
     out.horizontal = plane.horizontal;
+    out.index = i;
   }
 
   /** The nearest plane the ray from `origin` along unit `dir` crosses inside its outline. */
@@ -193,6 +196,7 @@ export class RoomPlanes {
     if (out.normal.dot(dir) > 0) out.normal.negate();
     out.label = plane.label;
     out.horizontal = plane.horizontal;
+    out.index = found;
     return true;
   }
 }

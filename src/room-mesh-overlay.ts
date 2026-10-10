@@ -12,7 +12,7 @@ import {
 } from '@iwsdk/core';
 import { MAX_TRIANGLES, TARGET_EDGE, type SnapPlane } from './mesh-subdivide.js';
 import type { RoomPlanes } from './room-planes.js';
-import { createRubberUniforms, rubberMaterial, type RubberUniformSet } from './stretch-material.js';
+import { createRubberUniforms, roomDepthMaterial, rubberMaterial, type RubberUniformSet } from './stretch-material.js';
 
 interface WorkerReply {
   kind: 'subdivide' | 'snap';
@@ -59,8 +59,12 @@ export class RoomMeshOverlay {
   readonly uniforms: RubberUniformSet;
   /** Headset program. It samples video only for the `?lens=overlay` check. */
   readonly material: ShaderMaterial;
-  /** Desk stand-in program, with the webcam as the unmoved backdrop. */
+  /** Desk stand-in program, with the webcam as the unmoved backdrop. It always cuts a box's opening. */
   readonly previewMaterial: ShaderMaterial;
+  /** The headset program that also cuts a pushed-in box's opening, only while there is one. */
+  readonly holeMaterial: ShaderMaterial;
+  /** Depth and the opening only, for a box with nothing else in the room moving. */
+  readonly depthMaterial: ShaderMaterial;
   triangles = 0;
   ready = false;
 
@@ -91,11 +95,36 @@ export class RoomMeshOverlay {
   private loggedPlanes = -1;
   private readonly tmp = new Vector3();
   private readonly pendingClip = new Matrix4();
+  /** What the room draws with: the plain program, or one that cuts a box's opening. */
+  private current: ShaderMaterial;
+  /** One degenerate triangle per extra program, drawn from the start so neither compiles on a push. */
+  private readonly warmers: Mesh[] = [];
 
   constructor(private readonly parent: Object3D, lensOverlay = false) {
     this.uniforms = createRubberUniforms();
     this.material = rubberMaterial(this.uniforms, false, lensOverlay);
-    this.previewMaterial = rubberMaterial(this.uniforms, true);
+    this.previewMaterial = rubberMaterial(this.uniforms, true, false, 'hole');
+    this.holeMaterial = rubberMaterial(this.uniforms, false, lensOverlay, 'hole');
+    this.depthMaterial = roomDepthMaterial(this.uniforms);
+    this.current = this.material;
+    const speck = new BufferGeometry();
+    speck.setAttribute('position', new BufferAttribute(new Float32Array(9), 3));
+    for (const material of [this.holeMaterial, this.depthMaterial]) {
+      const warmer = new Mesh(speck, material);
+      warmer.frustumCulled = false;
+      warmer.renderOrder = 2;
+      warmer.visible = false;
+      this.warmers.push(warmer);
+      parent.add(warmer);
+    }
+  }
+
+  /**
+   * `full` draws the room as always; `hole` also leaves a pushed-in box's opening undrawn; `depth`
+   * only writes depth around the opening, for a box with nothing else moving.
+   */
+  setVariant(variant: 'full' | 'hole' | 'depth'): void {
+    this.current = variant === 'hole' ? this.holeMaterial : variant === 'depth' ? this.depthMaterial : this.material;
   }
 
   /** Draw the room this frame. Off at rest, so nothing renders or uploads. */
@@ -133,6 +162,8 @@ export class RoomMeshOverlay {
 
     const showing = this.active || this.warm > 0;
     if (this.warm > 0) this.warm--;
+    for (let i = 0; i < this.warmers.length; i++) this.warmers[i].visible = true;
+    if (this.dense && this.dense.material !== this.current) this.dense.material = this.current;
     const denseOn = !!this.dense && this.ready;
     for (let i = 0; i < sources.length; i++) setShown(sources[i], showing && !denseOn);
     if (this.dense) setShown(this.dense, showing && denseOn);
@@ -185,6 +216,7 @@ export class RoomMeshOverlay {
 
   hide(restore: boolean): void {
     if (this.dense) setShown(this.dense, false);
+    for (let i = 0; i < this.warmers.length; i++) this.warmers[i].visible = false;
     if (!restore) {
       for (const mesh of this.painted.keys()) setShown(mesh, false);
       return;
@@ -205,18 +237,23 @@ export class RoomMeshOverlay {
     this.dense?.geometry.dispose();
     this.material.dispose();
     this.previewMaterial.dispose();
+    this.holeMaterial.dispose();
+    this.depthMaterial.dispose();
+    for (let i = 0; i < this.warmers.length; i++) this.warmers[i].removeFromParent();
+    this.warmers[0]?.geometry.dispose();
   }
 
   private paint(mesh: Mesh): void {
     if (!this.painted.has(mesh)) this.painted.set(mesh, mesh.material);
-    if (mesh.material !== this.material) mesh.material = this.material;
+    if (mesh.material !== this.current) mesh.material = this.current;
     mesh.frustumCulled = false;
     mesh.renderOrder = 2;
   }
 
   private release(mesh: Mesh): void {
     const saved = this.painted.get(mesh);
-    if (saved && mesh.material === this.material) mesh.material = saved;
+    const ours = mesh.material === this.material || mesh.material === this.holeMaterial || mesh.material === this.depthMaterial;
+    if (saved && ours) mesh.material = saved;
     this.painted.delete(mesh);
     setShown(mesh, false);
   }
@@ -334,7 +371,7 @@ export class RoomMeshOverlay {
     geometry.computeBoundingSphere();
     if (!this.dense) {
       // World space: the merged room carries every scan's pose in its vertices.
-      this.dense = new Mesh(geometry, this.material);
+      this.dense = new Mesh(geometry, this.current);
       this.dense.frustumCulled = false;
       this.dense.renderOrder = 2;
       this.dense.matrixAutoUpdate = false;

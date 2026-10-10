@@ -20,8 +20,8 @@ import { TableTouchSystem } from './table-touch-system.js';
 const NO_PASSTHROUGH = 'Open this page in the Meta Quest browser to use passthrough.';
 const DEPTH_WAIT = 'Downloading the depth model. Passthrough unlocks when it’s ready.';
 const DEPTH_FAIL = 'The depth model didn’t load. Reload the page to try again.';
-const STRETCH_HINT = 'Round 6c. Hold an index fingertip near a surface, without pinching.';
-const STRETCH_CAMERA = 'Camera on. Hold a fingertip near the mesh, or pinch and pull toward you.';
+const STRETCH_HINT = 'Round 7. Hold an open palm up to a wall, then push.';
+const STRETCH_CAMERA = 'Camera on. Push a palm into a wall, or pinch and pull.';
 const STRETCH_ASKING = 'Allow the camera so the pull can show your room.';
 const STRETCH_BLOCKED = 'Camera blocked. Allow it for this site so the pull can show your room.';
 
@@ -64,8 +64,8 @@ export class LauncherSystem extends createSystem({}) {
     const version = document.getElementById('stretchVersion');
     if (version) {
       version.textContent =
-        `Round 6c · jonze-${__BUILD_SHA__}. Pinch a table and pull toward you: it follows your fingers like cloth. ` +
-        'A fingertip within 25 cm sucks the surface up. Touching or tapping the mesh does nothing.';
+        `Round 7 · jonze-${__BUILD_SHA__}. Hold a palm up to a wall and push: it sinks in like a box and stays. ` +
+        'Pinch it to pop it back. Touching or tapping the mesh does nothing.';
     }
 
     enter.disabled = true;
@@ -160,9 +160,10 @@ export class LauncherSystem extends createSystem({}) {
     const lensOn = params.get('lens') === 'overlay';
     const handsOn = params.get('occ') === 'debug';
     const consoleOn = params.get('debug') === '1';
+    const pushDemo = params.get('demo') === 'push';
     const checkId = lensOn ? 'checkLens' : handsOn ? 'checkHands' : consoleOn ? 'checkConsole' : '';
     if (checkId) document.getElementById(checkId)?.setAttribute('aria-current', 'page');
-    if (lensOn || handsOn || consoleOn) applyMode('stretch');
+    if (lensOn || handsOn || consoleOn || pushDemo) applyMode('stretch');
 
     if (this.world.xrEnabled && navigator.xr) {
       navigator.xr.isSessionSupported('immersive-ar').then(
