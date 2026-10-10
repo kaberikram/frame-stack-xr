@@ -27,6 +27,12 @@ export class EnvDepth {
   readonly eyeSize = new Vector2(1, 1);
   /** Each eye's normDepthBufferFromNormView: view uv into depth uv. */
   readonly normDepth = [new Matrix4(), new Matrix4()];
+  /**
+   * Each eye's pose in the XR reference space and its projection, from this frame's viewer pose: the
+   * views the depth layers were taken from. The posed XR cameras still hold last frame's until render.
+   */
+  readonly viewPose = [new Matrix4(), new Matrix4()];
+  readonly viewProjection = [new Matrix4(), new Matrix4()];
   private logged = false;
 
   /** Call once per frame, before the stretch draws. */
@@ -52,6 +58,8 @@ export class EnvDepth {
       const ndb = depth.normDepthBufferFromNormView?.matrix;
       if (ndb) this.normDepth[i].fromArray(ndb);
       else this.normDepth[i].identity();
+      this.viewPose[i].fromArray(views[i].transform.matrix);
+      this.viewProjection[i].fromArray(views[i].projectionMatrix);
       if (!this.logged && i === Math.min(2, views.length) - 1) this.log(xr.getCamera(), session, depth, views.length);
     }
     if (views.length === 1) this.normDepth[1].copy(this.normDepth[0]);

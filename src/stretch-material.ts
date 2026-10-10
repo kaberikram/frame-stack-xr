@@ -1,5 +1,6 @@
 import { DoubleSide, Matrix4, ShaderMaterial, Vector2, Vector3, Vector4, type Texture } from '@iwsdk/core';
 import { SEGMENTS } from './hand-occluder.js';
+import { RAISE_MAX, RAISE_MIN } from './raise-map.js';
 
 /**
  * Two grabs, in world space. The room mesh bends by both, then each grab reads its own photo first.
@@ -88,6 +89,16 @@ export function createRubberUniforms() {
     uSegB: { value: Array.from({ length: SEGMENTS }, () => new Vector4()) },
     /** 0 off, 1 `?occ=debug` (cut magenta, gate cyan), 2 `?occ=delta` (real depth against the room). */
     uOccDebug: { value: 0 },
+    // Per photo slot, the headset's depth frozen at the pinch (raise-map.ts): scanned points behind
+    // an unscanned object slide onto it before they bend.
+    uRaise0: { value: null as Texture | null },
+    uRaise1: { value: null as Texture | null },
+    uRaiseToMap0: { value: new Matrix4() },
+    uRaiseToMap1: { value: new Matrix4() },
+    uRaiseEye0: { value: new Vector3() },
+    uRaiseEye1: { value: new Vector3() },
+    uRaiseOn0: { value: 0 },
+    uRaiseOn1: { value: 0 },
   };
 }
 
@@ -148,6 +159,34 @@ varying float vViewZ; // metres in front of this eye, after the stretch
 
 const float SQUASH = 2.0;       // squeezed zones are 2 m long per metre pulled; slope stays above -0.75
 ${SHARED}
+
+#ifdef ENV_DEPTH
+uniform sampler2D uRaise0;
+uniform sampler2D uRaise1;
+uniform mat4 uRaiseToMap0;
+uniform mat4 uRaiseToMap1;
+uniform vec3 uRaiseEye0;
+uniform vec3 uRaiseEye1;
+uniform float uRaiseOn0;
+uniform float uRaiseOn1;
+
+/**
+ * Slides a scanned point onto the real surface in front of it, along the line of sight of the eye
+ * the depth was frozen from, when it sits ${RAISE_MIN * 100}-${RAISE_MAX * 100} cm behind it: an object the scan missed.
+ * Nearest filtering, so a cleared (hand) texel never blends into a false depth.
+ */
+bool raiseOnto(inout vec3 p, sampler2D map, mat4 toMap, vec3 eye) {
+  vec4 h = toMap * vec4(p, 1.0);
+  if (h.w < 0.1) return false;
+  vec2 uv = h.xy / h.w;
+  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return false;
+  float real = textureLod(map, uv, 0.0).r;
+  float gap = h.w - real;
+  if (real <= 0.0 || gap < ${RAISE_MIN.toFixed(3)} || gap > ${RAISE_MAX.toFixed(3)}) return false;
+  p = eye + (p - eye) * (real / h.w);
+  return true;
+}
+#endif
 
 /**
  * One pinch. Slides the surface along the pull (stretched behind the pinch, rigid for A ahead,
@@ -221,6 +260,10 @@ void pinch(inout vec3 p, inout float seen, inout float hide, out float own,
 
 void main() {
   vec3 rest = (modelMatrix * vec4(position, 1.0)).xyz;
+#ifdef ENV_DEPTH
+  bool raised = uRaiseOn0 > 0.5 && raiseOnto(rest, uRaise0, uRaiseToMap0, uRaiseEye0);
+  if (!raised && uRaiseOn1 > 0.5) raiseOnto(rest, uRaise1, uRaiseToMap1, uRaiseEye1);
+#endif
   vec3 p = rest;
   float seen = 0.0;
   float hide = 0.0;
@@ -471,13 +514,30 @@ float photoCover(mat4 toClip, vec3 cam, float has, vec3 p, vec3 nr, float streak
  * so a half-transparent edge texel of a hand cut-out came back too dark; that is undone here. Opaque
  * and empty texels need nothing.
  */
-vec4 photoTexel(sampler2D tex, vec2 uv) {
-  vec4 t = textureLod(tex, uv, 0.0);
+vec4 photoTexelLod(sampler2D tex, vec2 uv, float lod) {
+  vec4 t = textureLod(tex, uv, lod);
   if (t.a > 0.004 && t.a < 0.996) {
     vec3 encoded = sRGBTransferOETF(vec4(t.rgb, 1.0)).rgb / t.a;
     t.rgb = sRGBTransferEOTF(vec4(encoded, 1.0)).rgb * t.a;
   }
   return t;
+}
+
+vec4 photoTexel(sampler2D tex, vec2 uv) {
+  return photoTexelLod(tex, uv, 0.0);
+}
+
+/**
+ * What surrounds a hand cut-out, as an opaque premultiplied colour: the photo's mip levels are
+ * alpha-weighted averages over 8, 32, 128 and 512 texels, so the finest one with any picture in it
+ * leads (a pull-push fill, one tap per level). Clear only if the whole photo is.
+ */
+vec4 holeFill(sampler2D tex, vec2 uv) {
+  vec4 acc = photoTexelLod(tex, uv, 3.0);
+  acc += photoTexelLod(tex, uv, 5.0) * (1.0 - acc.a);
+  acc += photoTexelLod(tex, uv, 7.0) * (1.0 - acc.a);
+  acc += photoTexelLod(tex, uv, 9.0) * (1.0 - acc.a);
+  return acc.a > 1e-3 ? acc / acc.a : vec4(0.0);
 }
 
 /**
@@ -490,6 +550,11 @@ vec4 slotPicture(sampler2D own, vec2 uv, float c, sampler2D fill, vec2 fuv, floa
   vec4 a = c > 0.0 ? photoTexel(own, uv) * c : vec4(0.0);
   if (cf > 0.0 && a.a < 0.999) a += photoTexel(fill, fuv) * (cf * (1.0 - a.a));
   return vec4(a.rgb * gain, a.a);
+}
+
+/** The colour around a cut-out in one slot's pictures: its own photo where it covers, else its fill. */
+vec3 slotHole(sampler2D own, vec2 uv, float c, sampler2D fill, vec2 fuv, vec3 gain) {
+  return (c > 0.0 ? holeFill(own, uv) : holeFill(fill, fuv)).rgb * gain;
 }
 
 /**
@@ -522,6 +587,15 @@ void main() {
     // Discarded, not drawn clear: a clear stripe would still write depth and cut what is behind it.
     if (!inside || stripe < 0.5) discard;
     writeColor(sRGBTransferEOTF(texture(uLive, luv)).rgb, 1.0);
+    return;
+  }
+#endif
+
+#ifdef ENV_DEPTH
+  // Neither grab moved this triangle: it stays real. Leave before any streak or photo work, which
+  // would only arrive at alpha 0 (own is 0 below). The debug views draw everywhere, so they stay.
+  if (uOccDebug < 0.5 && max(vW.x, vW.y) <= 0.0) {
+    gl_FragColor = vec4(0.0);
     return;
   }
 #endif
@@ -613,6 +687,14 @@ void main() {
   float cover = p0.a * w0 + p1.a * w1;
   vec3 col = (p0.rgb * w0 + p1.rgb * w1) / max(cover, 1e-7);
   alpha = shown * max(own * max(p0.a * uFade0, p1.a * uFade1), frost);
+  // A hand cut out of every photo here takes the colour around it, from the leading slot. Left clear,
+  // the real room showed through the moving surface as a dark hand-shaped hole.
+  float wanted = shown * max(own * max(k0, k1), frost);
+  if (alpha < wanted - 0.002) {
+    vec3 hole = k0 >= k1 ? slotHole(uPhoto0, uv0, c0, uFill0, fuv0, uGain0) : slotHole(uPhoto1, uv1, c1, uFill1, fuv1, uGain1);
+    col = (col * alpha + hole * (wanted - alpha)) / wanted;
+    alpha = wanted;
+  }
 #ifdef ENV_DEPTH
   // Debug views paint the cut instead of cutting.
   if (uOccDebug < 0.5) {

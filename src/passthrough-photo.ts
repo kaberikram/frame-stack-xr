@@ -3,6 +3,7 @@ import {
   ClampToEdgeWrapping,
   Euler,
   LinearFilter,
+  LinearMipmapLinearFilter,
   Matrix4,
   Quaternion,
   SRGBColorSpace,
@@ -1324,9 +1325,11 @@ function makeTexture(canvas: HTMLCanvasElement, slot: { ready: boolean }): Canva
   const tex = new CanvasTexture(canvas);
   tex.premultiplyAlpha = true;
   tex.colorSpace = SRGBColorSpace;
-  tex.minFilter = LinearFilter;
+  // Mipmapped for the shader's hole fill: the photo is premultiplied, so each level is the
+  // alpha-weighted average of what is around a hand cut-out. Level 0 is always read explicitly.
+  tex.minFilter = LinearMipmapLinearFilter;
   tex.magFilter = LinearFilter;
-  tex.generateMipmaps = false;
+  tex.generateMipmaps = true;
   tex.wrapS = ClampToEdgeWrapping;
   tex.wrapT = ClampToEdgeWrapping;
   tex.onUpdate = () => {
