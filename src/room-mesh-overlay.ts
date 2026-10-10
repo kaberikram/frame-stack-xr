@@ -274,6 +274,8 @@ export class RoomMeshOverlay {
       if (!position || position.array.length !== reply.positions.length) return;
       (position.array as Float32Array).set(reply.positions);
       position.needsUpdate = true;
+      // Upload while drawing alpha 0 for a couple of frames, not on the next pinch.
+      this.warm = 2;
       console.info(`[jonze] dense room: ${snapped}`);
       return;
     }

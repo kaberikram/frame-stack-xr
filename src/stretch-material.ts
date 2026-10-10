@@ -50,6 +50,15 @@ export function createRubberUniforms() {
     uGain1: { value: new Vector3(1, 1, 1) },
     uHasPhoto0: { value: 0 },
     uHasPhoto1: { value: 0 },
+    // Each slot's fill: a second photo read where the slot's own is masked (hands) or off its frame.
+    uFill0: { value: null as Texture | null },
+    uFill1: { value: null as Texture | null },
+    uFillToClip0: { value: new Matrix4() },
+    uFillToClip1: { value: new Matrix4() },
+    uFillCam0: { value: new Vector3() },
+    uFillCam1: { value: new Vector3() },
+    uHasFill0: { value: 0 },
+    uHasFill1: { value: 0 },
     uFade0: { value: 0 },
     uFade1: { value: 0 },
     /** 1 while a camera feeds photos. Without one the desk preview frosts moved surfaces; a headset draws nothing. */
@@ -233,6 +242,14 @@ uniform vec3 uGain0;
 uniform vec3 uGain1;
 uniform float uHasPhoto0;
 uniform float uHasPhoto1;
+uniform sampler2D uFill0;
+uniform sampler2D uFill1;
+uniform mat4 uFillToClip0;
+uniform mat4 uFillToClip1;
+uniform vec3 uFillCam0;
+uniform vec3 uFillCam1;
+uniform float uHasFill0;
+uniform float uHasFill1;
 uniform float uFade0;
 uniform float uFade1;
 uniform float uAnyPhoto;
@@ -375,11 +392,24 @@ float frameCover(vec4 clip, out vec2 uv) {
 }
 
 /**
- * The photos are SRGBColorSpace textures, stored as SRGB8_ALPHA8, so the sampler already returns
- * linear light. Decoding again crushed every photo to a flat grey. textureLod needs no derivatives.
+ * How much of a photo covers this point: inside its frame, and seen from the camera's side of the
+ * surface. Streaks read the grabbed column, so they skip the facing test for surfaces seen edge-on.
  */
-vec3 photo(sampler2D tex, vec2 uv, vec3 gain) {
-  return textureLod(tex, uv, 0.0).rgb * gain;
+float photoCover(mat4 toClip, vec3 cam, float has, vec3 p, vec3 nr, float streaked, out vec2 uv) {
+  float c = has * frameCover(toClip * vec4(p, 1.0), uv);
+  return c * max(step(0.0, dot(nr, cam - vRest)), streaked);
+}
+
+/**
+ * One slot's picture: its own photo, then its fill wherever the first is masked or off its frame.
+ * The photos are premultiplied SRGB8_ALPHA8, so the sampler returns linear light times alpha
+ * (decoding again crushed every photo to a flat grey). Returns gain * rgb premultiplied, and
+ * coverage in alpha. textureLod needs no derivatives.
+ */
+vec4 slotPicture(sampler2D own, vec2 uv, float c, sampler2D fill, vec2 fuv, float cf, vec3 gain) {
+  vec4 a = c > 0.0 ? textureLod(own, uv, 0.0) * c : vec4(0.0);
+  if (cf > 0.0 && a.a < 0.999) a += textureLod(fill, fuv, 0.0) * (cf * (1.0 - a.a));
+  return vec4(a.rgb * gain, a.a);
 }
 
 /**
@@ -433,19 +463,21 @@ void main() {
   // one picture with passthrough instead of two offset ones.
   vec3 sr = mix(vWorld, s, shown);
 
+  float streaked = step(0.5, st);
   vec2 uv0;
   vec2 uv1;
-  float c0 = uHasPhoto0 * frameCover(uWorldToClip0 * vec4(sr, 1.0), uv0);
-  float c1 = uHasPhoto1 * frameCover(uWorldToClip1 * vec4(sr, 1.0), uv1);
-  // Streaks read the grabbed column, so they skip the test for surfaces the camera saw edge-on.
-  float streaked = step(0.5, st);
-  c0 *= max(step(0.0, dot(nr, uCamPos0 - vRest)), streaked);
-  c1 *= max(step(0.0, dot(nr, uCamPos1 - vRest)), streaked);
+  vec2 fuv0;
+  vec2 fuv1;
+  float c0 = photoCover(uWorldToClip0, uCamPos0, uHasPhoto0, sr, nr, streaked, uv0);
+  float c1 = photoCover(uWorldToClip1, uCamPos1, uHasPhoto1, sr, nr, streaked, uv1);
+  float cf0 = photoCover(uFillToClip0, uFillCam0, uHasFill0, sr, nr, streaked, fuv0);
+  float cf1 = photoCover(uFillToClip1, uFillCam1, uHasFill1, sr, nr, streaked, fuv1);
 
-  // Both frozen photos are pictures of the same still room, so a moved point may read either one.
-  // Its own grab's photo leads; the other takes over where the first runs off its frame.
-  float k0 = c0 * uFade0;
-  float k1 = c1 * uFade1;
+  // Both slots are pictures of the same still room, so a moved point may read either one.
+  // Its own grab's photo leads; the other takes over where the first is masked or runs off its frame.
+  // Coverage before masks bounds the alpha, so unmoved surfaces leave before any texture is read.
+  float k0 = max(c0, cf0) * uFade0;
+  float k1 = max(c1, cf1) * uFade1;
   float own = max(smoothstep(0.0, 0.01, vW.x), smoothstep(0.0, 0.01, vW.y));
 #ifdef PREVIEW
   // Desk without a webcam: a faint frost keeps the demo visible.
@@ -455,10 +487,6 @@ void main() {
   const float frost = 0.0;
 #endif
   float alpha = shown * max(own * max(k0, k1), frost);
-#ifdef ENV_DEPTH
-  float occ = handOcclusion(vWorld);
-  alpha = uOccDebug > 0.5 ? max(alpha, occ) : alpha * (1.0 - occ);
-#endif
 
 #ifdef PREVIEW
   vec3 back = vec3(0.16) * (0.65 + 0.35 * abs(normalize(nr).y));
@@ -478,18 +506,24 @@ void main() {
   }
 #endif
 
-  float w0 = k0 * (max(vW.x, 0.0) + OTHER_PHOTO);
-  float w1 = k1 * (max(vW.y, 0.0) + OTHER_PHOTO);
-  vec3 col = vec3(0.0);
-  if (w0 > 0.0) col += photo(uPhoto0, uv0, uGain0) * w0;
-  if (w1 > 0.0) col += photo(uPhoto1, uv1, uGain1) * w1;
+  // Masked texels carry alpha 0: they drop out of both the colour and the alpha, never smear.
+  vec4 p0 = k0 > 0.0 ? slotPicture(uPhoto0, uv0, c0, uFill0, fuv0, cf0, uGain0) : vec4(0.0);
+  vec4 p1 = k1 > 0.0 ? slotPicture(uPhoto1, uv1, c1, uFill1, fuv1, cf1, uGain1) : vec4(0.0);
+  float w0 = uFade0 * (max(vW.x, 0.0) + OTHER_PHOTO);
+  float w1 = uFade1 * (max(vW.y, 0.0) + OTHER_PHOTO);
+  float cover = p0.a * w0 + p1.a * w1;
+  vec3 col = (p0.rgb * w0 + p1.rgb * w1) / max(cover, 1e-7);
+  alpha = shown * max(own * max(p0.a * uFade0, p1.a * uFade1), frost);
+#ifdef ENV_DEPTH
+  float occ = handOcclusion(vWorld);
+  alpha = uOccDebug > 0.5 ? max(alpha, occ) : alpha * (1.0 - occ);
+#endif
 #ifdef PREVIEW
-  col = w0 + w1 > 1e-7 ? col / (w0 + w1) : vec3(0.92);
+  col = cover > 1e-7 ? col : vec3(0.92);
   col = mix(back, col, alpha);
   gl_FragColor = vec4(col, 1.0);
   #include <colorspace_fragment>
 #else
-  col /= max(w0 + w1, 1e-7);
 #ifdef ENV_DEPTH
   // ?occ=debug: the depth cut in magenta instead of a hole.
   if (uOccDebug > 0.5) col = mix(col, vec3(1.0, 0.0, 1.0), occ);

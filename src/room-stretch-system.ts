@@ -82,6 +82,8 @@ const SETTLE_MAX = 0.12;
 const FADE_IN = 0.12;
 /** A pinch with no usable photo yet keeps trying this long (fresh pose, fresh frame) before it lets go. */
 const PHOTO_WAIT = 0.4;
+/** Frames after a pinch whose timing is kept and printed at release, to see a pop or a hitch. */
+const ONSET_FRAMES = 12;
 /** A plane counts as the grabbed surface when the line of sight meets it this close before or after the mesh. */
 const PLANE_IN_FRONT = 0.05;
 const PLANE_BEHIND = 0.03;
@@ -174,6 +176,15 @@ interface Grab {
   peakBurst: number;
   peakBloom: number;
   clipped: boolean;
+  /** The first ONSET_FRAMES frames after the pinch, 4 numbers each: dt ms, |D| cm, fade, ease. */
+  readonly onset: Float32Array;
+  onsetCount: number;
+  /** ms the photo freeze took on the pinch frame, and the whole update that frame (-1 until known). */
+  freezeMs: number;
+  pinchUpdateMs: number;
+  /** The last aim(): hand travel since the pinch, and the dead-zone ease it gave. */
+  moved: number;
+  ease: number;
 }
 
 const enum Card {
@@ -236,6 +247,12 @@ function makeGrab(side: Side): Grab {
     peakBurst: 0,
     peakBloom: 0,
     clipped: false,
+    onset: new Float32Array(ONSET_FRAMES * 4),
+    onsetCount: 0,
+    freezeMs: 0,
+    pinchUpdateMs: 0,
+    moved: 0,
+    ease: 0,
   };
 }
 
@@ -340,6 +357,8 @@ export class RoomStretchSystem extends createSystem({
   };
 
   private readonly photo = new PassthroughPhoto();
+  /** This frame's real delta, uncapped, for the onset timing line. */
+  private frameDt = 0;
   private readonly depth = new EnvDepth();
   private readonly sound = new StretchSound();
   private overlay!: RoomMeshOverlay;
@@ -489,8 +508,10 @@ export class RoomStretchSystem extends createSystem({
       this.sound.stop();
       return;
     }
+    const startMs = performance.now();
     const dt = Math.min(0.1, delta);
-    const now = performance.now() / 1000;
+    this.frameDt = delta;
+    const now = startMs / 1000;
     this.readLook();
     this.syncSession(now);
     if (!this.lookLogged) this.logLook();
@@ -502,6 +523,7 @@ export class RoomStretchSystem extends createSystem({
       console.info(hasVideo ? `[jonze] camera video on ${frameShape(video)}` : '[jonze] camera video off');
     }
     this.applyLook();
+    this.warmTextures();
     if (presenting) {
       this.wasPresenting = true;
       this.room.visible = false;
@@ -531,6 +553,9 @@ export class RoomStretchSystem extends createSystem({
       this.sing(this.left);
       this.sing(this.right);
       this.rearmCamera(now);
+      const updateMs = performance.now() - startMs;
+      if (this.left.pinchUpdateMs < 0) this.left.pinchUpdateMs = updateMs;
+      if (this.right.pinchUpdateMs < 0) this.right.pinchUpdateMs = updateMs;
     } else if (!this.previewRoom) {
       // A headset back on the launch page. Leaving a session stops the camera; the frames
       // between the Enter click and the session starting must not.
@@ -788,6 +813,13 @@ export class RoomStretchSystem extends createSystem({
     this.hands.update(this.world.xrFrame, this.world.xrReferenceSpace, this.player.matrixWorld, this.handMap, performance.now() / 1000);
   }
 
+  /** Uploads photo textures made at camera start, so a pinch never allocates GPU storage. */
+  private warmTextures(): void {
+    const list = this.photo.warmList;
+    for (let i = 0; i < list.length; i++) this.renderer.initTexture(list[i]);
+    list.length = 0;
+  }
+
   /** Headset depth and the hand segments it may cut around, for the stretch shader. */
   private publishDepth(): void {
     const U = this.overlay.uniforms;
@@ -951,7 +983,10 @@ export class RoomStretchSystem extends createSystem({
     this.poseGrab(grab);
     grab.lift.copy(this.head).sub(grab.worldG).normalize();
     this.writeFootprint(grab);
-    if (!this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, true, this.camera, now, this.handJoints(), this.head)) {
+    const freezeAt = performance.now();
+    const frozen = this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, true, this.camera, now, this.handJoints(), this.head);
+    grab.freezeMs = performance.now() - freezeAt;
+    if (!frozen) {
       // Nothing to show: bending it would be invisible. Without video a retry can't help.
       const retry = this.photo.lastMiss !== 'no-video' && now - grab.pendingAt < PHOTO_WAIT;
       this.resetGrab(grab);
@@ -970,8 +1005,10 @@ export class RoomStretchSystem extends createSystem({
       `[jonze] pinch ${tag} ${surface} ${this.head.distanceTo(grab.worldG).toFixed(2)}m dense=${this.overlay.ready ? 'y' : 'n'} ` +
         `hit=${this.hitNote}`,
     );
-    console.info(`[jonze] ${this.photo.pickLine(grab.slot)}`);
+    console.info(`[jonze] ${this.photo.pickLine(grab.slot)} | ${grab.freezeMs.toFixed(1)}ms`);
     grab.heldAt = now;
+    grab.onsetCount = 0;
+    grab.pinchUpdateMs = -1;
     grab.fade = 0;
     this.pinched = true;
   }
@@ -1035,6 +1072,13 @@ export class RoomStretchSystem extends createSystem({
     grab.rippleT = Math.min(grab.rippleT + dt, 10);
     const slot = this.photo.slots[grab.slot];
     grab.fade = slot.has && slot.ready ? Math.min(1, grab.fade + dt / FADE_IN) : 0;
+    if (grab.holding && grab.onsetCount < ONSET_FRAMES) {
+      const o = grab.onsetCount++ * 4;
+      grab.onset[o] = this.frameDt * 1000;
+      grab.onset[o + 1] = grab.D.length() * 100;
+      grab.onset[o + 2] = grab.fade;
+      grab.onset[o + 3] = grab.ease;
+    }
     const wasOn = grab.on;
     grab.on = grab.holding || !this.springsAtRest(grab) || grab.rippleT < RIPPLE_SECONDS;
     if (wasOn && !grab.on) {
@@ -1087,6 +1131,8 @@ export class RoomStretchSystem extends createSystem({
     const travel = this.raw.copy(hand).sub(grab.hand0);
     const moved = travel.length();
     const ease = smooth((moved - 0.5 * DEAD) / DEAD);
+    grab.moved = moved;
+    grab.ease = ease;
     const ray = this.unit.copy(hand).sub(this.head);
     const reach = ray.length();
     const n = grab.normal;
@@ -1125,6 +1171,29 @@ export class RoomStretchSystem extends createSystem({
         `lift=${grab.peakLift.toFixed(2)} burst=${grab.peakBurst.toFixed(2)} bloom=${grab.peakBloom.toFixed(2)}` +
         (grab.clipped ? ' clip' : ''),
     );
+    this.logOnset(grab);
+  }
+
+  /**
+   * The pull's first frames, two short lines: frame times (a hitch shows as one long frame), then how
+   * far the surface had moved (cm) and the fade (0-9). A pop is a jump in D within one frame.
+   */
+  private logOnset(grab: Grab): void {
+    const n = grab.onsetCount;
+    if (n === 0) return;
+    const tag = grab.side === 'left' ? 'L' : 'R';
+    let dt = '';
+    let d = '';
+    let fade = '';
+    for (let i = 0; i < n; i++) {
+      const o = i * 4;
+      dt += ` ${Math.round(grab.onset[o])}`;
+      d += ` ${Math.round(grab.onset[o + 1])}`;
+      fade += Math.min(9, Math.floor(grab.onset[o + 2] * 10));
+    }
+    const upd = grab.pinchUpdateMs >= 0 ? grab.pinchUpdateMs.toFixed(1) : '?';
+    console.info(`[jonze] onset ${tag} freeze ${grab.freezeMs.toFixed(1)} upd ${upd}ms dt${dt}`);
+    console.info(`[jonze] onset ${tag} D${d} a ${fade}`);
   }
 
   /** Shortens a slide so the grab point lands inside its photo: past the edge there is nothing to show. */
@@ -1246,13 +1315,20 @@ export class RoomStretchSystem extends createSystem({
     (first ? U.uWorldToClip0 : U.uWorldToClip1).value.copy(slot.toClip);
     (first ? U.uCamPos0 : U.uCamPos1).value.copy(slot.cam);
     (first ? U.uGain0 : U.uGain1).value.copy(slot.gain);
+    const fill = slot.fill;
+    const hasFill = slot.has && fill.has && fill.ready && fill.texture ? 1 : 0;
+    (first ? U.uFill0 : U.uFill1).value = fill.texture;
+    (first ? U.uFillToClip0 : U.uFillToClip1).value.copy(fill.toClip);
+    (first ? U.uFillCam0 : U.uFillCam1).value.copy(fill.cam);
+    (first ? U.uHasFill0 : U.uHasFill1).value = hasFill;
     const on = grab.on ? 1 : 0;
     const has = slot.has && slot.texture ? 1 : 0;
     // Streaks only on the side the pull went; the spring's overshoot flips D but not the picture.
     const len = grab.D.length();
     const sk = grab.holding || len < 1e-4 ? 1 : Math.max(0, grab.D.dot(grab.axisRel) / len);
-    // A live frame with the hand painted out: its grabbed column is the painted strip, so it only stretches.
-    grab.bloom = grab.on && !slot.painted ? smooth((len * sk - this.look.stripes) / STREAK_SPAN) : 0;
+    // A live frame's grabbed column is the hand's hole: without a fill behind it, it only stretches.
+    const streaks = !slot.live || hasFill > 0;
+    grab.bloom = grab.on && streaks ? smooth((len * sk - this.look.stripes) / STREAK_SPAN) : 0;
     if (grab.holding && grab.bloom > grab.peakBloom) grab.peakBloom = grab.bloom;
     if (first) {
       U.uA0.value = grab.A;
