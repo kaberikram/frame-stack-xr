@@ -339,8 +339,12 @@ const OCC_DELTA = OCC_MODE === 'delta';
 
 /** Developer check: `?lens=overlay` draws the live camera in stripes over the room at rest. */
 const LENS_OVERLAY = typeof location !== 'undefined' && new URLSearchParams(location.search).get('lens') === 'overlay';
-/** `?raise=0` keeps the scan as it is: no depth-raised objects under a pull. */
-const RAISE = typeof location === 'undefined' || new URLSearchParams(location.search).get('raise') !== '0';
+/**
+ * `?raise=1` raises objects the scan missed from the headset's depth before a pull (raise-map.ts).
+ * Off by default: the 256² depth map lifts some scan points and not their neighbours, so a pull tore
+ * those spots into shards.
+ */
+const RAISE = typeof location !== 'undefined' && new URLSearchParams(location.search).get('raise') === '1';
 /** `?cull=0` draws the whole room with the stretch program, for comparing frame times. */
 const CULL = typeof location === 'undefined' || new URLSearchParams(location.search).get('cull') !== '0';
 
@@ -411,7 +415,8 @@ export class RoomStretchSystem extends createSystem({
   private readonly sound = new StretchSound();
   private meter!: FrameMeter;
   private readonly bounding: BoundLook = { reach: 0.45, core: 0.12, ripple: 0.015, wobble: 0.035 };
-  private raise!: RaiseMaps;
+  /** Only with `?raise=1`: nothing compiles or captures for it otherwise. */
+  private raise: RaiseMaps | null = null;
   private overlay!: RoomMeshOverlay;
   private hands!: HandOccluder;
   private readonly handMap: { left: XRHand | null; right: XRHand | null } = { left: null, right: null };
@@ -477,9 +482,10 @@ export class RoomStretchSystem extends createSystem({
     if (LENS_OVERLAY) console.info('[jonze] lens overlay: live camera in stripes over the room at rest; hold still to read it');
     if (!CULL) console.info('[jonze] cull=0: the whole room draws with the stretch program');
     this.meter = new FrameMeter(this.renderer, this.scene);
-    this.raise = new RaiseMaps(this.renderer);
-    if (!RAISE) console.info('[jonze] raise=0: unscanned objects stay flat under a pull');
-    else if (!this.raise.supported) console.info('[jonze] raise off: no half-float render targets here');
+    if (RAISE) {
+      this.raise = new RaiseMaps(this.renderer);
+      console.info(`[jonze] raise=1: ${this.raise.supported ? 'unscanned objects rise from depth under a pull' : 'off, no half-float render targets here'}`);
+    }
     this.hands = new HandOccluder(this.scene, OCC_DEBUG);
     this.photo.history = this.hands;
     this.joints.points = this.hands.points;
@@ -609,7 +615,7 @@ export class RoomStretchSystem extends createSystem({
         this.overlay.setLive(video, live, this.photo.worldToClip);
         this.overlay.uniforms.uLensOn.value = live ? 1 : 0;
         // The stripes check the raise too: slot 0's map follows the live depth while nothing is held.
-        if (live && RAISE) this.captureRaise(0);
+        if (live) this.captureRaise(0);
       }
       // The depth debug views show the whole room, pinched or not, so they draw all of it.
       const debugView = this.overlay.uniforms.uLensOn.value > 0 || OCC_DEBUG || OCC_DELTA;
@@ -1132,7 +1138,7 @@ export class RoomStretchSystem extends createSystem({
       this.sound.miss(grab.slot, this.pinch.x, this.pinch.y, this.pinch.z);
       return;
     }
-    const raised = RAISE && this.captureRaise(grab.slot);
+    const raised = this.captureRaise(grab.slot);
     const n = grab.normal;
     const surface = Math.abs(n.y) < 0.5 ? 'wall' : n.y > 0 ? 'table' : 'ceiling';
     console.info(
@@ -1496,7 +1502,7 @@ export class RoomStretchSystem extends createSystem({
 
   /** Copies this frame's depth into photo slot `k`'s raise map, hands cleared. */
   private captureRaise(k: 0 | 1): boolean {
-    return this.raise.capture(k, this.renderer, this.depth, this.camera.parent, this.hands.segA, this.hands.segB);
+    return !!this.raise?.capture(k, this.renderer, this.depth, this.camera.parent, this.hands.segA, this.hands.segB);
   }
 
   /**
@@ -1504,12 +1510,14 @@ export class RoomStretchSystem extends createSystem({
    * show, so they can be checked on the objects it raises.
    */
   private publishRaise(): void {
+    const raise = this.raise;
+    if (!raise) return;
     const U = this.overlay.uniforms;
     const lens = U.uLensOn.value > 0;
     for (let k = 0; k < 2; k++) {
-      const map = this.raise.maps[k];
+      const map = raise.maps[k];
       const grab = k === 0 ? this.left : this.right;
-      const on = RAISE && map.on && (grab.on || (k === 0 && lens)) ? 1 : 0;
+      const on = map.on && (grab.on || (k === 0 && lens)) ? 1 : 0;
       if (k === 0) {
         U.uRaiseOn0.value = on;
         U.uRaise0.value = map.target.texture;
@@ -1523,8 +1531,6 @@ export class RoomStretchSystem extends createSystem({
       }
     }
   }
-
-
 
   private writeGrab(U: RubberUniformSet, k: 0 | 1, grab: Grab): void {
     const first = k === 0;
@@ -1793,7 +1799,7 @@ export class RoomStretchSystem extends createSystem({
     this.stopCamera();
     this.overlay.dispose();
     this.meter.dispose();
-    this.raise.dispose();
+    this.raise?.dispose();
     this.hands.dispose();
     this.photo.dispose();
     this.sound.dispose();

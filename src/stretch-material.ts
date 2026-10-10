@@ -532,21 +532,6 @@ vec4 photoTexel(sampler2D tex, vec2 uv) {
 }
 
 /**
- * What surrounds a hand cut-out, as an opaque premultiplied colour: the photo's mip levels are
- * alpha-weighted averages over 8, 32, 128 and 512 texels, so the finest one with any picture in it
- * leads (a pull-push fill, one tap per level). Clear only if the whole photo is. Read raw: WebGL2
- * builds SRGB8_ALPHA8 mips from decoded texels, so above level 0 they are already linear
- * premultiplied, and photoTexel's fix would brighten every partly covered one.
- */
-vec4 holeFill(sampler2D tex, vec2 uv) {
-  vec4 acc = textureLod(tex, uv, 3.0);
-  acc += textureLod(tex, uv, 5.0) * (1.0 - acc.a);
-  acc += textureLod(tex, uv, 7.0) * (1.0 - acc.a);
-  acc += textureLod(tex, uv, 9.0) * (1.0 - acc.a);
-  return acc.a > 1e-3 ? acc / acc.a : vec4(0.0);
-}
-
-/**
  * One slot's picture: its own photo, then its fill wherever the first is masked or off its frame.
  * The photos are premultiplied SRGB8_ALPHA8, so the sampler returns linear light times alpha
  * (decoding again crushed every photo to a flat grey). Returns gain * rgb premultiplied, and
@@ -556,11 +541,6 @@ vec4 slotPicture(sampler2D own, vec2 uv, float c, sampler2D fill, vec2 fuv, floa
   vec4 a = c > 0.0 ? photoTexel(own, uv) * c : vec4(0.0);
   if (cf > 0.0 && a.a < 0.999) a += photoTexel(fill, fuv) * (cf * (1.0 - a.a));
   return vec4(a.rgb * gain, a.a);
-}
-
-/** The colour around a cut-out in one slot's pictures: its own photo where it covers, else its fill. */
-vec3 slotHole(sampler2D own, vec2 uv, float c, sampler2D fill, vec2 fuv, vec3 gain) {
-  return (c > 0.0 ? holeFill(own, uv) : holeFill(fill, fuv)).rgb * gain;
 }
 
 /**
@@ -694,14 +674,6 @@ void main() {
   float cover = p0.a * w0 + p1.a * w1;
   vec3 col = (p0.rgb * w0 + p1.rgb * w1) / max(cover, 1e-7);
   alpha = shown * max(own * max(p0.a * uFade0, p1.a * uFade1), frost);
-  // A hand cut out of every photo here takes the colour around it, from the leading slot. Left clear,
-  // the real room showed through the moving surface as a dark hand-shaped hole.
-  float wanted = shown * max(own * max(k0, k1), frost);
-  if (alpha < wanted - 0.002) {
-    vec3 hole = k0 >= k1 ? slotHole(uPhoto0, uv0, c0, uFill0, fuv0, uGain0) : slotHole(uPhoto1, uv1, c1, uFill1, fuv1, uGain1);
-    col = (col * alpha + hole * (wanted - alpha)) / wanted;
-    alpha = wanted;
-  }
 #ifdef ENV_DEPTH
   // Debug views paint the cut instead of cutting.
   if (uOccDebug < 0.5) {

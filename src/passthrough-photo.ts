@@ -3,7 +3,6 @@ import {
   ClampToEdgeWrapping,
   Euler,
   LinearFilter,
-  LinearMipmapLinearFilter,
   Matrix4,
   Quaternion,
   SRGBColorSpace,
@@ -49,8 +48,12 @@ const BANK = 8;
 const POSES = 128;
 const PROBE_W = 16;
 const PROBE_H = 12;
-/** Mean linear luminance below this is a warm-up or suspended frame. */
-const DARK = 0.03;
+/**
+ * Mean linear luminance below this (about sRGB 24/255) is a warm-up or suspended frame. At 0.03 an
+ * evening room counted as dark: most bank frames were dropped and pinches fell back on live frames
+ * with the hands cut out, or were refused.
+ */
+const DARK = 0.008;
 const STEADY_RAD = (8 * Math.PI) / 180;
 const STEADY_M = 0.1;
 /** Frames this soon after the camera starts are still finding their exposure. */
@@ -80,8 +83,6 @@ const MASK_WRIST = 0.02;
 const CLEAN_RING = 0.08;
 /** Most footprint points a freeze is given (the grab point and its ring). */
 const FOOTPRINT_MAX = 32;
-/** A probe mean younger than this stands in for measuring the live frame at a pinch. */
-const MEAN_FRESH = 2;
 /** Hand or arm cover below this counts as a clean frame. */
 const CLEANER = 0.02;
 /** Hand and arm cover is measured over nearly the whole frame, on a coarse grid of sample points. */
@@ -660,9 +661,10 @@ export class PassthroughPhoto {
       this.lastMiss = 'off-frame';
       return false;
     }
-    // A pinch frame must stay light: the last capture's mean stands in for a fresh readback.
-    const fresh = now - this.measuredAt < MEAN_FRESH && this.probeMean.lum >= DARK;
-    if (!fresh && !this.measure(video, now)) {
+    // A pinch frame must stay light: the last capture's mean stands in for a readback, however old.
+    // Reading the video back on the pinch frame stalled it 55-85 ms. Only a camera never read is.
+    const lit = this.measuredAt === -Infinity ? this.measure(video, now) : this.probeMean.lum >= DARK;
+    if (!lit) {
       this.lastMiss = 'dark';
       return false;
     }
@@ -1325,11 +1327,9 @@ function makeTexture(canvas: HTMLCanvasElement, slot: { ready: boolean }): Canva
   const tex = new CanvasTexture(canvas);
   tex.premultiplyAlpha = true;
   tex.colorSpace = SRGBColorSpace;
-  // Mipmapped for the shader's hole fill: the photo is premultiplied, so each level is the
-  // alpha-weighted average of what is around a hand cut-out. Level 0 is always read explicitly.
-  tex.minFilter = LinearMipmapLinearFilter;
+  tex.minFilter = LinearFilter;
   tex.magFilter = LinearFilter;
-  tex.generateMipmaps = true;
+  tex.generateMipmaps = false;
   tex.wrapS = ClampToEdgeWrapping;
   tex.wrapT = ClampToEdgeWrapping;
   tex.onUpdate = () => {
