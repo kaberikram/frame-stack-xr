@@ -150,6 +150,13 @@ export class LauncherSystem extends createSystem({}) {
     enter.addEventListener('click', onEnter);
     modeStack.addEventListener('click', onStack);
     modeStretch.addEventListener('click', onStretch);
+    const params = new URLSearchParams(location.search);
+    const lensOn = params.get('lens') === 'overlay';
+    const handsOn = params.get('occ') === 'debug';
+    const consoleOn = params.get('debug') === '1';
+    const checkId = lensOn ? 'checkLens' : handsOn ? 'checkHands' : consoleOn ? 'checkConsole' : '';
+    if (checkId) document.getElementById(checkId)?.setAttribute('aria-current', 'page');
+    if (lensOn || handsOn || consoleOn) applyMode('stretch');
 
     if (this.world.xrEnabled && navigator.xr) {
       navigator.xr.isSessionSupported('immersive-ar').then(

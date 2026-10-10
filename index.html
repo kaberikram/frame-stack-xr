@@ -78,6 +78,14 @@
       .btn:active { transform: scale(0.97); }
       .btn.primary { border-color: var(--text); background: var(--text); color: var(--stage); }
       .btn:disabled { opacity: 0.45; cursor: not-allowed; transform: none; }
+      .checks { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+      .check {
+        height: 30px; padding: 0 10px;
+        border: 1px solid var(--line); border-radius: 8px; background: var(--surface);
+        color: var(--muted); font-size: 12px; font-weight: 650; text-decoration: none;
+        display: inline-flex; align-items: center;
+      }
+      .check[aria-current="page"] { border-color: var(--text); color: var(--text); }
       .hint { margin: 12px 0 0; color: var(--muted); font-size: 12.5px; }
       .toast {
         position: fixed; z-index: 3; top: max(20px, env(safe-area-inset-top, 0px)); left: 50%;
@@ -89,6 +97,7 @@
       @media (hover: hover) {
         .btn:not(:disabled):hover { background: var(--well); }
         .btn.primary:not(:disabled):hover { background: var(--text); opacity: 0.88; }
+        .check:hover { color: var(--text); }
       }
       @media (prefers-reduced-motion: reduce) {
         .btn { transition: none; }
@@ -121,6 +130,12 @@
         <p class="note" id="rateNote"></p>
       </div>
       <div id="stretchPanel" hidden>
+        <div class="checks" aria-label="Stretch checks">
+          <a class="check" id="checkConsole" href="?debug=1">Console</a>
+          <a class="check" id="checkLens" href="?debug=1&amp;lens=overlay">Lens stripes</a>
+          <a class="check" id="checkHands" href="?debug=1&amp;occ=debug">Hand cut</a>
+        </div>
+        <p class="note">Each one reloads the page. Console shows the log, lens stripes lays the camera over the room, and hand cut paints the depth hole magenta.</p>
         <p>Pinch the room and pull, with one hand or both. The surface stretches like taffy, its real texture and all, and long pulls smear into streaks of what you grabbed. Pull a table toward you and it stretches toward you; pull a wall straight back and it bursts. Let go and it springs back, and every pull plays a little tune.</p>
         <ol>
           <li>Finish Space Setup so the headset knows the room.</li>
