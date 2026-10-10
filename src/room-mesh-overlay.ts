@@ -13,7 +13,6 @@ import {
   type Object3D,
 } from '@iwsdk/core';
 import { CHUNK_STRIDE, MAX_TRIANGLES, TARGET_EDGE, type SnapPlane } from './mesh-subdivide.js';
-import { RAISE_MAX } from './raise-map.js';
 import type { RoomPlanes } from './room-planes.js';
 import { createRubberUniforms, rubberMaterial, type RubberUniformSet } from './stretch-material.js';
 
@@ -43,11 +42,11 @@ export class StretchBound {
   readonly lift = new Vector3();
   /** Negative when the grab has no lift. */
   liftRadius = -1;
-  /** Its photo slot raises points toward this eye (raise-map.ts), so chunks behind can reach in. */
-  raise = false;
-  readonly raiseEye = new Vector3();
 }
 
+/** The dense room draws in at most this many runs once gaps are folded in; gaps this short always fold. */
+const MAX_GROUPS = 8;
+const SMALL_GAP = 6000;
 /** Room chunks: the shader's widest band off the grabbed plane (burst and ripple), and the lift's. */
 const BOUND_SLAB = 0.3;
 const LIFT_SLAB = 0.75;
@@ -186,7 +185,7 @@ export class RoomMeshOverlay {
   private readonly groupPool: Group[] = [];
   private readonly groups: Group[] = [];
   private cull = false;
-  private readonly swept = new Float32Array(CHUNK_STRIDE);
+  private pulling = false;
   /** A finished snap waiting for the room to be idle: uploading 2.6 MB mid-pull drops frames. */
   private heldSnap: WorkerReply | null = null;
 
@@ -196,9 +195,13 @@ export class RoomMeshOverlay {
     this.previewMaterial = rubberMaterial(this.uniforms, true);
   }
 
-  /** Draw the room this frame. Off at rest, so nothing renders or uploads. */
-  setActive(on: boolean): void {
+  /**
+   * Draw the room this frame. Off at rest, so nothing renders or uploads. `pulling` is false when
+   * only a debug view keeps it drawn: snaps then still land.
+   */
+  setActive(on: boolean, pulling = on): void {
     this.active = on;
+    this.pulling = pulling;
   }
 
   /** Draw only the chunks a pull can reach with the stretch program; the rest depth only. */
@@ -234,7 +237,7 @@ export class RoomMeshOverlay {
       this.submit(sources, eye);
     } else if (!this.building && this.ready && eye.distanceTo(this.focus) > FOCUS_MOVE) this.submit(sources, eye);
 
-    if (this.heldSnap && !this.active) {
+    if (this.heldSnap && !this.pulling) {
       const held = this.heldSnap;
       this.heldSnap = null;
       this.apply(held);
@@ -320,19 +323,22 @@ export class RoomMeshOverlay {
 
   /**
    * Splits the dense room's draw into runs of chunks: the stretch program where a pull can reach,
-   * depth only elsewhere. Neighbouring chunks of one kind merge, so a frame has a few draws. While
-   * warming, the kinds alternate so both programs compile before the first pinch.
+   * depth only elsewhere. Neighbouring chunks of one kind merge, and short depth-only gaps between
+   * stretch runs draw with the stretch program, so a frame has at most a few draws. Warming at rest
+   * draws chunk 0 depth only and the rest stretched, so both programs compile before the first pinch.
    */
   private chooseChunks(warming: boolean): void {
     const chunks = this.chunks;
     if (!chunks) return;
     const count = chunks.length / CHUNK_STRIDE;
     const groups = this.groups;
+    // Mid-pull a rebuilt room warms by drawing as culled: it is on screen.
+    const warmOnly = warming && !this.active;
     let used = 0;
     let drawn = 0;
     for (let c = 0; c < count; c++) {
       const o = c * CHUNK_STRIDE;
-      const stretch = warming ? c % 2 === 0 : !this.cull || this.reaches(chunks, o);
+      const stretch = warmOnly ? c > 0 || count === 1 : !this.cull || this.reaches(chunks, o);
       const kind = stretch ? 0 : 1;
       if (stretch) drawn++;
       const start = chunks[o];
@@ -348,19 +354,42 @@ export class RoomMeshOverlay {
       group.materialIndex = kind;
       groups[used++] = group;
     }
-    groups.length = used;
+    groups.length = this.mergeGaps(used);
     this.chunksDrawn = drawn;
+  }
+
+  /**
+   * Morton order keeps cells local only in blocks, so a pull's reach leaves dozens of runs. Folds
+   * the smallest depth-only run between two stretch runs into them, while more than MAX_GROUPS
+   * remain or the gap is under SMALL_GAP indices: stretching a few unmoved chunks costs less than a
+   * draw call each. Returns the new run count.
+   */
+  private mergeGaps(used: number): number {
+    const g = this.groups;
+    while (used > 2) {
+      let best = -1;
+      let smallest = Infinity;
+      for (let i = 1; i < used - 1; i++) {
+        if (g[i].materialIndex === 1 && g[i].count < smallest) {
+          best = i;
+          smallest = g[i].count;
+        }
+      }
+      if (best < 0 || (used <= MAX_GROUPS && smallest > SMALL_GAP)) break;
+      g[best - 1].count += g[best].count + g[best + 1].count;
+      for (let i = best; i + 2 < used; i++) g[i] = g[i + 2];
+      used -= 2;
+    }
+    return used;
   }
 
   private reaches(chunks: Float32Array, o: number): boolean {
     for (let k = 0; k < this.bounds.length; k++) {
       const b = this.bounds[k];
       if (!b.on) continue;
-      // A raised point starts up to RAISE_MAX toward the eye: test the box swept that way.
-      const box = b.raise ? sweep(chunks, o, b.raiseEye, this.swept) : chunks;
-      const at = b.raise ? 0 : o;
-      if (b.liftRadius > 0 && boxSphere(box, at, b.lift, b.liftRadius)) return true;
-      if (boxSphere(box, at, b.centre, b.radius) && boxSlab(box, at, b.centre, b.normal, b.slab)) return true;
+      // Raised points need nothing extra: they bend by their scanned position, which the box holds.
+      if (b.liftRadius > 0 && boxSphere(chunks, o, b.lift, b.liftRadius)) return true;
+      if (boxSphere(chunks, o, b.centre, b.radius) && boxSlab(chunks, o, b.centre, b.normal, b.slab)) return true;
     }
     return false;
   }
@@ -476,8 +505,8 @@ export class RoomMeshOverlay {
     if (reply.id !== this.requestId) return;
     const snapped = `snapped ${reply.moved} verts to ${reply.planes} planes`;
     if (reply.kind === 'snap' || !reply.indices) {
-      if (this.active) {
-        // Mid-pull: keep the newest snap and land it once the room is idle.
+      if (this.pulling) {
+        // Mid-pull: keep the newest snap and land it once the pull is over.
         this.heldSnap = reply;
         return;
       }
@@ -564,23 +593,3 @@ function boxSlab(b: Float32Array, o: number, c: Vector3, n: Vector3, half: numbe
   return Math.abs(s) <= half + reach;
 }
 
-/** The chunk's box grown by itself moved RAISE_MAX toward `eye`, into `out` at 0. */
-function sweep(b: Float32Array, o: number, eye: Vector3, out: Float32Array): Float32Array {
-  const cx = (b[o + 2] + b[o + 5]) * 0.5;
-  const cy = (b[o + 3] + b[o + 6]) * 0.5;
-  const cz = (b[o + 4] + b[o + 7]) * 0.5;
-  const dx = eye.x - cx;
-  const dy = eye.y - cy;
-  const dz = eye.z - cz;
-  const scale = RAISE_MAX / Math.max(1e-6, Math.hypot(dx, dy, dz));
-  const mx = dx * scale;
-  const my = dy * scale;
-  const mz = dz * scale;
-  out[2] = b[o + 2] + Math.min(0, mx);
-  out[3] = b[o + 3] + Math.min(0, my);
-  out[4] = b[o + 4] + Math.min(0, mz);
-  out[5] = b[o + 5] + Math.max(0, mx);
-  out[6] = b[o + 6] + Math.max(0, my);
-  out[7] = b[o + 7] + Math.max(0, mz);
-  return out;
-}

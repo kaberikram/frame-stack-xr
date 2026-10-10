@@ -20,8 +20,8 @@ const enum Slot {
 
 /**
  * Frame timing for the console header, about once a second: frame rate and 95th-percentile frame
- * time, the stretch system's own update (mean/max), three's render call on the CPU, GPU time per
- * frame where the browser exposes timer queries, the draw calls and triangles of the last frame, and
+ * time, the stretch system's own update (mean/max), three's render call on the CPU, the GPU time of
+ * that render where the browser exposes timer queries, the draw calls and triangles of the last frame, and
  * how many room chunks drew with the stretch program. Allocates nothing per frame.
  */
 export class FrameMeter {
@@ -46,7 +46,11 @@ export class FrameMeter {
   private readonly timer: TimerQuery | null;
   private readonly queries: WebGLQuery[] = [];
   private readonly state = new Uint8Array(QUERIES);
+  /** Set for queries that were in flight when the GPU reported a disjoint event: their time is bad. */
+  private readonly tainted = new Uint8Array(QUERIES);
   private running = -1;
+  /** frame() ran this frame, so the main render that follows is timed. */
+  private armed = false;
   private readonly before: Scene['onBeforeRender'];
   private readonly after: Scene['onAfterRender'];
 
@@ -65,10 +69,13 @@ export class FrameMeter {
     const meter = this;
     scene.onBeforeRender = function (...args) {
       meter.renderStart = performance.now();
+      if (meter.armed) meter.beginQuery();
       meter.before.apply(this, args);
     };
     scene.onAfterRender = function (...args) {
       meter.after.apply(this, args);
+      meter.endQuery();
+      meter.armed = false;
       meter.calls = renderer.info.render.calls;
       meter.triangles = renderer.info.render.triangles;
       if (meter.renderStart > 0) {
@@ -90,14 +97,16 @@ export class FrameMeter {
     this.updN++;
     if (updateMs > this.updMax) this.updMax = updateMs;
     if (room > this.roomMax) this.roomMax = room;
+    this.armed = true;
     this.pollGpu();
     if (now - this.reportAt < REPORT_GAP) return '';
     this.reportAt = now;
     return this.report(chunks);
   }
 
-  /** Call on frames that are not measured, so no timer query is left running across a pause. */
+  /** Call on frames that are not measured: the next render is not timed. */
   idle(): void {
+    this.armed = false;
     if (this.running >= 0 && this.gl && this.timer) {
       this.gl.endQuery(this.timer.TIME_ELAPSED_EXT);
       this.state[this.running] = Slot.Free;
@@ -113,32 +122,47 @@ export class FrameMeter {
     this.queries.length = 0;
   }
 
-  /** Ends the query begun last frame (it covered that frame's render), reads finished ones, begins another. */
+  /**
+   * Starts timing the main render (from the scene's onBeforeRender), in a free query. Only the render
+   * is timed: a query left open from one update to the next also counted the GPU idling for vsync.
+   */
+  private beginQuery(): void {
+    const gl = this.gl;
+    const timer = this.timer;
+    if (!gl || !timer || this.running >= 0) return;
+    for (let i = 0; i < this.queries.length; i++) {
+      if (this.state[i] !== Slot.Free) continue;
+      gl.beginQuery(timer.TIME_ELAPSED_EXT, this.queries[i]);
+      this.state[i] = Slot.Running;
+      this.tainted[i] = 0;
+      this.running = i;
+      return;
+    }
+  }
+
+  private endQuery(): void {
+    if (this.running < 0 || !this.gl || !this.timer) return;
+    this.gl.endQuery(this.timer.TIME_ELAPSED_EXT);
+    this.state[this.running] = Slot.Waiting;
+    this.running = -1;
+  }
+
+  /** Reads finished queries. A disjoint event spoils every query in flight, not just the next one read. */
   private pollGpu(): void {
     const gl = this.gl;
     const timer = this.timer;
     if (!gl || !timer || this.queries.length === 0) return;
-    if (this.running >= 0) {
-      gl.endQuery(timer.TIME_ELAPSED_EXT);
-      this.state[this.running] = Slot.Waiting;
-      this.running = -1;
+    if (gl.getParameter(timer.GPU_DISJOINT_EXT) as boolean) {
+      for (let i = 0; i < this.queries.length; i++) if (this.state[i] !== Slot.Free) this.tainted[i] = 1;
     }
-    const disjoint = gl.getParameter(timer.GPU_DISJOINT_EXT) as boolean;
-    let free = -1;
     for (let i = 0; i < this.queries.length; i++) {
-      if (this.state[i] === Slot.Waiting && gl.getQueryParameter(this.queries[i], gl.QUERY_RESULT_AVAILABLE)) {
-        if (!disjoint) {
-          this.gpuSum += (gl.getQueryParameter(this.queries[i], gl.QUERY_RESULT) as number) / 1e6;
-          this.gpuN++;
-        }
-        this.state[i] = Slot.Free;
+      if (this.state[i] !== Slot.Waiting || !gl.getQueryParameter(this.queries[i], gl.QUERY_RESULT_AVAILABLE)) continue;
+      if (!this.tainted[i]) {
+        this.gpuSum += (gl.getQueryParameter(this.queries[i], gl.QUERY_RESULT) as number) / 1e6;
+        this.gpuN++;
       }
-      if (this.state[i] === Slot.Free && free < 0) free = i;
-    }
-    if (free >= 0) {
-      gl.beginQuery(timer.TIME_ELAPSED_EXT, this.queries[free]);
-      this.state[free] = Slot.Running;
-      this.running = free;
+      this.state[i] = Slot.Free;
+      this.tainted[i] = 0;
     }
   }
 

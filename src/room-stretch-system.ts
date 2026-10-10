@@ -61,9 +61,9 @@ const RAMP_NEAR = 0.8;
 /** The smoothing step never exceeds this: a long frame cannot land a whole pull at once. */
 const STEP_MAX = 1 / 50;
 /**
- * The surface never follows faster than this, m/s of real time. Above a quick pull's hand speed, so
- * it only binds on a hitch (the pinch frame); at 2.5 m/s over the capped step it held every quick
- * pull to 5 cm a frame.
+ * The surface never follows faster than this, m/s over the capped step: above a quick pull's hand
+ * speed on a normal frame (at 2.5 m/s it held every quick pull to 5 cm a frame), and on a long
+ * frame it holds the jump to FOLLOW_MAX * STEP_MAX = 12 cm.
  */
 const FOLLOW_MAX = 6;
 /** The pinch ray must meet the grabbed plane within ~78° of its normal to slide. */
@@ -613,11 +613,12 @@ export class RoomStretchSystem extends createSystem({
       }
       // The depth debug views show the whole room, pinched or not, so they draw all of it.
       const debugView = this.overlay.uniforms.uLensOn.value > 0 || OCC_DEBUG || OCC_DELTA;
-      this.overlay.setActive(active || debugView);
+      this.overlay.setActive(active || debugView, active);
       this.overlay.setCull(CULL && !debugView);
+      // Uniforms and chunk bounds first: the chunks drawn this frame must match this frame's pull.
+      this.publish(this.left, this.right, time, hasVideo);
       this.overlay.sync(meshes, this.head);
       this.overlay.syncPlanes(this.roomPlanes);
-      this.publish(this.left, this.right, time, hasVideo);
       this.sing(this.left);
       this.sing(this.right);
       this.rearmCamera(now);
@@ -1189,7 +1190,7 @@ export class RoomStretchSystem extends createSystem({
       grab.Dprev.copy(grab.D);
       grab.D.lerp(grab.target, f);
       const jump = this.tmp.copy(grab.D).sub(grab.Dprev);
-      const most = FOLLOW_MAX * dt;
+      const most = FOLLOW_MAX * step;
       if (jump.lengthSq() > most * most) grab.D.copy(grab.Dprev).addScaledVector(jump, most / jump.length());
       grab.Dvel.copy(grab.D).sub(grab.Dprev).multiplyScalar(inv);
       const e = grab.E + (grab.explodeTo - grab.E) * f;
@@ -1478,14 +1479,10 @@ export class RoomStretchSystem extends createSystem({
     this.boundGrab(b1, g1, g0.on && g1.chain ? moveReach(g0, this.boundLook()) : 0);
   }
 
-  /** Where a grab can move the room this frame; its raise map lets chunks behind it reach in. */
+  /** Where a grab can move the room this frame. */
   private boundGrab(bound: StretchBound, grab: Grab, grow: number): void {
     bound.on = grab.on;
-    if (!grab.on) return;
-    fillBound(bound, grab, this.boundLook(), grow);
-    const U = this.overlay.uniforms;
-    bound.raise = (grab.slot === 0 ? U.uRaiseOn0.value : U.uRaiseOn1.value) > 0;
-    bound.raiseEye.copy(this.raise.maps[grab.slot].eye);
+    if (grab.on) fillBound(bound, grab, this.boundLook(), grow);
   }
 
   private boundLook(): BoundLook {

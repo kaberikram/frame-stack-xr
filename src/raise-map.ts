@@ -30,6 +30,8 @@ const SIZE = 256;
 const RAISE_FAR = 6;
 /** Depth texels this close to a hand segment (past its own radius) belong to the hand. */
 const HAND_CLEAR = 0.05;
+/** A hand texel looks this many steps of 2 texels along each of 8 directions for what is behind it. */
+const FILL_STEPS = 48;
 
 const COPY_VERTEX = /* glsl */ `
 varying vec2 vUv;
@@ -79,10 +81,11 @@ void main() {
   vec3 ray = onRay.xyz / onRay.w;
   vec3 world = (uEyeWorld * vec4(ray * (m / max(-ray.z, 1e-5)), 1.0)).xyz;
   // Hands and forearms are not furniture: the pinching hand sits right on the grabbed surface.
+  // Marked -1, unknown, for the fill pass to take from around it.
   for (int i = 0; i < ${SEGMENTS}; i++) {
     if (uSegA[i].w < 0.5) continue;
     if (segmentDistance(world, uSegA[i].xyz, uSegB[i].xyz) < uSegB[i].w + ${HAND_CLEAR.toFixed(3)}) {
-      gl_FragColor = vec4(0.0);
+      gl_FragColor = vec4(-1.0, 0.0, 0.0, 1.0);
       return;
     }
   }
@@ -90,9 +93,50 @@ void main() {
 }
 `;
 
-/** One frozen copy of the headset's depth, and how to look a world point up in it. */
-export class RaiseMap {
-  readonly target = new WebGLRenderTarget(SIZE, SIZE, {
+/**
+ * What is behind the hand: each hand texel looks outward along 8 directions for the first texel
+ * that is not hand. Only when all 8 find a depth does it take one, the farthest, so a hand at an
+ * object's edge leaves the scan alone rather than raising wall onto the object. Without this the
+ * patch behind the pinching hand stayed on the scan while the object around it was raised.
+ */
+const FILL_FRAGMENT = /* glsl */ `
+uniform sampler2D uSource;
+varying vec2 vUv;
+
+void main() {
+  ivec2 size = textureSize(uSource, 0);
+  ivec2 at = ivec2(vUv * vec2(size));
+  float v = texelFetch(uSource, at, 0).r;
+  if (v >= 0.0) {
+    gl_FragColor = vec4(v, 0.0, 0.0, 1.0);
+    return;
+  }
+  float far = 0.0;
+  for (int d = 0; d < 8; d++) {
+    float a = float(d) * 0.78539816;
+    vec2 dir = vec2(cos(a), sin(a)) * 2.0;
+    float found = -1.0;
+    for (int k = 1; k <= ${FILL_STEPS}; k++) {
+      ivec2 q = at + ivec2(round(dir * float(k)));
+      if (q.x < 0 || q.y < 0 || q.x >= size.x || q.y >= size.y) break;
+      float w = texelFetch(uSource, q, 0).r;
+      if (w >= 0.0) {
+        found = w;
+        break;
+      }
+    }
+    if (found <= 0.0) {
+      gl_FragColor = vec4(0.0);
+      return;
+    }
+    far = max(far, found);
+  }
+  gl_FragColor = vec4(far, 0.0, 0.0, 1.0);
+}
+`;
+
+function depthTarget(): WebGLRenderTarget {
+  return new WebGLRenderTarget(SIZE, SIZE, {
     type: HalfFloatType,
     format: RedFormat,
     depthBuffer: false,
@@ -100,6 +144,11 @@ export class RaiseMap {
     magFilter: NearestFilter,
     generateMipmaps: false,
   });
+}
+
+/** One frozen copy of the headset's depth, and how to look a world point up in it. */
+export class RaiseMap {
+  readonly target = depthTarget();
   /** World point to homogeneous raise-map uv; w is the point's depth in front of the eye. */
   readonly toMap = new Matrix4();
   readonly eye = new Vector3();
@@ -109,10 +158,11 @@ export class RaiseMap {
 /**
  * Real objects the room scan missed (a lamp, a plush toy, the glass of a door) from the headset's
  * depth. At a pinch, the depth of the eye the depth was taken from is copied into a small map, with
- * the hands cleared out; the stretch's vertex stage then slides each scanned point that sits 3-80 cm
- * behind the measured surface onto it, along that eye's line of sight. The photo then lands on the
- * object itself and stretches with it, and a pull beside it no longer smears a flat copy of it
- * across the wall. One map per photo slot; `?lens=overlay` refreshes slot 0 every frame to check it.
+ * the hands filled in from what is around them. The stretch's vertex stage then slides each scanned
+ * point that sits 3-80 cm behind the measured surface onto it, along that eye's line of sight, and
+ * bends it as the scan behind it bends. The photo lands on the object itself and stretches with it,
+ * and a pull beside it no longer smears a flat copy of it across the wall. One map per photo slot;
+ * `?lens=overlay` refreshes slot 0 every frame to check it.
  */
 export class RaiseMaps {
   readonly maps = [new RaiseMap(), new RaiseMap()];
@@ -121,7 +171,10 @@ export class RaiseMaps {
   private readonly scene = new Scene();
   private readonly camera = new OrthographicCamera(-1, 1, 1, -1, 0, 1);
   private readonly material: ShaderMaterial;
+  private readonly fillMaterial: ShaderMaterial;
   private readonly quad: Mesh;
+  /** The copy pass lands here, hand texels marked; the fill pass writes the slot's map from it. */
+  private readonly scratch = depthTarget();
   private readonly eyeWorld = new Matrix4();
   private readonly tmp = new Matrix4();
   private readonly uvFromClip = new Matrix4();
@@ -145,6 +198,13 @@ export class RaiseMaps {
       depthTest: false,
       depthWrite: false,
     });
+    this.fillMaterial = new ShaderMaterial({
+      vertexShader: COPY_VERTEX,
+      fragmentShader: FILL_FRAGMENT,
+      uniforms: { uSource: { value: this.scratch.texture } },
+      depthTest: false,
+      depthWrite: false,
+    });
     // One triangle over the whole target.
     const geometry = new BufferGeometry();
     geometry.setAttribute('position', new BufferAttribute(new Float32Array([-1, -1, 0, 3, -1, 0, -1, 3, 0]), 3));
@@ -153,6 +213,11 @@ export class RaiseMaps {
     this.scene.add(this.quad);
     // Clip space to view uv, with z dropped so normDepthBufferFromNormView sees (u, v, 0, 1).
     this.uvFromClip.set(0.5, 0, 0, 0.5, 0, 0.5, 0, 0.5, 0, 0, 0, 0, 0, 0, 0, 1);
+    // Compile both programs and allocate every target now, outside any session, not on a pinch.
+    // Drawn into the real targets, so the programs match the ones a capture uses.
+    if (this.supported) {
+      for (let i = 0; i < this.maps.length; i++) this.draw(renderer, this.maps[i].target);
+    }
   }
 
   /**
@@ -198,22 +263,35 @@ export class RaiseMaps {
     map.toMap.premultiply(this.tmp.copy(depth.normDepth[0]));
     map.eye.setFromMatrixPosition(this.eyeWorld);
 
-    // Drawn outside the XR camera: with xr enabled, three would swap in the headset's eyes.
-    const xr = renderer.xr;
-    const wasXr = xr.enabled;
-    const previous = renderer.getRenderTarget();
-    xr.enabled = false;
-    renderer.setRenderTarget(map.target);
-    renderer.render(this.scene, this.camera);
-    renderer.setRenderTarget(previous);
-    xr.enabled = wasXr;
+    this.draw(renderer, map.target);
     map.on = true;
     return true;
   }
 
   dispose(): void {
     for (let i = 0; i < this.maps.length; i++) this.maps[i].target.dispose();
+    this.scratch.dispose();
     this.quad.geometry.dispose();
     this.material.dispose();
+    this.fillMaterial.dispose();
+  }
+
+  /**
+   * The copy pass into the scratch target, then the fill into `target`. Outside the XR camera: with
+   * xr enabled, three would swap in the headset's eyes.
+   */
+  private draw(renderer: WebGLRenderer, target: WebGLRenderTarget): void {
+    const xr = renderer.xr;
+    const wasXr = xr.enabled;
+    const previous = renderer.getRenderTarget();
+    xr.enabled = false;
+    this.quad.material = this.material;
+    renderer.setRenderTarget(this.scratch);
+    renderer.render(this.scene, this.camera);
+    this.quad.material = this.fillMaterial;
+    renderer.setRenderTarget(target);
+    renderer.render(this.scene, this.camera);
+    renderer.setRenderTarget(previous);
+    xr.enabled = wasXr;
   }
 }

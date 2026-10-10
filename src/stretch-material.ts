@@ -151,6 +151,7 @@ uniform float uRippleK;
 uniform float uRippleSpeed;
 
 varying vec3 vRest;
+varying vec3 vScan; // the scanned point before any raise: what the bends and streak weights measure
 varying vec3 vWorld;
 varying vec3 vMid;  // after the first grab: where the second grab measures its column from
 varying vec2 vMask; // x: visible displacement (m), y: how much a squeezed zone hands back to the room
@@ -259,12 +260,16 @@ void pinch(inout vec3 p, inout float seen, inout float hide, out float own,
 }
 
 void main() {
-  vec3 rest = (modelMatrix * vec4(position, 1.0)).xyz;
+  vec3 scan = (modelMatrix * vec4(position, 1.0)).xyz;
+  vec3 rest = scan;
 #ifdef ENV_DEPTH
   bool raised = uRaiseOn0 > 0.5 && raiseOnto(rest, uRaise0, uRaiseToMap0, uRaiseEye0);
   if (!raised && uRaiseOn1 > 0.5) raiseOnto(rest, uRaise1, uRaiseToMap1, uRaiseEye1);
 #endif
-  vec3 p = rest;
+  // The bends are measured on the scan, as the grab point and its plane are, and the raise rides
+  // along as a fixed offset: weighed from the raised point, an object standing off the grabbed
+  // surface fell outside its falloffs and stayed put while the patch behind the hand slid away.
+  vec3 p = scan;
   float seen = 0.0;
   float hide = 0.0;
   float own0 = 0.0;
@@ -272,11 +277,13 @@ void main() {
   if (uOn0 > 0.5) pinch(p, seen, hide, own0, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0, uRamp0);
   // A later grab that began on the already-moved surface bends what you saw; two grabs that began
   // together each bend the rest surface and their moves add, so neither squeezes into the other.
-  vec3 base1 = uChain1 > 0.5 ? p : rest;
+  vec3 base1 = uChain1 > 0.5 ? p : scan;
   vec3 p1 = base1;
   if (uOn1 > 0.5) pinch(p1, seen, hide, own1, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1, uRamp1);
   p += p1 - base1;
+  p += rest - scan;
   vMid = base1;
+  vScan = scan;
   vRest = rest;
   vWorld = p;
   vMask = vec2(seen * (1.0 - smoothstep(0.6, 1.0, hide)), ease(hide));
@@ -344,6 +351,7 @@ const float LENS_STRIPE = 96.0;
 #endif
 
 varying vec3 vRest;
+varying vec3 vScan; // the scanned point before any raise: what the bends and streak weights measure
 varying vec3 vWorld;
 varying vec3 vMid;
 varying vec2 vMask;
@@ -514,8 +522,8 @@ float photoCover(mat4 toClip, vec3 cam, float has, vec3 p, vec3 nr, float streak
  * so a half-transparent edge texel of a hand cut-out came back too dark; that is undone here. Opaque
  * and empty texels need nothing.
  */
-vec4 photoTexelLod(sampler2D tex, vec2 uv, float lod) {
-  vec4 t = textureLod(tex, uv, lod);
+vec4 photoTexel(sampler2D tex, vec2 uv) {
+  vec4 t = textureLod(tex, uv, 0.0);
   if (t.a > 0.004 && t.a < 0.996) {
     vec3 encoded = sRGBTransferOETF(vec4(t.rgb, 1.0)).rgb / t.a;
     t.rgb = sRGBTransferEOTF(vec4(encoded, 1.0)).rgb * t.a;
@@ -523,20 +531,18 @@ vec4 photoTexelLod(sampler2D tex, vec2 uv, float lod) {
   return t;
 }
 
-vec4 photoTexel(sampler2D tex, vec2 uv) {
-  return photoTexelLod(tex, uv, 0.0);
-}
-
 /**
  * What surrounds a hand cut-out, as an opaque premultiplied colour: the photo's mip levels are
  * alpha-weighted averages over 8, 32, 128 and 512 texels, so the finest one with any picture in it
- * leads (a pull-push fill, one tap per level). Clear only if the whole photo is.
+ * leads (a pull-push fill, one tap per level). Clear only if the whole photo is. Read raw: WebGL2
+ * builds SRGB8_ALPHA8 mips from decoded texels, so above level 0 they are already linear
+ * premultiplied, and photoTexel's fix would brighten every partly covered one.
  */
 vec4 holeFill(sampler2D tex, vec2 uv) {
-  vec4 acc = photoTexelLod(tex, uv, 3.0);
-  acc += photoTexelLod(tex, uv, 5.0) * (1.0 - acc.a);
-  acc += photoTexelLod(tex, uv, 7.0) * (1.0 - acc.a);
-  acc += photoTexelLod(tex, uv, 9.0) * (1.0 - acc.a);
+  vec4 acc = textureLod(tex, uv, 3.0);
+  acc += textureLod(tex, uv, 5.0) * (1.0 - acc.a);
+  acc += textureLod(tex, uv, 7.0) * (1.0 - acc.a);
+  acc += textureLod(tex, uv, 9.0) * (1.0 - acc.a);
   return acc.a > 1e-3 ? acc / acc.a : vec4(0.0);
 }
 
@@ -593,8 +599,9 @@ void main() {
 
 #ifdef ENV_DEPTH
   // Neither grab moved this triangle: it stays real. Leave before any streak or photo work, which
-  // would only arrive at alpha 0 (own is 0 below). The debug views draw everywhere, so they stay.
-  if (uOccDebug < 0.5 && max(vW.x, vW.y) <= 0.0) {
+  // would only arrive at alpha 0: below 1e-4 m, own is under 3e-4, so alpha takes the clear below
+  // anyway (a strict 0 test failed on sway's sin(pi) rounding). The debug views draw everywhere.
+  if (uOccDebug < 0.5 && max(vW.x, vW.y) <= 1e-4) {
     gl_FragColor = vec4(0.0);
     return;
   }
@@ -607,7 +614,7 @@ void main() {
   // fades out exactly where its pull does, so the blend has no seam at either pinch.
   float st0 = 0.0;
   float st1 = 0.0;
-  vec4 o0 = uOn0 > 0.5 && uBloom0 > 0.0 && vW.x > 0.0 ? streakOffset(vRest, uG0, uD0, uAxis0, uN0, uBloom0, uRamp0, st0) : vec4(0.0);
+  vec4 o0 = uOn0 > 0.5 && uBloom0 > 0.0 && vW.x > 0.0 ? streakOffset(vScan, uG0, uD0, uAxis0, uN0, uBloom0, uRamp0, st0) : vec4(0.0);
   vec4 o1 = uOn1 > 0.5 && uBloom1 > 0.0 && vW.y > 0.0 ? streakOffset(vMid, uG1, uD1, uAxis1, uN1, uBloom1, uRamp1, st1) : vec4(0.0);
   float m0 = length(o0.xyz);
   float m1 = length(o1.xyz);
