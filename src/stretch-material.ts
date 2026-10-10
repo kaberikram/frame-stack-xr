@@ -167,7 +167,7 @@ const float SQUASH = 2.0;       // squeezed zones are 2 m long per metre pulled;
 const float FOLDS = 5.0;        // radial creases in a cone
 const float FOLD_DEPTH = 0.12;  // their depth, as a share of the cone's rise
 const float GATHER = 0.35;      // how far the cone's hem is drawn in toward the pinch, as a share of its rise
-const float SPIKE_GATHER = 0.6; // and a fingertip spike's surroundings toward the point under the finger
+const float SPIKE_GATHER = 1.0; // and a fingertip spike's surroundings toward the point under the finger
 ${SHARED}
 
 /**

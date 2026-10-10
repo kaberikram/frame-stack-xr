@@ -34,8 +34,8 @@ import type { RubberUniformSet } from './stretch-material.js';
 import { StretchSound } from './stretch-sound.js';
 
 type Side = 'left' | 'right';
-/** What held a cone's height: it followed the hand, sat just behind the fingers, hit its cap, or the photo's edge. */
-type LiftLimit = 'hand' | 'tip' | 'cap' | 'cover';
+/** What held a cone's height: it followed the hand, sat just behind the fingers, or hit its cap. */
+type LiftLimit = 'hand' | 'tip' | 'cap';
 const SIDES: readonly Side[] = ['left', 'right'];
 
 /** Hand travel below half of this does nothing; full response at one and a half. */
@@ -71,23 +71,21 @@ const TOWARD_DEAD = 0.02;
 const TENT_FRAC = 0.7;
 const TENT_MAX = 1.2;
 /**
- * How wide the cone's foot is per metre of rise (stretch-material.ts tentR): wide enough that its
- * steepest slope along the surface, from the lift's in-plane share and the gather, stays under 0.9.
+ * How near the surface was to the fingers at the pinch, as a 0..1 share: full with the surface within
+ * NEAR_FULL behind the fingers (a table pinched on), none from NEAR_NONE (a wall across the room).
+ * Near, a pull toward you holds back CLOTH_DRAG of the slide toward you and the spot follows your
+ * fingertips as cloth instead.
  */
-function tentSpread(liftIn: number): number {
-  return Math.max(0.6, (1.8 * liftIn + 0.35) / 0.9);
-}
+const NEAR_FULL = 0.08;
+const NEAR_NONE = 0.35;
+const CLOTH_DRAG = 0.6;
+/** The cone's direction turns toward where it is aimed at this rate, 1/s. */
+const LIFT_TURN = 12;
 /** The burst along the surface, now a side note to the cone: this share of before, and at most this far. */
 const BURST_SHARE = 0.35;
 const EXPLODE_MAX = 0.3;
-/** The cone's tip stops this far behind the fingers; a photo is measured this far around the pinch. */
+/** The cone's tip stops this far behind the fingers. */
 const TIP_CLEAR = 0.05;
-const COVER_MAX = 2;
-/**
- * The cover is measured to this uv margin. A bank photo may hold the grab point only 0.06 in from its
- * edge (CENTER_MIN), so measuring to SLIDE_MARGIN (0.1) found no cover at all and the cone never rose.
- */
-const COVER_MARGIN = 0.02;
 /**
  * A long cone carries the pinched spot's colours up into its tip, from this share of the way, fully
  * this much later. Late, so most pulls read as cloth with its own texture rather than taffy.
@@ -98,13 +96,14 @@ const TENT_STREAK_SPAN = 0.3;
  * Fingertip vacuum: an index fingertip this close to a surface (no pinch) sucks it up. The pull
  * starts at SPIKE_RANGE and is full by SPIKE_FULL; the surface then reaches SPIKE_REACH of the way to
  * the tip, stopping at least SPIKE_KEEP short, so a fingertip resting on the table raises nothing.
- * About 4.7 cm at 15 cm, 6.5 cm at 10-12 cm. Its base radius grows from SPIKE_RADIUS with its height.
+ * About 5.6 cm at 20 cm, 10.7 cm at 15 cm (4 cm short of the tip), 9.7 cm at 12 cm (2 cm short). Its
+ * base radius grows from SPIKE_RADIUS with its height.
  */
-const SPIKE_RANGE = 0.22;
-const SPIKE_FULL = 0.08;
-const SPIKE_REACH = 0.85;
+const SPIKE_RANGE = 0.25;
+const SPIKE_FULL = 0.12;
+const SPIKE_REACH = 0.9;
 const SPIKE_KEEP = 0.012;
-const SPIKE_RADIUS = 0.12;
+const SPIKE_RADIUS = 0.15;
 const SPIKE_WIDEN = 0.6;
 /** Below this height there is no spike to draw. */
 const SPIKE_MIN = 2e-4;
@@ -113,9 +112,13 @@ const SPIKE_STIFF = 320;
 const SPIKE_DAMP = 22;
 /** A table plane counts under a spike only this far below the hit: where the dense room was snapped onto it. */
 const SPIKE_CLUTTER = 0.02;
-/** A spike's photo ring, and how soon a failed freeze may be tried again. */
+/**
+ * A spike's photo ring, and how soon a failed freeze may be tried again. With no clean bank photo by
+ * SPIKE_LIVE_AFTER, it takes the live frame with the hands cut out: the finger hides the cut anyway.
+ */
 const SPIKE_FOOTPRINT = 0.15;
 const SPIKE_RETRY = 0.4;
+const SPIKE_LIVE_AFTER = 0.5;
 /** The spike's foot glides after the fingertip with this time constant (s). */
 const SPIKE_GLIDE = 0.04;
 /**
@@ -218,7 +221,9 @@ interface Grab {
   /** Head-to-hand direction at the pinch. Travel across it is sideways, not toward you. */
   ray0: Vector3;
   reach0: number;
+  /** The cone's direction, eased toward `liftAim`, where aim() points it. */
   lift: Vector3;
+  liftAim: Vector3;
   target: Vector3;
   D: Vector3;
   Dprev: Vector3;
@@ -262,9 +267,9 @@ interface Grab {
   /** What the slide caps were measured against (span between hands, or the ramp), and whether they bit. */
   span: number;
   capped: boolean;
-  /** How far the grab's photo reaches around it in the surface (measureCover). */
-  coverR: number;
-  /** What held the cone this frame (aim), and at its peak: your fingers, the cap, or the photo's cover. */
+  /** How near the surface was behind the fingers at the pinch, 0..1 (NEAR_FULL, NEAR_NONE). */
+  near: number;
+  /** What held the cone this frame (aim), and at its peak: your fingers, or the cap. */
   liftWhy: LiftLimit;
   peakWhy: LiftLimit;
   /**
@@ -328,6 +333,7 @@ function makeGrab(side: Side): Grab {
     ray0: new Vector3(0, 0, -1),
     reach0: 0.45,
     lift: new Vector3(0, 0, 1),
+    liftAim: new Vector3(0, 0, 1),
     target: new Vector3(),
     D: new Vector3(),
     Dprev: new Vector3(),
@@ -363,7 +369,7 @@ function makeGrab(side: Side): Grab {
     chain: false,
     span: 0,
     capped: false,
-    coverR: COVER_MAX,
+    near: 0,
     liftWhy: 'hand',
     peakWhy: 'hand',
     hovering: false,
@@ -1185,7 +1191,9 @@ export class RoomStretchSystem extends createSystem({
     grab.dist = Math.max(0.2, this.head.distanceTo(grab.worldG));
     grab.ramp = this.look.ramp * Math.max(1, grab.dist / RAMP_NEAR);
     grab.span = grab.ramp;
+    grab.near = 1 - smooth((grab.dist - grab.reach0 - NEAR_FULL) / (NEAR_NONE - NEAR_FULL));
     grab.lift.copy(this.head).sub(grab.worldG).normalize();
+    grab.liftAim.copy(grab.lift);
     this.writeFootprint(grab);
     const freezeAt = performance.now();
     const frozen = this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, true, this.camera, now, this.handJoints(), this.head);
@@ -1203,7 +1211,6 @@ export class RoomStretchSystem extends createSystem({
       this.sound.miss(grab.slot, this.pinch.x, this.pinch.y, this.pinch.z);
       return;
     }
-    this.measureCover(grab);
     const n = grab.normal;
     const surface = Math.abs(n.y) < 0.5 ? 'wall' : n.y > 0 ? 'table' : 'ceiling';
     console.info(
@@ -1326,9 +1333,10 @@ export class RoomStretchSystem extends createSystem({
     const slot = this.photo.slots[grab.slot];
     if (grab.hoverPhoto && slot.has && this.photo.slotContains(grab.slot, grab.hoverC, SLIDE_MARGIN)) return;
     if (now < grab.hoverRetryAt) return;
-    grab.hoverRetryAt = now + SPIKE_RETRY;
+    const liveOk = now - grab.hoverAt >= SPIKE_LIVE_AFTER;
+    grab.hoverRetryAt = liveOk ? now + SPIKE_RETRY : Math.min(now + SPIKE_RETRY, grab.hoverAt + SPIKE_LIVE_AFTER);
     this.writeFootprintAt(grab.hoverC, grab.hoverN, SPIKE_FOOTPRINT);
-    const frozen = this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, true, this.camera, now, this.handJoints(), this.head, false);
+    const frozen = this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, true, this.camera, now, this.handJoints(), this.head, liveOk);
     grab.hoverPhoto = frozen;
     if (!frozen) grab.hoverFade = 0;
   }
@@ -1336,9 +1344,10 @@ export class RoomStretchSystem extends createSystem({
   /** One console line per spike, then back to rest. `keep` leaves the slot photo to a pinch that took over. */
   private endSpike(grab: Grab, now: number, keep: boolean): void {
     if (grab.hoverPeak > 0.003) {
+      const photo = grab.hoverPhoto ? (this.photo.slots[grab.slot].live ? 'live' : 'bank') : 'none';
       console.info(
         `[jonze] hover ${grab.side === 'left' ? 'L' : 'R'} ${grab.hoverSurface} from ${(grab.hoverFrom * 100).toFixed(0)} to ${(grab.hoverGap * 100).toFixed(1)}cm ` +
-          `peak ${(grab.hoverPeak * 100).toFixed(1)}cm photo ${grab.hoverPhoto ? 'bank' : 'none'} ${(now - grab.hoverAt).toFixed(1)}s` +
+          `peak ${(grab.hoverPeak * 100).toFixed(1)}cm photo ${photo} ${(now - grab.hoverAt).toFixed(1)}s` +
           (keep ? ' -> pinch' : ''),
       );
     }
@@ -1386,8 +1395,8 @@ export class RoomStretchSystem extends createSystem({
       const b = grab.B + (grab.liftTo - grab.B) * f;
       grab.Bvel = (b - grab.B) * inv;
       grab.B = b;
-      // Toward your head from where the spot has slid, so the cone stays on the line through your fingers.
-      grab.lift.copy(this.head).sub(grab.worldG).sub(grab.D).normalize();
+      // Turned toward where aim() points it: your head, or near a surface, your fingertips.
+      grab.lift.lerp(grab.liftAim, 1 - Math.exp(-step * LIFT_TURN)).normalize();
       const slid = grab.D.length();
       if (slid > grab.peakSlide) grab.peakSlide = slid;
       if (b > grab.peakLift) {
@@ -1467,23 +1476,51 @@ export class RoomStretchSystem extends createSystem({
     const ray = this.unit.copy(hand).sub(this.head);
     const reach = ray.length();
     const n = grab.normal;
+    const near = grab.near;
+    // The slide: where your line of sight through the fingers meets the surface (a far wall moves as
+    // much as it looks), or, pinched right on a surface, where your hand itself went along it. Lifting
+    // the hand off a table must not slide the spot away from you.
+    const slide = this.tmp2;
     const across = n.dot(ray);
-    if (across < -GRAZE * reach) {
+    const sight = across < -GRAZE * reach;
+    if (sight) {
       const k = this.tmp.copy(grab.worldG).sub(this.head).dot(n) / across;
-      const slide = this.tmp2.copy(this.head).addScaledVector(ray, k).sub(grab.worldG);
+      slide.copy(this.head).addScaledVector(ray, k).sub(grab.worldG);
       slide.addScaledVector(n, -slide.dot(n)).multiplyScalar(this.look.gain * ease);
-      const len = slide.length();
-      const span = this.slideSpan(grab, dt);
-      const soft = Math.min(SLIDE_SOFT, SOFT_PER_SPAN * span);
-      const hard = Math.min(SLIDE_MAX, MAX_PER_SPAN * span);
-      if (len > soft) {
-        const room = Math.max(1e-3, hard - soft);
-        slide.multiplyScalar((soft + room * (1 - Math.exp(-(len - soft) / room))) / len);
-        grab.capped = true;
-      }
-      this.keepInPhoto(grab, slide);
-      grab.target.copy(slide);
     }
+    if (near > 0) {
+      const along = this.tmpA.copy(travel).addScaledVector(n, -travel.dot(n)).multiplyScalar(this.look.gain * ease);
+      if (sight) slide.lerp(along, near);
+      else slide.copy(along);
+    } else if (!sight) {
+      slide.copy(grab.target);
+    }
+    const len = slide.length();
+    const span = this.slideSpan(grab, dt);
+    const soft = Math.min(SLIDE_SOFT, SOFT_PER_SPAN * span);
+    const hard = Math.min(SLIDE_MAX, MAX_PER_SPAN * span);
+    if (len > soft) {
+      const room = Math.max(1e-3, hard - soft);
+      slide.multiplyScalar((soft + room * (1 - Math.exp(-(len - soft) / room))) / len);
+      grab.capped = true;
+    }
+    // Near a surface, the part of the slide toward you is mostly held back: the pinched spot follows
+    // your fingers as cloth instead (the cone below), its base dragging behind. Sideways stays a slide.
+    const held = this.tmpC.set(0, 0, 0);
+    if (near > 0) {
+      const toward = this.tmpB.copy(this.head).sub(grab.worldG);
+      toward.addScaledVector(n, -toward.dot(n));
+      if (toward.lengthSq() > 1e-6) {
+        toward.normalize();
+        const share = slide.dot(toward);
+        if (share > 0) {
+          held.copy(toward).multiplyScalar(share * CLOTH_DRAG);
+          slide.addScaledVector(held, -near);
+        }
+      }
+    }
+    this.keepInPhoto(grab, slide);
+    grab.target.copy(slide);
     const reach0 = Math.max(0.1, grab.reach0);
     // The burst still reads how far the hand came toward your head.
     const toward = Math.max(0, reach0 - reach - TOWARD_DEAD * reach0) * ease;
@@ -1495,47 +1532,21 @@ export class RoomStretchSystem extends createSystem({
     const slid = grab.target.length();
     if (slid + e > PULL_MAX) e = Math.max(0, PULL_MAX - slid);
     grab.explodeTo = e;
-    // The cone, like cloth pinched between your fingers: its tip on your line of sight through
-    // them, at the depth that keeps the pinch's own proportion of hand to surface. Pinched with the
-    // hand on the surface, the tip is at your fingertips and lifting your hand lifts it; pinched on a
-    // far wall, it comes the same share of its way as your hand came of its own. Always just behind
-    // your fingers, and with its foot inside the photo frozen for it.
-    const depth = this.tmp.copy(grab.worldG).add(grab.target).distanceTo(this.head);
-    const tip = Math.max(reach + TIP_CLEAR, (reach * grab.dist) / reach0);
-    const want = Math.max(0, depth - tip) * this.look.depthPull * ease;
+    // The cone, like cloth pinched between your fingers. Far (a wall well behind your hand): its tip
+    // on your line of sight through them, at the depth that keeps the pinch's own proportion of hand
+    // to surface, rising toward your head. Near (pinched right on a surface): its tip follows your
+    // fingertips: what the slide held back, plus how far they rose off the surface.
+    const spot = this.tmpA.copy(grab.worldG).add(grab.target);
+    const depth = spot.distanceTo(this.head);
+    const tipDepth = Math.max(reach + TIP_CLEAR, (reach * grab.dist) / reach0);
+    const farV = this.tmpB.copy(this.head).sub(spot).normalize().multiplyScalar(Math.max(0, depth - tipDepth) * ease);
+    const nearV = held.addScaledVector(n, Math.max(0, off) * ease);
+    const v = farV.multiplyScalar(1 - near).addScaledVector(nearV, near).multiplyScalar(this.look.depthPull);
+    const b = v.length();
     const cap = Math.min(TENT_MAX, TENT_FRAC * depth);
-    const liftIn = Math.sqrt(Math.max(0, 1 - grab.lift.dot(n) ** 2));
-    const edge = this.overlay.uniforms.uCore.value + 0.1 + 0.55 * e;
-    const covered = Math.max(0, grab.coverR - edge - e) / tentSpread(liftIn);
-    grab.liftTo = Math.min(want, cap, covered);
-    grab.liftWhy = want <= cap && want <= covered ? (tip === reach + TIP_CLEAR ? 'tip' : 'hand') : cap <= covered ? 'cap' : 'cover';
-  }
-
-  /**
-   * How far the slot's photo reaches around the grab point in the surface: the nearest frame edge
-   * along four directions, found the way keepInPhoto finds the slide's. The cone stays inside it.
-   */
-  private measureCover(grab: Grab): void {
-    const n = grab.normal;
-    this.tanU.set(0, 1, 0).cross(n);
-    if (this.tanU.lengthSq() < 1e-6) this.tanU.set(1, 0, 0).cross(n);
-    this.tanU.normalize();
-    this.tanV.copy(n).cross(this.tanU);
-    let cover = COVER_MAX;
-    for (let d = 0; d < 4; d++) {
-      const axis = d < 2 ? this.tanU : this.tanV;
-      const sign = d % 2 === 0 ? 1 : -1;
-      let lo = 0;
-      let hi = cover;
-      for (let i = 0; i < 7; i++) {
-        const mid = (lo + hi) * 0.5;
-        this.tmp.copy(grab.worldG).addScaledVector(axis, sign * mid);
-        if (this.photo.slotContains(grab.slot, this.tmp, COVER_MARGIN)) lo = mid;
-        else hi = mid;
-      }
-      cover = Math.min(cover, lo);
-    }
-    grab.coverR = cover;
+    grab.liftWhy = b > cap ? 'cap' : near < 0.5 && tipDepth === reach + TIP_CLEAR ? 'tip' : 'hand';
+    grab.liftTo = Math.min(b, cap);
+    if (b > 1e-3) grab.liftAim.copy(v).multiplyScalar(1 / b);
   }
 
   /**
@@ -1568,7 +1579,8 @@ export class RoomStretchSystem extends createSystem({
     console.info(
       `[jonze] pull ${grab.side === 'left' ? 'L' : 'R'} ${held.toFixed(1)}s${limit} ${grab.dist.toFixed(1)}m ` +
         `D${short(grab.peakSlide)} x${ratio.toFixed(1)} lift${short(grab.peakLift)}(${grab.peakWhy}) ` +
-        `burst${short(grab.peakBurst)} bloom${short(grab.peakBloom)}${grab.chain ? ' chain' : ''}`,
+        `n${short(grab.near).replace('1.00', '1')} burst${short(grab.peakBurst)} bloom${short(grab.peakBloom)}` +
+        (grab.chain ? ' chain' : ''),
     );
     this.logOnset(grab);
   }
@@ -1646,7 +1658,6 @@ export class RoomStretchSystem extends createSystem({
     grab.peakBurst = 0;
     grab.peakBloom = 0;
     grab.clipped = false;
-    grab.coverR = COVER_MAX;
     grab.peakWhy = 'hand';
     for (let i = 0; i < grab.springs.length; i++) grab.springs[i].reset(0);
   }
@@ -1733,7 +1744,9 @@ export class RoomStretchSystem extends createSystem({
     const sk = grab.holding || len < 1e-4 ? 1 : Math.max(0, grab.D.dot(grab.axisRel) / len);
     // A live frame's grabbed column is the hand's hole: without a fill behind it, it only stretches.
     const streaks = !slot.live || hasFill > 0;
-    const angle = Math.atan2(len * sk, grab.dist) / DEG;
+    // Near a surface the cone carries what the slide held back, so it counts toward the angle too.
+    const move = this.tmp.copy(grab.D).multiplyScalar(sk).addScaledVector(grab.lift, grab.near * Math.max(0, grab.B)).length();
+    const angle = Math.atan2(move, grab.dist) / DEG;
     grab.bloom = grab.on && streaks ? smooth((angle - this.look.stripes) / STREAK_SPAN_DEG) : 0;
     // The cone carries the pinched spot's colours by how far of its way toward you it has come.
     const tent = grab.on && streaks ? smooth((grab.B / Math.max(0.2, grab.dist) - TENT_STREAK_FROM) / TENT_STREAK_SPAN) : 0;
