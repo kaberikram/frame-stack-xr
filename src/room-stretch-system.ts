@@ -23,7 +23,7 @@ import {
 } from '@iwsdk/core';
 import { EnvDepth } from './env-depth.js';
 import { PREVIEW_FORCED, getMode } from './experience.js';
-import { HandOccluder } from './hand-occluder.js';
+import { HandOccluder, SEGMENTS } from './hand-occluder.js';
 import { drawHint, makeCanvas, type Canvas2D } from './labels.js';
 import { cameraMount, PassthroughPhoto, type CameraMount, type CameraSideSetting, type HandJoints } from './passthrough-photo.js';
 import { RoomMeshOverlay } from './room-mesh-overlay.js';
@@ -325,8 +325,10 @@ function logSession(session: XRSession): void {
   );
 }
 
-/** Developer check: `?occ=debug` paints the depth cut around the hands magenta instead of cutting. */
-const OCC_DEBUG = typeof location !== 'undefined' && new URLSearchParams(location.search).get('occ') === 'debug';
+const OCC_MODE = typeof location !== 'undefined' ? new URLSearchParams(location.search).get('occ') : null;
+/** `?occ=debug`: occluders green, the gate cyan, the cut magenta. `?occ=delta`: real depth against the room, as colour. */
+const OCC_DEBUG = OCC_MODE === 'debug';
+const OCC_DELTA = OCC_MODE === 'delta';
 
 /** Developer check: `?lens=overlay` draws the live camera in stripes over the room at rest. */
 const LENS_OVERLAY = typeof location !== 'undefined' && new URLSearchParams(location.search).get('lens') === 'overlay';
@@ -450,7 +452,7 @@ export class RoomStretchSystem extends createSystem({
   init(): void {
     this.overlay = new RoomMeshOverlay(this.scene, LENS_OVERLAY);
     if (LENS_OVERLAY) console.info('[jonze] lens overlay: live camera in stripes over the room at rest; hold still to read it');
-    this.hands = new HandOccluder(this.scene);
+    this.hands = new HandOccluder(this.scene, OCC_DEBUG);
     this.joints.points = this.hands.points;
     this.joints.arms = this.hands.arms;
     this.joints.armOk = this.hands.armOk;
@@ -835,12 +837,16 @@ export class RoomStretchSystem extends createSystem({
   private refreshHands(): void {
     this.hands.setActive(true);
     this.hands.lag = this.look.handLag;
-    // With headset depth the real arm is cut out exactly; a capsule would cut a guessed one.
-    this.hands.capsules = !this.depth.on;
+    this.hands.pinching.left = this.left.holding;
+    this.hands.pinching.right = this.right.holding;
     this.player.updateWorldMatrix(true, false);
+    this.player.head.updateWorldMatrix(true, false);
     this.handMap.left = this.input.xr.isPrimary('hand', 'left') ? this.input.xr.getPrimaryInputSource('left')?.hand ?? null : null;
     this.handMap.right = this.input.xr.isPrimary('hand', 'right') ? this.input.xr.getPrimaryInputSource('right')?.hand ?? null : null;
-    this.hands.update(this.world.xrFrame, this.world.xrReferenceSpace, this.player.matrixWorld, this.handMap, performance.now() / 1000);
+    this.hands.update(
+      this.world.xrFrame, this.world.xrReferenceSpace, this.player.matrixWorld, this.handMap,
+      performance.now() / 1000, this.player.head.matrixWorld,
+    );
   }
 
   /** Uploads photo textures made at camera start, so a pinch never allocates GPU storage. */
@@ -855,8 +861,8 @@ export class RoomStretchSystem extends createSystem({
     const U = this.overlay.uniforms;
     const d = this.depth;
     U.uDepthOn.value = d.on ? 1 : 0;
-    U.uOccDebug.value = OCC_DEBUG ? 1 : 0;
-    for (let i = 0; i < 4; i++) {
+    U.uOccDebug.value = OCC_DEBUG ? 1 : OCC_DELTA ? 2 : 0;
+    for (let i = 0; i < SEGMENTS; i++) {
       U.uSegA.value[i].copy(this.hands.segA[i]);
       U.uSegB.value[i].copy(this.hands.segB[i]);
     }
@@ -1500,7 +1506,7 @@ export class RoomStretchSystem extends createSystem({
     );
     console.info(
       `[jonze] look stripes=${k.stripes.toFixed(0)}deg ramp=${k.ramp.toFixed(2)} radial=${k.radial.toFixed(1)} ` +
-        `lat=${k.cameraLatency.toFixed(3)} hand=${k.handLag.toFixed(3)}${OCC_DEBUG ? ' occ=debug' : ''}`,
+        `lat=${k.cameraLatency.toFixed(3)} hand=${k.handLag.toFixed(3)}${OCC_MODE ? ` occ=${OCC_MODE}` : ''}`,
     );
     const trimmed =
       k.lensScale !== 1 || k.lensPitchTrim !== 0 || k.lensYawTrim !== 0 || k.lensRollTrim !== 0 ||

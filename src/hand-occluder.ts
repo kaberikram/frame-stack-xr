@@ -1,4 +1,4 @@
-import { CapsuleGeometry, InstancedMesh, Matrix4, MeshBasicMaterial, Object3D, SphereGeometry, Vector3, Vector4 } from '@iwsdk/core';
+import { CapsuleGeometry, InstancedMesh, Matrix4, MeshBasicMaterial, Object3D, ShaderMaterial, SphereGeometry, Vector3, Vector4, type Material } from '@iwsdk/core';
 
 const JOINTS = [
   'wrist',
@@ -19,23 +19,46 @@ const BONES: readonly (readonly [number, number])[] = [
 ];
 
 const JOINT_COUNT = JOINTS.length;
-/** One capsule up each forearm: one smooth edge where three spheres left a scalloped one. */
-const FOREARM_RADIUS = 0.035;
+/** One capsule up each forearm, toward the elbow: one smooth edge where three spheres left a scalloped one. */
+const FOREARM_RADIUS = 0.03;
 const FOREARM_LENGTH = 0.24;
 /** Capsule centre, metres up the arm from the wrist: it starts at the wrist and ends past 0.3 m. */
 const FOREARM_CENTER = 0.15;
 const WRIST = 0;
-const MIDDLE_METACARPAL = 10;
-const MIDDLE_TIP = 14;
+const THUMB_TIP = 4;
+const INDEX_TIP = 9;
+const PINKY_TIP = 24;
+/** Thumb and index distal and tip joints: the pinching fingertips, drawn without lag and a little larger. */
+const PINCH_JOINTS = [3, 4, 8, 9] as const;
+const PINCH_RADIUS = 0.017;
 const PER_HAND = JOINT_COUNT + BONES.length;
 const HANDS = 2;
 /** Joint frames kept per hand for drawing the occluders a little in the past. */
 const RING = 8;
-/** Where the depth cut may act around each hand: the hand itself, then the forearm. */
-const HAND_REACH = 0.07;
-const FOREARM_REACH = 0.06;
-const FOREARM_GATE = 0.3;
+/**
+ * Where the depth cut may act: three segments fanned from the wrist to the thumb, index and pinky
+ * tips (they cover the palm and fingers), and the forearm. Reach is from the segment's axis.
+ */
+export const SEGMENTS_PER_HAND = 4;
+export const SEGMENTS = SEGMENTS_PER_HAND * HANDS;
+const HAND_REACH = 0.035;
+const FOREARM_REACH = FOREARM_RADIUS + 0.02;
+const FOREARM_GATE = 0.26;
+/** Kind codes in segA.w for the shader. */
+const KIND_HAND = 1;
+const KIND_ARM = 2;
+/**
+ * A shoulder model for the elbow: below, beside and a little behind the head, upper arm and
+ * forearm lengths of an average adult. The elbow bends down and outward.
+ */
+const SHOULDER_SIDE = 0.17;
+const SHOULDER_DOWN = 0.22;
+const SHOULDER_BACK = 0.05;
+const UPPER_ARM = 0.29;
+const FOREARM = 0.26;
+const POLE_OUT = 0.6;
 const UP = new Vector3(0, 1, 0);
+const TIPS = [THUMB_TIP, INDEX_TIP, PINKY_TIP] as const;
 
 type Side = 'left' | 'right';
 const SIDES: readonly Side[] = ['left', 'right'];
@@ -68,14 +91,15 @@ export class HandOccluder {
   rightCount = 0;
   /** Seconds the occluders trail the tracked joints. Pinch and photo logic use the current joints. */
   lag = 0.03;
-  /** Draw the forearm capsules. Off while headset depth cuts the real arm out instead. */
-  capsules = true;
+  /** Set by the system: that hand is holding a pinch, so its fingertips are drawn without lag. */
+  readonly pinching = { left: false, right: false };
   /**
-   * Where the depth cut may act, from the trailing joints: per hand a hand segment then a forearm
-   * segment. `segA[i]` is the start and 1 in w while valid; `segB[i]` the end and the reach in w.
+   * Where the depth cut may act, from the trailing joints, SEGMENTS_PER_HAND per hand: three hand
+   * segments then the forearm. `segA[i]` is the start and the kind in w (0 off, 1 hand, 2 arm);
+   * `segB[i]` the end and the reach in w.
    */
-  readonly segA = [new Vector4(), new Vector4(), new Vector4(), new Vector4()];
-  readonly segB = [new Vector4(), new Vector4(), new Vector4(), new Vector4()];
+  readonly segA = Array.from({ length: SEGMENTS }, () => new Vector4());
+  readonly segB = Array.from({ length: SEGMENTS }, () => new Vector4());
   readonly indexTip = { left: new Vector3(), right: new Vector3() };
   readonly thumbTip = { left: new Vector3(), right: new Vector3() };
   readonly hasPinch = { left: false, right: false };
@@ -84,6 +108,12 @@ export class HandOccluder {
   private readonly arm: InstancedMesh;
   private readonly dummy = new Object3D();
   private readonly dir = new Vector3();
+  private readonly headPos = new Vector3();
+  private readonly yawRight = new Vector3();
+  private readonly yawBack = new Vector3();
+  private readonly shoulder = new Vector3();
+  private readonly toWrist = new Vector3();
+  private readonly pole = new Vector3();
   private readonly ring = [new Float32Array(RING * JOINT_COUNT * 3), new Float32Array(RING * JOINT_COUNT * 3)];
   private readonly ringTime = [new Float64Array(RING), new Float64Array(RING)];
   private readonly ringHead = [-1, -1];
@@ -95,8 +125,9 @@ export class HandOccluder {
   private readonly handRef: Record<Side, XRHand | null> = { left: null, right: null };
   private readonly local = new Float32Array(JOINT_COUNT * 3);
 
-  constructor(parent: Object3D) {
-    const mat = new MeshBasicMaterial({ colorWrite: false, depthWrite: true, depthTest: true });
+  /** `debug` draws the occluders 30% green instead of invisible, for `?occ=debug`. */
+  constructor(parent: Object3D, debug = false) {
+    const mat: Material = debug ? debugMaterial() : new MeshBasicMaterial({ colorWrite: false, depthWrite: true, depthTest: true });
     this.mesh = new InstancedMesh(new SphereGeometry(1, 6, 5), mat, PER_HAND * HANDS);
     this.mesh.frustumCulled = false;
     this.mesh.renderOrder = 0;
@@ -122,7 +153,7 @@ export class HandOccluder {
     if (!on) {
       this.ringCount[0] = 0;
       this.ringCount[1] = 0;
-      for (let i = 0; i < 4; i++) this.segA[i].w = 0;
+      for (let i = 0; i < SEGMENTS; i++) this.segA[i].w = 0;
       this.jointCount = 0;
       this.leftCount = 0;
       this.rightCount = 0;
@@ -139,6 +170,7 @@ export class HandOccluder {
     playerWorld: Matrix4,
     hands: Record<Side, XRHand | null>,
     now: number,
+    head: Matrix4,
   ): void {
     this.jointCount = 0;
     this.leftCount = 0;
@@ -150,6 +182,7 @@ export class HandOccluder {
       this.hasPinch.right = false;
       return;
     }
+    this.headFrame(head);
     for (let s = 0; s < SIDES.length; s++) {
       const side = SIDES[s];
       const hand = hands[side];
@@ -157,8 +190,7 @@ export class HandOccluder {
       if (!hand || !this.fillJoints(frame, ref, side, hand)) {
         this.hasPinch[side] = false;
         this.ringCount[s] = 0;
-        this.segA[s * 2].w = 0;
-        this.segA[s * 2 + 1].w = 0;
+        for (let i = 0; i < SEGMENTS_PER_HAND; i++) this.segA[s * SEGMENTS_PER_HAND + i].w = 0;
         this.hideRange(base, PER_HAND);
         this.hideArm(s);
         continue;
@@ -180,7 +212,7 @@ export class HandOccluder {
   dispose(): void {
     this.mesh.geometry.dispose();
     this.arm.geometry.dispose();
-    (this.mesh.material as MeshBasicMaterial).dispose();
+    (this.mesh.material as Material).dispose();
     this.mesh.removeFromParent();
     this.arm.removeFromParent();
   }
@@ -244,11 +276,11 @@ export class HandOccluder {
       this.points[n * 3 + 1] = y;
       this.points[n * 3 + 2] = z;
     }
-    this.thumbTip[side].set(this.local[4 * 3], this.local[4 * 3 + 1], this.local[4 * 3 + 2]);
-    this.indexTip[side].set(this.local[9 * 3], this.local[9 * 3 + 1], this.local[9 * 3 + 2]);
+    this.thumbTip[side].set(this.local[THUMB_TIP * 3], this.local[THUMB_TIP * 3 + 1], this.local[THUMB_TIP * 3 + 2]);
+    this.indexTip[side].set(this.local[INDEX_TIP * 3], this.local[INDEX_TIP * 3 + 1], this.local[INDEX_TIP * 3 + 2]);
     this.hasPinch[side] = true;
     const h = side === 'left' ? 0 : 1;
-    this.armOk[h] = this.forearm(this.local, this.dir) ? 1 : 0;
+    this.armOk[h] = this.forearm(this.local, h, this.dir) ? 1 : 0;
     if (this.armOk[h]) {
       const o = h * 6;
       this.arms[o] = this.local[WRIST * 3];
@@ -261,8 +293,19 @@ export class HandOccluder {
 
     this.record(h, now);
     const d = this.drawn;
+    const pinching = this.pinching[side];
+    // A pinching hand's fingertips hold the sheet: tracking is right there, so no lag.
+    if (pinching) {
+      for (let i = 0; i < PINCH_JOINTS.length; i++) {
+        const j = PINCH_JOINTS[i] * 3;
+        d[j] = this.local[j];
+        d[j + 1] = this.local[j + 1];
+        d[j + 2] = this.local[j + 2];
+      }
+    }
     for (let i = 0; i < JOINT_COUNT; i++) {
-      this.place(base + i, d[i * 3], d[i * 3 + 1], d[i * 3 + 2], i === 0 ? 0.02 : 0.013);
+      const radius = i === WRIST ? 0.02 : pinching && isPinchJoint(i) ? PINCH_RADIUS : 0.013;
+      this.place(base + i, d[i * 3], d[i * 3 + 1], d[i * 3 + 2], radius);
     }
     for (let i = 0; i < BONES.length; i++) {
       const [a, b] = BONES[i];
@@ -275,27 +318,25 @@ export class HandOccluder {
       );
     }
     const w = WRIST * 3;
-    const t = MIDDLE_TIP * 3;
-    const hand = this.segA[h * 2];
-    hand.set(d[w], d[w + 1], d[w + 2], 1);
-    this.segB[h * 2].set(d[t], d[t + 1], d[t + 2], HAND_REACH);
-    const arm = this.segA[h * 2 + 1];
-    if (!this.forearm(d, this.dir)) {
+    const s0 = h * SEGMENTS_PER_HAND;
+    for (let i = 0; i < TIPS.length; i++) {
+      const t = TIPS[i] * 3;
+      this.segA[s0 + i].set(d[w], d[w + 1], d[w + 2], KIND_HAND);
+      this.segB[s0 + i].set(d[t], d[t + 1], d[t + 2], HAND_REACH);
+    }
+    const arm = this.segA[s0 + 3];
+    if (!this.forearm(d, h, this.dir)) {
       arm.w = 0;
       this.hideArm(h);
       return;
     }
-    arm.set(d[w], d[w + 1], d[w + 2], 1);
-    this.segB[h * 2 + 1].set(
+    arm.set(d[w], d[w + 1], d[w + 2], KIND_ARM);
+    this.segB[s0 + 3].set(
       d[w] + this.dir.x * FOREARM_GATE,
       d[w + 1] + this.dir.y * FOREARM_GATE,
       d[w + 2] + this.dir.z * FOREARM_GATE,
       FOREARM_REACH,
     );
-    if (!this.capsules) {
-      this.hideArm(h);
-      return;
-    }
     this.dummy.position.set(
       d[w] + this.dir.x * FOREARM_CENTER,
       d[w + 1] + this.dir.y * FOREARM_CENTER,
@@ -308,11 +349,44 @@ export class HandOccluder {
     this.dummy.quaternion.identity();
   }
 
-  /** Up the arm from the wrist, away from the knuckles, into `out`. Needs no joint orientation. */
-  private forearm(joints: Float32Array, out: Vector3): boolean {
+  /** The head's position and its level right and back directions, for the shoulder model. */
+  private headFrame(head: Matrix4): void {
+    const e = head.elements;
+    this.headPos.set(e[12], e[13], e[14]);
+    this.yawRight.set(e[0], 0, e[2]);
+    if (this.yawRight.lengthSq() < 1e-6) this.yawRight.set(1, 0, 0);
+    this.yawRight.normalize();
+    // Level back is level right turned 90 degrees about up: (x, z) -> (-z, x).
+    this.yawBack.set(-this.yawRight.z, 0, this.yawRight.x);
+  }
+
+  /**
+   * Unit direction from the wrist toward the elbow, into `out`. The elbow comes from two-bone IK
+   * between a modelled shoulder and the tracked wrist, bending down and outward, so a bent wrist
+   * no longer turns the forearm with the hand.
+   */
+  private forearm(joints: Float32Array, h: number, out: Vector3): boolean {
+    const side = h === 0 ? -1 : 1;
+    const shoulder = this.shoulder
+      .copy(this.headPos)
+      .addScaledVector(this.yawRight, side * SHOULDER_SIDE)
+      .addScaledVector(this.yawBack, SHOULDER_BACK);
+    shoulder.y -= SHOULDER_DOWN;
     const w = WRIST * 3;
-    const m = MIDDLE_METACARPAL * 3;
-    out.set(joints[w] - joints[m], joints[w + 1] - joints[m + 1], joints[w + 2] - joints[m + 2]);
+    const u = this.toWrist.set(joints[w] - shoulder.x, joints[w + 1] - shoulder.y, joints[w + 2] - shoulder.z);
+    const reach = u.length();
+    if (reach < 1e-4) return false;
+    u.multiplyScalar(1 / reach);
+    const d = Math.min(UPPER_ARM + FOREARM - 1e-3, Math.max(Math.abs(UPPER_ARM - FOREARM) + 1e-3, reach));
+    const cosA = (UPPER_ARM * UPPER_ARM + d * d - FOREARM * FOREARM) / (2 * UPPER_ARM * d);
+    const sinA = Math.sqrt(Math.max(0, 1 - cosA * cosA));
+    const pole = this.pole.set(0, -1, 0).addScaledVector(this.yawRight, side * POLE_OUT);
+    pole.addScaledVector(u, -pole.dot(u));
+    if (pole.lengthSq() < 1e-8) pole.copy(this.yawBack).addScaledVector(u, -this.yawBack.dot(u));
+    pole.normalize();
+    // Elbow = shoulder + u*L1*cosA + pole*L1*sinA; the forearm points from the wrist to it.
+    out.copy(shoulder).addScaledVector(u, UPPER_ARM * cosA).addScaledVector(pole, UPPER_ARM * sinA);
+    out.set(out.x - joints[w], out.y - joints[w + 1], out.z - joints[w + 2]);
     const len = out.length();
     if (len < 1e-4) return false;
     out.multiplyScalar(1 / len);
@@ -367,4 +441,28 @@ export class HandOccluder {
     this.dummy.updateMatrix();
     for (let i = 0; i < count; i++) this.mesh.setMatrixAt(start + i, this.dummy.matrix);
   }
+}
+
+function isPinchJoint(i: number): boolean {
+  return i === 3 || i === 4 || i === 8 || i === 9;
+}
+
+/**
+ * The occluders made visible: depth-writing and opaque to three, so they still cut the room, but
+ * writing premultiplied 30% green, so passthrough shows through them.
+ */
+function debugMaterial(): ShaderMaterial {
+  return new ShaderMaterial({
+    vertexShader: /* glsl */ `
+      void main() {
+        gl_Position = projectionMatrix * viewMatrix * modelMatrix * instanceMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: /* glsl */ `
+      void main() {
+        gl_FragColor = vec4(0.0, 0.3, 0.0, 0.3);
+      }`,
+    depthWrite: true,
+    depthTest: true,
+    transparent: false,
+  });
 }

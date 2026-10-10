@@ -1,4 +1,5 @@
 import { DoubleSide, Matrix4, ShaderMaterial, Vector2, Vector3, Vector4, type Texture } from '@iwsdk/core';
+import { SEGMENTS } from './hand-occluder.js';
 
 /**
  * Two grabs, in world space. The room mesh bends by both, then each grab reads its own photo first.
@@ -82,9 +83,10 @@ export function createRubberUniforms() {
     uEyeSize: { value: new Vector2(1, 1) },
     uNormDepth0: { value: new Matrix4() },
     uNormDepth1: { value: new Matrix4() },
-    /** Per hand, a hand then a forearm segment: start xyz and 1 when valid, end xyz and reach. */
-    uSegA: { value: [new Vector4(), new Vector4(), new Vector4(), new Vector4()] },
-    uSegB: { value: [new Vector4(), new Vector4(), new Vector4(), new Vector4()] },
+    /** Per hand, three hand segments then the forearm: start xyz and kind (0 off, 1 hand, 2 arm), end xyz and reach. */
+    uSegA: { value: Array.from({ length: SEGMENTS }, () => new Vector4()) },
+    uSegB: { value: Array.from({ length: SEGMENTS }, () => new Vector4()) },
+    /** 0 off, 1 `?occ=debug` (cut magenta, gate cyan), 2 `?occ=delta` (real depth against the room). */
     uOccDebug: { value: 0 },
   };
 }
@@ -284,9 +286,11 @@ uniform float uDepthNear;
 uniform vec2 uEyeSize;
 uniform mat4 uNormDepth0;
 uniform mat4 uNormDepth1;
-uniform vec4 uSegA[4];
-uniform vec4 uSegB[4];
+uniform vec4 uSegA[${SEGMENTS}];
+uniform vec4 uSegB[${SEGMENTS}];
 uniform float uOccDebug;
+/** The gate fades out over this much beyond a segment's reach. */
+const float GATE_SOFT = 0.015;
 /** Depth nearer than this is a hole in the depth map, not a hand. */
 const float DEPTH_MIN = 0.12;
 #endif
@@ -328,8 +332,8 @@ vec4 streakOffset(vec3 base, vec3 G, vec3 D, vec3 axis, vec3 n, float bloom, flo
 }
 
 #ifdef ENV_DEPTH
-/** Closest distance between segments p0-p1 and q0-q1. */
-float segmentGap(vec3 p0, vec3 p1, vec3 q0, vec3 q1) {
+/** Closest distance between segments p0-p1 and q0-q1; the closest point on q0-q1 goes to 'onQ'. */
+float segmentClosest(vec3 p0, vec3 p1, vec3 q0, vec3 q1, out vec3 onQ) {
   vec3 d1 = p1 - p0;
   vec3 d2 = q1 - q0;
   vec3 r = p0 - q0;
@@ -348,17 +352,39 @@ float segmentGap(vec3 p0, vec3 p1, vec3 q0, vec3 q1) {
     t = 1.0;
     s = clamp((b - c) / a, 0.0, 1.0);
   }
-  return length(p0 + d1 * s - q0 - d2 * t);
+  onQ = q0 + d2 * t;
+  return length(p0 + d1 * s - onQ);
 }
 
-/** 1 where the line of sight to this point passes through a tracked hand or forearm, 0 well clear. */
-float handGate(vec3 world) {
+/** This eye's position. Under multiview viewMatrix is per eye; cameraPosition is the pair's midpoint. */
+vec3 eyePosition() {
+  return -(transpose(mat3(viewMatrix)) * viewMatrix[3].xyz);
+}
+
+/**
+ * 1 where the line of sight to this point passes through a tracked hand or forearm, 0 well clear.
+ * Also returns how far in front of this eye that hand is there, and how thick it is.
+ */
+float handGate(vec3 world, out float handZ, out float band) {
+  vec3 eye = eyePosition();
   float g = 0.0;
-  for (int i = 0; i < 4; i++) {
-    if (uSegA[i].w < 0.5) continue;
-    float d = segmentGap(cameraPosition, world, uSegA[i].xyz, uSegB[i].xyz);
-    g = max(g, 1.0 - smoothstep(0.6 * uSegB[i].w, uSegB[i].w, d));
+  float nearest = 1e9;
+  vec3 at = world;
+  band = 0.04;
+  for (int i = 0; i < ${SEGMENTS}; i++) {
+    float kind = uSegA[i].w;
+    if (kind < 0.5) continue;
+    vec3 onSeg;
+    float d = segmentClosest(eye, world, uSegA[i].xyz, uSegB[i].xyz, onSeg);
+    float gi = 1.0 - smoothstep(uSegB[i].w, uSegB[i].w + GATE_SOFT, d);
+    if (gi > g || (gi == g && gi > 0.0 && d < nearest)) {
+      g = gi;
+      nearest = d;
+      at = onSeg;
+      band = kind > 1.5 ? 0.04 : 0.045;
+    }
   }
+  handZ = -(viewMatrix * vec4(at, 1.0)).z;
   return g;
 }
 
@@ -368,15 +394,8 @@ float envMeters(vec2 uv, float layer) {
   return m < DEPTH_MIN ? 1e4 : m;
 }
 
-/**
- * How much a real hand or arm stands in front of this point of the stretch, from the headset's
- * depth: 1 shows passthrough's real hand, 0 keeps the stretch. Only near tracked hands, so depth
- * noise elsewhere never punches holes, and with a margin so a pinched sheet stays on the fingers.
- */
-float handOcclusion(vec3 world) {
-  if (uDepthOn < 0.5) return 0.0;
-  float gate = handGate(world);
-  if (gate <= 0.0) return 0.0;
+/** The headset's depth of the real room at this pixel, metres; 1e4 where it has none. */
+float realDepth() {
 #ifdef VIEW_ID
   float eye = float(VIEW_ID);
   vec2 fc = gl_FragCoord.xy;
@@ -385,15 +404,49 @@ float handOcclusion(vec3 world) {
   vec2 fc = gl_FragCoord.xy - vec2(eye * uEyeSize.x, 0.0);
 #endif
   vec2 uv = ((eye < 0.5 ? uNormDepth0 : uNormDepth1) * vec4(fc / uEyeSize, 0.0, 1.0)).xy;
-  vec2 texel = 1.0 / vec2(textureSize(uEnvDepth, 0).xy);
-  // The nearest of five taps, so the cut covers the hand's edge rather than trailing inside it.
+  // The nearest of five taps half a texel apart: covers the hand's edge without dilating it a texel.
+  vec2 texel = 0.5 / vec2(textureSize(uEnvDepth, 0).xy);
   float real = envMeters(uv, eye);
   real = min(real, envMeters(uv + vec2(texel.x, 0.0), eye));
   real = min(real, envMeters(uv - vec2(texel.x, 0.0), eye));
   real = min(real, envMeters(uv + vec2(0.0, texel.y), eye));
   real = min(real, envMeters(uv - vec2(0.0, texel.y), eye));
+  return real;
+}
+
+/**
+ * How much a real hand or arm stands in front of this point of the stretch, from the headset's
+ * depth: 1 shows passthrough's real hand, 0 keeps the stretch. Only along the line of sight to a
+ * tracked hand, and only where the real surface is at that hand's depth: a mug or a lamp beside
+ * the hand is in front of the room too, but it is not the hand.
+ */
+float handOcclusion(vec3 world, out float gate) {
+  float handZ;
+  float band;
+  gate = handGate(world, handZ, band);
+  if (gate <= 0.0 || uDepthOn < 0.5) return 0.0;
+  float real = realDepth();
+  float atHand = 1.0 - smoothstep(band, band + 0.02, abs(real - handZ));
   float margin = 0.01 + 0.02 * vViewZ;
-  return gate * smoothstep(margin, margin + 0.02, vViewZ - real);
+  return gate * atHand * smoothstep(margin, margin + 0.02, vViewZ - real);
+}
+
+/**
+ * Developer views, premultiplied colour and alpha. ?occ=debug: the cut magenta, the gate a faint
+ * cyan. ?occ=delta: real depth minus the room's, red where the real surface is nearer, blue where
+ * it is farther, white where they agree, over a +-8 cm range.
+ */
+vec4 occDebug(vec3 world, float occ, float gate) {
+  if (uOccDebug > 1.5) {
+    if (uDepthOn < 0.5) return vec4(0.0);
+    float real = realDepth();
+    if (real > 1e3) return vec4(0.0);
+    float d = clamp((vViewZ - real) / 0.08, -1.0, 1.0);
+    vec3 c = d > 0.0 ? mix(vec3(1.0), vec3(1.0, 0.1, 0.1), d) : mix(vec3(1.0), vec3(0.1, 0.3, 1.0), -d);
+    return vec4(c, 0.6);
+  }
+  vec3 c = occ > 0.01 ? vec3(1.0, 0.0, 1.0) : vec3(0.0, 1.0, 1.0);
+  return vec4(c, max(occ, 0.2 * gate));
 }
 #endif
 
@@ -516,6 +569,16 @@ void main() {
     }
   }
 #else
+#ifdef ENV_DEPTH
+  float gate = 0.0;
+  float occ = handOcclusion(vWorld, gate);
+  // Developer views draw wherever the room is, moved or not.
+  vec4 dbg = uOccDebug > 0.5 ? occDebug(vWorld, occ, gate) : vec4(0.0);
+  if (alpha < 0.002 && dbg.a > 0.002) {
+    writeColor(dbg.rgb, dbg.a);
+    return;
+  }
+#endif
   // Unmoved surfaces stay real. Depth is still written so a nearer surface wins.
   if (alpha < 0.002) {
     gl_FragColor = vec4(0.0);
@@ -532,8 +595,8 @@ void main() {
   vec3 col = (p0.rgb * w0 + p1.rgb * w1) / max(cover, 1e-7);
   alpha = shown * max(own * max(p0.a * uFade0, p1.a * uFade1), frost);
 #ifdef ENV_DEPTH
-  float occ = handOcclusion(vWorld);
-  alpha = uOccDebug > 0.5 ? max(alpha, occ) : alpha * (1.0 - occ);
+  // Debug views paint the cut instead of cutting.
+  if (uOccDebug < 0.5) alpha *= 1.0 - occ;
 #endif
 #ifdef PREVIEW
   col = cover > 1e-7 ? col : vec3(0.92);
@@ -542,8 +605,10 @@ void main() {
   #include <colorspace_fragment>
 #else
 #ifdef ENV_DEPTH
-  // ?occ=debug: the depth cut in magenta instead of a hole.
-  if (uOccDebug > 0.5) col = mix(col, vec3(1.0, 0.0, 1.0), occ);
+  if (dbg.a > 0.0) {
+    col = mix(col, dbg.rgb, dbg.a);
+    alpha = max(alpha, dbg.a);
+  }
 #endif
   writeColor(col, alpha);
 #endif
