@@ -505,10 +505,8 @@ void main() {
     vec2 luv = lc.xy / max(lc.w, 1e-4) * 0.5 + 0.5;
     bool inside = lc.w > 1e-4 && luv.x >= 0.0 && luv.y >= 0.0 && luv.x <= 1.0 && luv.y <= 1.0;
     float stripe = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / LENS_STRIPE));
-    if (!inside || stripe < 0.5) {
-      gl_FragColor = vec4(0.0);
-      return;
-    }
+    // Discarded, not drawn clear: a clear stripe would still write depth and cut what is behind it.
+    if (!inside || stripe < 0.5) discard;
     writeColor(sRGBTransferEOTF(texture(uLive, luv)).rgb, 1.0);
     return;
   }

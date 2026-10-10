@@ -2,6 +2,11 @@
 export const TARGET_EDGE = 0.05;
 /** Hard stop so a large scan can't turn into a million triangles on the headset. */
 export const MAX_TRIANGLES = 250_000;
+/**
+ * Within this far of the focus (where you stand) edges aim for the target; beyond, the target grows
+ * in proportion, so far walls and the ceiling don't spend the budget the furniture near you needs.
+ */
+const FOCUS_NEAR = 1.5;
 
 export interface DenseMesh {
   positions: Float32Array;
@@ -20,13 +25,14 @@ export function subdivideMesh(
   indices: ArrayLike<number>,
   edge = TARGET_EDGE,
   maxTriangles = MAX_TRIANGLES,
+  focus: ArrayLike<number> | null = null,
 ): DenseMesh {
   let pos = positions instanceof Float32Array ? positions : Float32Array.from(positions);
   let idx = indices instanceof Uint32Array ? indices : Uint32Array.from(indices);
   let limit = Math.max(edge, 1e-3);
   for (let pass = 0; pass < 10; pass++) {
     if (idx.length / 3 >= maxTriangles) break;
-    const next = splitPass(pos, idx, limit, maxTriangles);
+    const next = splitPass(pos, idx, limit, maxTriangles, focus);
     if (next === 'stop') break;
     if (next === 'raise') {
       limit *= 1.4;
@@ -46,10 +52,24 @@ type Split = DenseMesh | 'stop' | 'raise';
  * edges split (1 → 2, 2 → 3, 3 → 4). Deciding per edge rather than per triangle keeps
  * neighbours agreeing, so there are no T-junctions to crack open once the mesh bends.
  */
-function splitPass(pos: Float32Array, idx: Uint32Array, edge: number, maxTriangles: number): Split {
+function splitPass(pos: Float32Array, idx: Uint32Array, edge: number, maxTriangles: number, focus: ArrayLike<number> | null): Split {
   const triCount = Math.floor(idx.length / 3);
   const edge2 = edge * edge;
   const mids = new Map<number, number>();
+  // An edge's limit depends only on its own midpoint, so both triangles sharing it agree.
+  const tooLong = (a: number, b: number): boolean => {
+    const d2 = dist2(pos, a, b);
+    if (d2 <= edge2) return false;
+    if (!focus) return true;
+    const ia = a * 3;
+    const ib = b * 3;
+    const far = Math.hypot(
+      (pos[ia] + pos[ib]) * 0.5 - focus[0],
+      (pos[ia + 1] + pos[ib + 1]) * 0.5 - focus[1],
+      (pos[ia + 2] + pos[ib + 2]) * 0.5 - focus[2],
+    ) / FOCUS_NEAR;
+    return far <= 1 || d2 > edge2 * far * far;
+  };
   let outTris = 0;
   for (let tri = 0; tri < triCount; tri++) {
     const base = tri * 3;
@@ -57,15 +77,15 @@ function splitPass(pos: Float32Array, idx: Uint32Array, edge: number, maxTriangl
     const i1 = idx[base + 1];
     const i2 = idx[base + 2];
     let long = 0;
-    if (dist2(pos, i0, i1) > edge2) {
+    if (tooLong(i0, i1)) {
       long++;
       mids.set(edgeKey(i0, i1), -1);
     }
-    if (dist2(pos, i1, i2) > edge2) {
+    if (tooLong(i1, i2)) {
       long++;
       mids.set(edgeKey(i1, i2), -1);
     }
-    if (dist2(pos, i2, i0) > edge2) {
+    if (tooLong(i2, i0)) {
       long++;
       mids.set(edgeKey(i2, i0), -1);
     }

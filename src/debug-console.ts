@@ -85,13 +85,15 @@ const SHADER_ERROR = /ERROR: *\d+:(\d+): *(.*)/;
 const SHADER_SOURCE = /^> *\d+: *(.*)$/m;
 
 const PARAM = typeof location === 'undefined' ? null : new URLSearchParams(location.search).get('debug');
+/** One-shot session lines that must stay on the panel however much else is logged after them. */
+const PINNED = /^(build|session|depth|camera pick|camera frames|lens f=|xr multiview)\b/;
 
 /** The last ROWS lines, oldest first, in arrays allocated once. */
 class ConsoleLines {
   readonly text: string[] = new Array<string>(ROWS).fill('');
   readonly level = new Uint8Array(ROWS);
   readonly tagged = new Uint8Array(ROWS);
-  /** Which line a full buffer drops first: log 0, info 1, warn 2, [jonze] 3, [jonze] warn 4, error 5. */
+  /** Which line a full buffer drops first: log 0, info 1, [jonze] 3, any warn 4, error 5, pinned session line 6. */
   readonly rank = new Uint8Array(ROWS);
   readonly repeat = new Uint32Array(ROWS);
   readonly time = new Float64Array(ROWS);
@@ -129,7 +131,8 @@ class ConsoleLines {
       }
       return;
     }
-    const rank = level === Level.Error ? 5 : tagged ? (level === Level.Warn ? 4 : 3) : level;
+    const rank =
+      level === Level.Error ? 5 : level === Level.Warn ? 4 : tagged ? (PINNED.test(line) ? 6 : 3) : level;
     let at = this.count;
     if (at < ROWS) {
       this.count++;

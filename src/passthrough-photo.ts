@@ -15,21 +15,33 @@ import {
 export type CameraMount = 'left' | 'right' | 'view';
 export type CameraSideSetting = 'auto' | 'left' | 'right';
 
+/** URL developer trims for checking the lens in the headset without a build: `?lensf=863&yaw=-0.23&pitch=&tau=`. */
+const URL_PARAMS = typeof location === 'undefined' ? null : new URLSearchParams(location.search);
+function urlNumber(name: string): number | null {
+  const raw = URL_PARAMS?.get(name);
+  if (raw === null || raw === undefined || raw === '') return null;
+  const value = Number(raw);
+  return Number.isFinite(value) ? value : null;
+}
+
 /**
- * Quest 3's room cameras as measured through getUserMedia: rectilinear, square pixels, fx = fy = 851 px
- * at 1280 wide (425.5 at 640), and taller or shorter frames are centred crops of the same lens. An
- * 800 px guess drew every photo about 6% too large.
+ * Quest 3's room cameras through getUserMedia: rectilinear, square pixels, and taller or shorter
+ * frames are centred crops of the same lens. fx = fy = 863 px at 1280 wide: the lab figure of 851
+ * drew the far wall 1.4% too large in the `?lens=overlay` check. An 800 px guess was 6% too large.
  */
 const REF_W = 1280;
-const REF_F = 851;
+const REF_F = urlNumber('lensf') ?? 863;
 /**
  * The left camera's mount in the head frame (three.js axes: x right, y up, looking down -Z). It sits in
  * front of its own eye on the visor, about 6.5 cm ahead of the eyes, tilted 11.8° down. The right
- * camera mirrors yaw, roll and x. Lens x is hardware: it does not move with the IPD setting.
+ * camera mirrors yaw, roll and x. Lens x is hardware: it does not move with the IPD setting. Yaw is
+ * the lab's +0.22° turned 0.45° right, which centred the far wall in the overlay check.
  */
-const MOUNT_DEG = { pitch: -11.77, yaw: 0.22, roll: 0.14 };
+const MOUNT_DEG = { pitch: urlNumber('pitch') ?? -11.77, yaw: urlNumber('yaw') ?? -0.23, roll: 0.14 };
 const LENS = { x: 0.0325, y: 0, z: -0.065 };
 const DEG = Math.PI / 180;
+/** Any lens value taken from the URL, for the lens line. */
+const URL_LENS = ['lensf', 'yaw', 'pitch', 'tau'].filter((name) => urlNumber(name) !== null).join(',');
 
 const BANK = 8;
 /** About 1.4 s of head poses at 90 Hz: enough to reach back past the slowest camera stamp. */
@@ -99,7 +111,7 @@ const DISPLAY_SLACK = 0.25;
  * is the end of the camera-to-screen pipeline, and arrival or polling is in between.
  */
 type FrameClock = 'capture' | 'expected' | 'arrival' | 'polled';
-const TAU: Record<FrameClock, number> = { capture: 0.01, expected: 0.07, arrival: 0.05, polled: 0.06 };
+const TAU: Record<FrameClock, number> = { capture: urlNumber('tau') ?? 0.025, expected: 0.07, arrival: 0.05, polled: 0.06 };
 
 export interface LensTuning {
   /** Multiplies the measured focal length. Developer trim; 1 is the measured lens. */
@@ -770,7 +782,8 @@ export class PassthroughPhoto {
     console.info(
       `[jonze] lens f=${this.focalPx().toFixed(0)} pyr=${sign(MOUNT_DEG.pitch + lens.pitchTrim)}/` +
         `${sign(MOUNT_DEG.yaw + lens.yawTrim)}/${sign(MOUNT_DEG.roll + lens.rollTrim)} ` +
-        `cam=${this.side === 'left' ? 'L' : 'R'} ${e.x.toFixed(3)},${e.y.toFixed(3)},${e.z.toFixed(3)}`,
+        `cam=${this.side === 'left' ? 'L' : 'R'} ${e.x.toFixed(3)},${e.y.toFixed(3)},${e.z.toFixed(3)}` +
+        (URL_LENS ? ` url=${URL_LENS}` : ''),
     );
   }
 

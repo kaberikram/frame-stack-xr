@@ -5,8 +5,8 @@ import {
   Matrix4,
   Mesh,
   ShaderMaterial,
+  Vector3,
   VideoTexture,
-  type InterleavedBufferAttribute,
   type Material,
   type Object3D,
 } from '@iwsdk/core';
@@ -27,16 +27,33 @@ interface WorkerReply {
 
 /** Re-snapping the dense room to changed planes waits at least this long after the last one. */
 const SNAP_GAP = 1;
+/** A plane counts as moved past these: 5 mm, or its normal turned 0.5°. Tracking jitter stays under. */
+const PLANE_MOVE = 0.005;
+const PLANE_TURN = Math.cos((0.5 * Math.PI) / 180);
+/** A scanned mesh that moves more than this rebuilds the merged room. */
+const MESH_MOVE = 0.01;
+/** The room is rebuilt around you once you are this far from where it was last built. */
+const FOCUS_MOVE = 1.5;
+/** A snap is logged again only when the vertices it moved change by more than this share. */
+const SNAP_LOG_SHARE = 0.01;
 
 /** Writes `visible` only when it changes. On scanned meshes each write is an ECS update. */
 function setShown(object: Object3D, on: boolean): void {
   if (object.visible !== on) object.visible = on;
 }
 
+/** What the dense room was last built from, per scanned mesh. */
+interface Built {
+  mesh: Mesh;
+  position: object | null;
+  readonly world: Float32Array;
+}
+
 /**
- * The room the rubber pull draws. Quest's global mesh is subdivided once in a worker
- * so a falloff can bend instead of crease, and that copy follows the scan's pose.
- * Nothing draws unless a pull is active: at rest the headset shows plain passthrough.
+ * The room the rubber pull draws. Every scanned mesh is merged into world space and subdivided in
+ * a worker, finest near you, so a falloff bends instead of creasing on walls and furniture alike,
+ * then snapped flat onto the detected planes. Nothing draws unless a pull is active: at rest the
+ * headset shows plain passthrough. Until the dense room is ready, the scans draw coarse.
  */
 export class RoomMeshOverlay {
   readonly uniforms: RubberUniformSet;
@@ -49,8 +66,10 @@ export class RoomMeshOverlay {
 
   private worker: Worker | null = null;
   private requestId = 0;
-  private source: Mesh | null = null;
-  private sourceKey: object | null = null;
+  /** A subdivide request is in the worker. */
+  private building = false;
+  private readonly built: Built[] = [];
+  private readonly focus = new Vector3();
   private dense: Mesh | null = null;
   private active = false;
   /** Frames left to draw a new dense mesh while invisible, so its compile and upload don't land on a pinch. */
@@ -60,14 +79,18 @@ export class RoomMeshOverlay {
   private readonly dropList: Mesh[] = [];
   private video: HTMLVideoElement | null = null;
   private videoTex: VideoTexture | null = null;
-  /** Detected planes in the dense mesh's space, and which plane set they and the mesh were built from. */
+  /** Detected planes in world space as last sent to the worker, and what they were built from. */
   private snapPlanes: SnapPlane[] = [];
-  private builtSig = 0;
-  private sentSig = 0;
+  private readonly sentWorld: Float32Array[] = [];
+  private readonly sentShape: number[] = [];
+  private sentCount = -1;
+  private planesDirty = false;
   private snapBusy = false;
   private snapAt = -Infinity;
-  private readonly toLocal = new Matrix4();
-  private readonly planeLocal = new Matrix4();
+  private loggedMoved = -1;
+  private loggedPlanes = -1;
+  private readonly tmp = new Vector3();
+  private readonly pendingClip = new Matrix4();
 
   constructor(private readonly parent: Object3D, lensOverlay = false) {
     this.uniforms = createRubberUniforms();
@@ -81,10 +104,10 @@ export class RoomMeshOverlay {
   }
 
   /**
-   * Draw every scanned mesh. The largest one is subdivided in the worker;
-   * the others stay coarse so a room made of separate objects is still visible.
+   * Draw every scanned mesh, from the merged dense room once it is ready. `eye` is where you are:
+   * the room is finest around it and rebuilt when you have walked away from where it was built.
    */
-  sync(sources: readonly Mesh[]): void {
+  sync(sources: readonly Mesh[], eye: Vector3): void {
     this.keep.clear();
     for (let i = 0; i < sources.length; i++) this.keep.add(sources[i]);
     const drop = this.dropList;
@@ -93,82 +116,52 @@ export class RoomMeshOverlay {
       if (!this.keep.has(mesh)) drop.push(mesh);
     }
     for (let i = 0; i < drop.length; i++) this.release(drop[i]);
+    for (let i = 0; i < sources.length; i++) this.paint(sources[i]);
 
-    let primary: Mesh | null = null;
-    let primaryCount = -1;
-    for (let i = 0; i < sources.length; i++) {
-      const mesh = sources[i];
-      this.paint(mesh);
-      const count = mesh.geometry.getAttribute('position')?.count ?? 0;
-      if (count > primaryCount) {
-        primary = mesh;
-        primaryCount = count;
-      }
-    }
-    if (!primary) {
+    if (sources.length === 0) {
       if (this.dense) setShown(this.dense, false);
-      this.source = null;
-      this.sourceKey = null;
+      this.built.length = 0;
       this.ready = false;
       this.triangles = 0;
       return;
     }
-    if (primary !== this.source) {
-      this.source = primary;
-      this.sourceKey = null;
-      this.ready = false;
-      this.triangles = 0;
-      if (this.dense) setShown(this.dense, false);
-    }
-    const position = primary.geometry.getAttribute('position');
-    if (position && position !== this.sourceKey) this.submit(primary, position);
+    if (this.changed(sources)) this.submit(sources, eye);
+    else if (!this.building && this.ready && eye.distanceTo(this.focus) > FOCUS_MOVE) this.submit(sources, eye);
 
     const showing = this.active || this.warm > 0;
     if (this.warm > 0) this.warm--;
     const denseOn = !!this.dense && this.ready;
-    for (let i = 0; i < sources.length; i++) {
-      const mesh = sources[i];
-      setShown(mesh, showing && !(denseOn && mesh === primary));
-    }
-    if (this.dense) {
-      if (denseOn) {
-        primary.updateWorldMatrix(true, false);
-        this.dense.matrix.copy(primary.matrixWorld);
-        this.dense.updateMatrixWorld(true);
-      }
-      setShown(this.dense, showing && denseOn);
-    }
+    for (let i = 0; i < sources.length; i++) setShown(sources[i], showing && !denseOn);
+    if (this.dense) setShown(this.dense, showing && denseOn);
   }
 
   /**
-   * Keeps the dense room snapped flat onto the detected planes. Planes that appear or change are
-   * sent to the worker, which re-snaps the cached unsnapped mesh; at most once a second.
+   * Keeps the dense room snapped flat onto the detected planes. A plane that appears, goes, moves
+   * 5 mm, turns 0.5° or changes its outline is sent to the worker, which re-snaps the unsnapped
+   * room; at most once a second. Tracking jitter below that never re-snaps.
    */
   syncPlanes(planes: RoomPlanes): void {
-    const source = this.source;
-    if (!source) return;
-    source.updateWorldMatrix(true, false);
-    const e = source.matrixWorld.elements;
-    const sig = (planes.signature * 31 + Math.round(e[12] * 100) * 3 + Math.round(e[13] * 100) * 5 + Math.round(e[14] * 100) * 7) | 0;
-    if (sig !== this.builtSig) {
-      this.builtSig = sig;
-      this.toLocal.copy(source.matrixWorld).invert();
+    if (this.planesChanged(planes)) {
       const list: SnapPlane[] = [];
       for (let i = 0; i < planes.count; i++) {
         const plane = planes.planes[i];
-        this.planeLocal.multiplyMatrices(this.toLocal, plane.world);
+        if (!this.sentWorld[i]) this.sentWorld[i] = new Float32Array(16);
+        this.sentWorld[i].set(plane.world.elements);
+        this.sentShape[i] = plane.shape;
         list.push({
-          matrix: Float32Array.from(this.planeLocal.elements),
+          matrix: Float32Array.from(plane.world.elements),
           polygon: plane.polygon.slice(0, plane.points * 2),
           points: plane.points,
           horizontal: plane.horizontal,
         });
       }
+      this.sentCount = planes.count;
       this.snapPlanes = list;
+      this.planesDirty = true;
     }
     const now = performance.now() / 1000;
-    if (!this.ready || this.snapBusy || this.sentSig === this.builtSig || now - this.snapAt < SNAP_GAP) return;
-    this.sentSig = this.builtSig;
+    if (!this.planesDirty || !this.ready || this.building || this.snapBusy || now - this.snapAt < SNAP_GAP) return;
+    this.planesDirty = false;
     this.snapBusy = true;
     this.snapAt = now;
     this.thread().postMessage({ kind: 'snap', id: this.requestId, planes: this.snapPlanes });
@@ -181,7 +174,9 @@ export class RoomMeshOverlay {
   setLive(video: HTMLVideoElement | null, hasLive: boolean, liveToClip: Matrix4): void {
     this.attachVideo(video);
     this.uniforms.uHasLive.value = hasLive && this.videoTex ? 1 : 0;
-    this.uniforms.uLiveToClip.value.copy(liveToClip);
+    // Committed when the frame actually uploads (deferred a frame under multiview), so the stripes
+    // pair each picture with the pose it was taken from, the way a frozen photo is paired.
+    this.pendingClip.copy(liveToClip);
     this.uniforms.uLive.value = this.videoTex;
   }
 
@@ -195,8 +190,7 @@ export class RoomMeshOverlay {
     drop.length = 0;
     for (const mesh of this.painted.keys()) drop.push(mesh);
     for (let i = 0; i < drop.length; i++) this.release(drop[i]);
-    this.source = null;
-    this.sourceKey = null;
+    this.built.length = 0;
     this.ready = false;
   }
 
@@ -222,37 +216,88 @@ export class RoomMeshOverlay {
     if (saved && mesh.material === this.material) mesh.material = saved;
     this.painted.delete(mesh);
     setShown(mesh, false);
-    if (mesh === this.source) {
-      this.source = null;
-      this.sourceKey = null;
-      this.ready = false;
-      this.triangles = 0;
-      if (this.dense) setShown(this.dense, false);
-    }
   }
 
-  private submit(source: Mesh, position: BufferAttribute | InterleavedBufferAttribute): void {
-    const geometry = source.geometry;
-    const index = geometry.getIndex();
-    this.sourceKey = position;
-    const positions = new Float32Array(position.count * 3);
-    for (let i = 0; i < position.count; i++) {
-      positions[i * 3] = position.getX(i);
-      positions[i * 3 + 1] = position.getY(i);
-      positions[i * 3 + 2] = position.getZ(i);
+  /** True when the set of scans, any scan's vertices, or any scan's pose changed since the last build. */
+  private changed(sources: readonly Mesh[]): boolean {
+    const built = this.built;
+    if (built.length !== sources.length) return true;
+    for (let i = 0; i < sources.length; i++) {
+      const mesh = sources[i];
+      const b = built[i];
+      if (b.mesh !== mesh || b.position !== (mesh.geometry.getAttribute('position') ?? null)) return true;
+      mesh.updateWorldMatrix(true, false);
+      const e = mesh.matrixWorld.elements;
+      const w = b.world;
+      if (Math.hypot(e[12] - w[12], e[13] - w[13], e[14] - w[14]) > MESH_MOVE) return true;
+      for (let k = 0; k < 11; k++) if (Math.abs(e[k] - w[k]) > MESH_MOVE) return true;
     }
-    const count = index ? index.count : position.count;
-    const indices = new Uint32Array(count);
-    if (index) {
-      for (let i = 0; i < count; i++) indices[i] = index.getX(i);
-    } else {
-      for (let i = 0; i < count; i++) indices[i] = i;
+    return false;
+  }
+
+  /** True when a plane appeared, went, moved past the tolerances, or changed its outline. */
+  private planesChanged(planes: RoomPlanes): boolean {
+    if (planes.count !== this.sentCount) return true;
+    for (let i = 0; i < planes.count; i++) {
+      const plane = planes.planes[i];
+      const w = this.sentWorld[i];
+      if (!w || this.sentShape[i] !== plane.shape) return true;
+      const e = plane.world.elements;
+      if (Math.hypot(e[12] - w[12], e[13] - w[13], e[14] - w[14]) > PLANE_MOVE) return true;
+      const dot = (e[4] * w[4] + e[5] * w[5] + e[6] * w[6]) / Math.max(1e-9, Math.hypot(e[4], e[5], e[6]) * Math.hypot(w[4], w[5], w[6]));
+      if (dot < PLANE_TURN) return true;
     }
+    return false;
+  }
+
+  /** Merges every scan into world space and sends it to the worker to subdivide and snap. */
+  private submit(sources: readonly Mesh[], eye: Vector3): void {
+    let vertices = 0;
+    let corners = 0;
+    for (let i = 0; i < sources.length; i++) {
+      const geometry = sources[i].geometry;
+      const position = geometry.getAttribute('position');
+      if (!position) continue;
+      vertices += position.count;
+      corners += geometry.getIndex()?.count ?? position.count;
+    }
+    const positions = new Float32Array(vertices * 3);
+    const indices = new Uint32Array(corners);
+    const built = this.built;
+    built.length = 0;
+    let vBase = 0;
+    let iBase = 0;
+    const v = this.tmp;
+    for (let i = 0; i < sources.length; i++) {
+      const mesh = sources[i];
+      const geometry = mesh.geometry;
+      const position = geometry.getAttribute('position');
+      mesh.updateWorldMatrix(true, false);
+      const record: Built = { mesh, position: position ?? null, world: Float32Array.from(mesh.matrixWorld.elements) };
+      built.push(record);
+      if (!position) continue;
+      for (let k = 0; k < position.count; k++) {
+        v.fromBufferAttribute(position, k).applyMatrix4(mesh.matrixWorld);
+        positions[(vBase + k) * 3] = v.x;
+        positions[(vBase + k) * 3 + 1] = v.y;
+        positions[(vBase + k) * 3 + 2] = v.z;
+      }
+      const index = geometry.getIndex();
+      const count = index ? index.count : position.count;
+      for (let k = 0; k < count; k++) indices[iBase + k] = vBase + (index ? index.getX(k) : k);
+      vBase += position.count;
+      iBase += count;
+    }
+    this.focus.copy(eye);
     const id = ++this.requestId;
-    this.sentSig = this.builtSig;
+    this.building = true;
+    this.planesDirty = false;
     this.snapBusy = false;
     this.thread().postMessage(
-      { kind: 'subdivide', id, positions, indices, edge: TARGET_EDGE, maxTriangles: MAX_TRIANGLES, planes: this.snapPlanes },
+      {
+        kind: 'subdivide', id, positions, indices, edge: TARGET_EDGE, maxTriangles: MAX_TRIANGLES,
+        planes: this.snapPlanes, focus: [eye.x, eye.y, eye.z],
+      },
       [positions.buffer, indices.buffer],
     );
   }
@@ -267,7 +312,7 @@ export class RoomMeshOverlay {
 
   private apply(reply: WorkerReply): void {
     if (reply.kind === 'snap') this.snapBusy = false;
-    if (reply.id !== this.requestId || !this.source) return;
+    if (reply.id !== this.requestId) return;
     const snapped = `snapped ${reply.moved} verts to ${reply.planes} planes`;
     if (reply.kind === 'snap' || !reply.indices) {
       const position = this.dense?.geometry.getAttribute('position');
@@ -276,32 +321,43 @@ export class RoomMeshOverlay {
       position.needsUpdate = true;
       // Upload while drawing alpha 0 for a couple of frames, not on the next pinch.
       this.warm = 2;
-      console.info(`[jonze] dense room: ${snapped}`);
+      this.noteSnap(reply, snapped);
       return;
     }
+    this.building = false;
     const geometry = new BufferGeometry();
     geometry.setAttribute('position', new BufferAttribute(reply.positions, 3));
     geometry.setIndex(new BufferAttribute(reply.indices, 1));
     geometry.computeBoundingSphere();
     if (!this.dense) {
+      // World space: the merged room carries every scan's pose in its vertices.
       this.dense = new Mesh(geometry, this.material);
       this.dense.frustumCulled = false;
       this.dense.renderOrder = 2;
       this.dense.matrixAutoUpdate = false;
+      this.dense.matrix.identity();
       this.dense.visible = false;
       this.parent.add(this.dense);
+      this.dense.updateMatrixWorld(true);
     } else {
       this.dense.geometry.dispose();
       this.dense.geometry = geometry;
     }
-    this.source.updateWorldMatrix(true, false);
-    this.dense.matrix.copy(this.source.matrixWorld);
-    this.dense.updateMatrixWorld(true);
     this.ready = true;
     this.warm = 2;
     this.triangles = reply.triangles;
     const edge = reply.edge >= 0.1 ? reply.edge.toFixed(2) : reply.edge.toFixed(3);
-    console.info(`[jonze] dense room: ${reply.triangles} triangles, ${edge} m edges, ${snapped}`);
+    console.info(`[jonze] dense room: ${reply.triangles} triangles, ${edge} m near edges, ${this.built.length} scans`);
+    this.noteSnap(reply, snapped);
+  }
+
+  /** Logs a snap only when its result changed: re-snaps that land the same push useful lines off the console. */
+  private noteSnap(reply: WorkerReply, line: string): void {
+    const same = reply.planes === this.loggedPlanes && Math.abs(reply.moved - this.loggedMoved) <= SNAP_LOG_SHARE * Math.max(1, this.loggedMoved);
+    if (same) return;
+    this.loggedMoved = reply.moved;
+    this.loggedPlanes = reply.planes;
+    console.info(`[jonze] dense room: ${line}`);
   }
 
   private attachVideo(video: HTMLVideoElement | null): void {
@@ -311,6 +367,9 @@ export class RoomMeshOverlay {
     tex.minFilter = LinearFilter;
     tex.magFilter = LinearFilter;
     tex.generateMipmaps = false;
+    tex.onUpdate = () => {
+      this.uniforms.uLiveToClip.value.copy(this.pendingClip);
+    };
     this.video = video;
     this.videoTex = tex;
   }
