@@ -115,9 +115,9 @@ export class RoomPlanes {
   /**
    * The plane under a mesh hit `meshT` along the ray: of every plane the ray crosses inside its
    * outline, the one nearest the mesh hit that sits within the tolerances. `miss` gets the nearest
-   * one that did not.
+   * one that did not. `clutter` is how far above a horizontal plane the hit may be.
    */
-  underHit(origin: Vector3, dir: Vector3, meshT: number, out: PlaneHit, miss: PlaneMiss): boolean {
+  underHit(origin: Vector3, dir: Vector3, meshT: number, out: PlaneHit, miss: PlaneMiss, clutter = CLUTTER): boolean {
     let best = -1;
     let bestGap = Infinity;
     let bestT = 0;
@@ -137,7 +137,7 @@ export class RoomPlanes {
       // Height of the mesh hit above the plane, on the eye's side: the ray meets the mesh first, then
       // the plane, and |d.y| is the cosine to the plane's normal.
       const above = delta * Math.abs(this.d.y);
-      const ok = plane.horizontal ? above <= CLUTTER && above >= -UNDER : delta >= -IN_FRONT && delta <= BEHIND;
+      const ok = plane.horizontal ? above <= clutter && above >= -UNDER : delta >= -IN_FRONT && delta <= BEHIND;
       const gap = Math.abs(delta);
       if (ok && gap < bestGap) {
         bestGap = gap;

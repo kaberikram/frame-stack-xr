@@ -61,11 +61,47 @@ const STEP_MAX = 1 / 50;
 const FOLLOW_MAX = 2.5;
 /** The pinch ray must meet the grabbed plane within ~78° of its normal to slide. */
 const GRAZE = 0.2;
-/** Toward-you travel ignored, and how much sideways travel cancels it (a shoulder sweep shortens reach too). */
+/**
+ * Pulling toward you: the share of the way to your head the hand has come, less this much, and less
+ * this much of the sideways travel (a shoulder sweep shortens reach too), both as shares of the reach
+ * at the pinch. The pinched spot comes that share of the way to your head, as a cone on the line of
+ * sight through your fingers: up to TENT_FRAC of the way, and never more than TENT_MAX.
+ */
 const TOWARD_DEAD = 0.02;
-const LATERAL_SHARE = 0.35;
-const EXPLODE_MAX = 0.8;
-const LIFT_MAX = 0.08;
+const TOWARD_LATERAL = 0.15;
+const TENT_FRAC = 0.7;
+const TENT_MAX = 1.2;
+/** The burst along the surface, now a side note to the cone: this share of before, and at most this far. */
+const BURST_SHARE = 0.35;
+const EXPLODE_MAX = 0.3;
+/** The cone's tip stops this far behind the fingers; a photo is measured this far around the pinch. */
+const TIP_CLEAR = 0.05;
+const COVER_MAX = 2;
+/** The cone carries the pinched spot's colours into it from this share of the way, fully this much later. */
+const TENT_STREAK_FROM = 0.08;
+const TENT_STREAK_SPAN = 0.25;
+/**
+ * Fingertip spikes: an index fingertip this close to a surface (no pinch) draws it up. The spike
+ * starts at SPIKE_RANGE, is full by SPIKE_FULL, and its tip stops SPIKE_KEEP short of the finger, so a
+ * fingertip resting on the table raises nothing. Its radius grows from SPIKE_RADIUS with its height.
+ */
+const SPIKE_RANGE = 0.09;
+const SPIKE_FULL = 0.03;
+const SPIKE_KEEP = 0.012;
+const SPIKE_RADIUS = 0.1;
+const SPIKE_WIDEN = 0.8;
+/** Below this height there is no spike to draw. */
+const SPIKE_MIN = 2e-4;
+/** The spike rises with this spring (stiff, nearly critical) and falls back with the look's own wobble. */
+const SPIKE_STIFF = 500;
+const SPIKE_DAMP = 38;
+/** A table plane counts under a spike only this far below the hit: where the dense room was snapped onto it. */
+const SPIKE_CLUTTER = 0.02;
+/** A spike's photo ring, and how soon a failed freeze may be tried again. */
+const SPIKE_FOOTPRINT = 0.08;
+const SPIKE_RETRY = 0.4;
+/** The spike's foot glides after the fingertip with this time constant (s). */
+const SPIKE_GLIDE = 0.04;
 /**
  * A table or floor bursts only when the hand leaves it nearly straight off: the off-surface share of
  * the hand's travel ramps from 0.8 (37° off the normal) to full at 0.95 (18°). Pulling a table edge
@@ -210,6 +246,28 @@ interface Grab {
   /** What the slide caps were measured against (span between hands, or the ramp), and whether they bit. */
   span: number;
   capped: boolean;
+  /** How far the grab's photo reaches around it in the surface (measureCover). */
+  coverR: number;
+  /**
+   * The index fingertip held close to a surface, no pinch: where the spike rises from (`hoverC`, on
+   * the surface under the tip), the surface normal it rises along, its height now and wanted.
+   * `hovering` stays on until the spike has sprung back. It shows through this hand's photo slot.
+   */
+  hovering: boolean;
+  hoverC: Vector3;
+  hoverN: Vector3;
+  hoverH: number;
+  hoverTo: number;
+  hoverSpring: Spring;
+  hoverFade: number;
+  /** The slot photo was frozen for the spike, and when a freeze may be tried again. */
+  hoverPhoto: boolean;
+  hoverRetryAt: number;
+  /** For the console line each spike prints when it settles. */
+  hoverAt: number;
+  hoverPeak: number;
+  hoverGap: number;
+  hoverSurface: string;
 }
 
 const enum Card {
@@ -283,6 +341,20 @@ function makeGrab(side: Side): Grab {
     chain: false,
     span: 0,
     capped: false,
+    coverR: COVER_MAX,
+    hovering: false,
+    hoverC: new Vector3(),
+    hoverN: new Vector3(0, 1, 0),
+    hoverH: 0,
+    hoverTo: 0,
+    hoverSpring: new Spring(),
+    hoverFade: 0,
+    hoverPhoto: false,
+    hoverRetryAt: 0,
+    hoverAt: 0,
+    hoverPeak: 0,
+    hoverGap: 1,
+    hoverSurface: '',
   };
 }
 
@@ -381,7 +453,7 @@ export class RoomStretchSystem extends createSystem({
   private outlineShown = true;
   private readonly look: Look = {
     gain: 1, reach: 0.45, ramp: 0.35, stripes: 11, feather: 0.07, wobble: 0.035,
-    waveLength: 0.45, waveSpeed: 7, stiffness: 90, damping: 9, depthPull: 0.35, radial: 2.5,
+    waveLength: 0.45, waveSpeed: 7, stiffness: 90, damping: 9, depthPull: 1, radial: 2.5,
     ripple: 0.015, exposure: 1.1, warmth: -0.1, tint: 0,
     lensScale: 1, lensPitchTrim: 0, lensYawTrim: 0, lensRollTrim: 0, lensDx: 0, lensDy: 0, lensDz: 0,
     cameraLatency: 0, handLag: 0.03, cameraSide: 'auto',
@@ -583,7 +655,10 @@ export class RoomStretchSystem extends createSystem({
       this.resolvePending(this.right, dt, now);
       this.stepHand(this.left, dt);
       this.stepHand(this.right, dt);
-      const active = this.left.on || this.right.on;
+      this.stepHover(this.left, dt, now);
+      this.stepHover(this.right, dt, now);
+      // A spike draws the room only once it has a photo to show.
+      const active = this.left.on || this.right.on || (this.left.hovering && this.left.hoverPhoto) || (this.right.hovering && this.right.hoverPhoto);
       if (LENS_OVERLAY) {
         const live = !active && hasVideo && this.photo.projectFrame(true, this.camera, now);
         this.overlay.setLive(video, live, this.photo.worldToClip);
@@ -1011,8 +1086,9 @@ export class RoomStretchSystem extends createSystem({
    * The scan is lumpy by a centimetre or two; a detected plane is flat. When the line of sight
    * through the pinch meets a plane just around the mesh hit, grab there with the plane's normal.
    */
-  private preferPlane(): void {
-    this.hitNote = 'mesh';
+  /** `note` builds the console text for the pinch line; the fingertip spike asks every frame without it. */
+  private preferPlane(note = true, clutter?: number): void {
+    if (note) this.hitNote = 'mesh';
     const mesh = this.hitMesh;
     if (!mesh || this.roomPlanes.count === 0) return;
     this.rayDir.copy(this.pinch).sub(this.head);
@@ -1021,15 +1097,15 @@ export class RoomStretchSystem extends createSystem({
     mesh.updateWorldMatrix(true, false);
     this.meshHitWorld.copy(this.localHit).applyMatrix4(mesh.matrixWorld);
     const meshT = this.meshHitWorld.distanceTo(this.head);
-    if (!this.roomPlanes.underHit(this.head, this.rayDir, meshT, this.planeHit, this.planeMiss)) {
+    if (!this.roomPlanes.underHit(this.head, this.rayDir, meshT, this.planeHit, this.planeMiss, clutter)) {
       const miss = this.planeMiss;
-      if (miss.found) this.hitNote = `mesh (${miss.label} ${(miss.delta * 100).toFixed(0)}cm)`;
+      if (note && miss.found) this.hitNote = `mesh (${miss.label} ${(miss.delta * 100).toFixed(0)}cm)`;
       return;
     }
     this.inv.copy(mesh.matrixWorld).invert();
     this.localHit.copy(this.planeHit.point).applyMatrix4(this.inv);
     this.localN.copy(this.planeHit.normal).transformDirection(this.inv);
-    this.hitNote = `plane:${this.planeHit.label} d=${(this.planeHit.delta * 100).toFixed(1)}cm`;
+    if (note) this.hitNote = `plane:${this.planeHit.label} d=${(this.planeHit.delta * 100).toFixed(1)}cm`;
   }
 
   private poseGrab(grab: Grab): void {
@@ -1101,6 +1177,7 @@ export class RoomStretchSystem extends createSystem({
       this.sound.miss(grab.slot, this.pinch.x, this.pinch.y, this.pinch.z);
       return;
     }
+    this.measureCover(grab);
     const n = grab.normal;
     const surface = Math.abs(n.y) < 0.5 ? 'wall' : n.y > 0 ? 'table' : 'ceiling';
     console.info(
@@ -1117,24 +1194,138 @@ export class RoomStretchSystem extends createSystem({
 
   /** The grab point and a ring at reach in its surface plane: what the photo has to cover. */
   private writeFootprint(grab: Grab): void {
-    const n = grab.normal;
+    this.writeFootprintAt(grab.worldG, grab.normal, Math.min(0.4, Math.max(0.25, this.look.reach * 0.8)));
+  }
+
+  /** The photo footprint: `centre` first, then a ring of radius `r` in the surface with normal `n`. */
+  private writeFootprintAt(centre: Vector3, n: Vector3, r: number): void {
     this.tanU.set(0, 1, 0).cross(n);
     if (this.tanU.lengthSq() < 1e-6) this.tanU.set(1, 0, 0).cross(n);
     this.tanU.normalize();
     this.tanV.copy(n).cross(this.tanU);
-    const r = Math.min(0.4, Math.max(0.25, this.look.reach * 0.8));
     const f = this.footprint;
-    f[0] = grab.worldG.x;
-    f[1] = grab.worldG.y;
-    f[2] = grab.worldG.z;
+    f[0] = centre.x;
+    f[1] = centre.y;
+    f[2] = centre.z;
     for (let i = 1; i < FOOTPRINT; i++) {
       const a = ((i - 1) / (FOOTPRINT - 1)) * Math.PI * 2;
       const c = Math.cos(a) * r;
       const s = Math.sin(a) * r;
-      f[i * 3] = grab.worldG.x + this.tanU.x * c + this.tanV.x * s;
-      f[i * 3 + 1] = grab.worldG.y + this.tanU.y * c + this.tanV.y * s;
-      f[i * 3 + 2] = grab.worldG.z + this.tanU.z * c + this.tanV.z * s;
+      f[i * 3] = centre.x + this.tanU.x * c + this.tanV.x * s;
+      f[i * 3 + 1] = centre.y + this.tanU.y * c + this.tanV.y * s;
+      f[i * 3 + 2] = centre.z + this.tanU.z * c + this.tanV.z * s;
     }
+  }
+
+  // ---------------------------------------------------------------- fingertip spikes
+
+  /**
+   * An index fingertip held close to a surface, without pinching, draws a small spike of it up
+   * toward the tip: higher as the finger comes closer, following it across the surface, springing
+   * back with a wobble when it leaves. A pinch, or a pull still springing back, owns the hand's photo
+   * slot, so then there is no spike.
+   */
+  private stepHover(grab: Grab, dt: number, now: number): void {
+    const free = !grab.pending && !grab.on;
+    if (!free) {
+      // A pinch took over the slot: the spike springs down under the new pull, on its old fade, while
+      // the pull's photo uploads and fades in.
+      if (grab.hovering) {
+        grab.hoverTo = 0;
+        grab.hoverH = grab.hoverSpring.step(0, dt, this.look.stiffness * 2, this.look.damping);
+        if (grab.hoverSpring.atRest(0, 0.0008)) this.endSpike(grab, now, true);
+      }
+      return;
+    }
+    // Only on the dense room: the raw scans are too coarse to draw a fingertip-sized point.
+    const want = this.hands.hasPinch[grab.side] && this.overlay.ready ? this.aimSpike(grab, dt) : 0;
+    grab.hoverTo = want;
+    if (want > 0 && !grab.hovering) {
+      grab.hovering = true;
+      grab.hoverAt = now;
+      grab.hoverPeak = 0;
+      grab.hoverGap = SPIKE_RANGE;
+    }
+    if (!grab.hovering) return;
+    const rising = want > 0;
+    grab.hoverH = grab.hoverSpring.step(
+      want, dt, rising ? SPIKE_STIFF : this.look.stiffness * 2, rising ? SPIKE_DAMP : this.look.damping,
+    );
+    if (grab.hoverH > grab.hoverPeak) grab.hoverPeak = grab.hoverH;
+    if (rising) this.spikePhoto(grab, now);
+    const slot = this.photo.slots[grab.slot];
+    grab.hoverFade = grab.hoverPhoto && slot.has && slot.ready ? Math.min(1, grab.hoverFade + dt / FADE_IN) : 0;
+    if (!rising && grab.hoverSpring.atRest(0, 0.0008)) this.endSpike(grab, now, false);
+  }
+
+  /**
+   * The spike this hand wants, metres, from the surface along your line of sight through the index
+   * tip. It rises from the tip's foot on that surface's plane, so it reaches straight up to the finger.
+   */
+  private aimSpike(grab: Grab, dt: number): number {
+    const tip = this.hands.indexTip[grab.side];
+    this.pinch.copy(tip);
+    if (!this.raycast(this.head, this.pinch) || !this.hitMesh) return 0;
+    // A plane only where the dense room lies on it: a book or a laptop on the table is the surface.
+    this.preferPlane(false, SPIKE_CLUTTER);
+    const mesh = this.hitMesh;
+    mesh.updateWorldMatrix(true, false);
+    const hit = this.tmp.copy(this.localHit).applyMatrix4(mesh.matrixWorld);
+    const n = this.tmp2.copy(this.localN).transformDirection(mesh.matrixWorld);
+    const gap = this.unit.copy(tip).sub(hit).dot(n);
+    if (gap <= SPIKE_KEEP || gap >= SPIKE_RANGE) return 0;
+    const foot = this.raw.copy(tip).addScaledVector(n, -gap);
+    if (!grab.hovering) {
+      grab.hoverC.copy(foot);
+      grab.hoverN.copy(n);
+    } else {
+      // Tracking jitters by millimetres: the spike glides after the finger instead of shaking.
+      const f = 1 - Math.exp(-Math.min(dt, STEP_MAX) / SPIKE_GLIDE);
+      grab.hoverC.lerp(foot, f);
+      grab.hoverN.lerp(n, f).normalize();
+    }
+    if (gap < grab.hoverGap) grab.hoverGap = gap;
+    grab.hoverSurface = Math.abs(n.y) < 0.5 ? 'wall' : n.y > 0 ? 'table' : 'ceiling';
+    return (1 - smooth((gap - SPIKE_FULL) / (SPIKE_RANGE - SPIKE_FULL))) * (gap - SPIKE_KEEP);
+  }
+
+  /**
+   * Freezes a photo for the spike into the hand's slot: a bank frame only. A live frame has this
+   * very finger cut out right where the spike rises, so without a clean one there is no spike. Again
+   * when the spike glides off the photo, at most every SPIKE_RETRY.
+   */
+  private spikePhoto(grab: Grab, now: number): void {
+    const slot = this.photo.slots[grab.slot];
+    if (grab.hoverPhoto && slot.has && this.photo.slotContains(grab.slot, grab.hoverC, SLIDE_MARGIN)) return;
+    if (now < grab.hoverRetryAt) return;
+    grab.hoverRetryAt = now + SPIKE_RETRY;
+    this.writeFootprintAt(grab.hoverC, grab.hoverN, SPIKE_FOOTPRINT);
+    const frozen = this.photo.freeze(grab.slot, this.footprint, FOOTPRINT, true, this.camera, now, this.handJoints(), this.head, false);
+    grab.hoverPhoto = frozen;
+    if (!frozen) grab.hoverFade = 0;
+  }
+
+  /** One console line per spike, then back to rest. `keep` leaves the slot photo to a pinch that took over. */
+  private endSpike(grab: Grab, now: number, keep: boolean): void {
+    if (grab.hoverPeak > 0.003) {
+      console.info(
+        `[jonze] hover ${grab.side === 'left' ? 'L' : 'R'} ${grab.hoverSurface} gap ${(grab.hoverGap * 100).toFixed(1)}cm ` +
+          `peak ${(grab.hoverPeak * 100).toFixed(1)}cm photo ${grab.hoverPhoto ? 'bank' : 'none'} ${(now - grab.hoverAt).toFixed(1)}s` +
+          (keep ? ' -> pinch' : ''),
+      );
+    }
+    if (grab.hoverPhoto && !keep) this.photo.drop(grab.slot);
+    this.resetSpike(grab);
+  }
+
+  private resetSpike(grab: Grab): void {
+    grab.hovering = false;
+    grab.hoverH = 0;
+    grab.hoverTo = 0;
+    grab.hoverSpring.reset(0);
+    grab.hoverFade = 0;
+    grab.hoverPhoto = false;
+    grab.hoverPeak = 0;
   }
 
   private stepHand(grab: Grab, dt: number): void {
@@ -1167,7 +1358,8 @@ export class RoomStretchSystem extends createSystem({
       const b = grab.B + (grab.liftTo - grab.B) * f;
       grab.Bvel = (b - grab.B) * inv;
       grab.B = b;
-      grab.lift.copy(this.head).sub(grab.worldG).normalize();
+      // Toward your head from where the spot has slid, so the cone stays on the line through your fingers.
+      grab.lift.copy(this.head).sub(grab.worldG).sub(grab.D).normalize();
       const slid = grab.D.length();
       if (slid > grab.peakSlide) grab.peakSlide = slid;
       if (b > grab.peakLift) grab.peakLift = b;
@@ -1263,16 +1455,55 @@ export class RoomStretchSystem extends createSystem({
     }
     const along = travel.dot(grab.ray0);
     const lateral = Math.sqrt(Math.max(0, moved * moved - along * along));
-    const toward = Math.max(0, grab.reach0 - reach - LATERAL_SHARE * lateral - TOWARD_DEAD) * ease;
+    const reach0 = Math.max(0.1, grab.reach0);
+    // Travel back along the line of sight at the pinch, so a pull toward the chest counts in full,
+    // not only what it brings the hand nearer the eyes.
+    const share = Math.max(0, -along / reach0 - TOWARD_DEAD - (TOWARD_LATERAL * lateral) / reach0);
+    const u = Math.min(TENT_FRAC, share * this.look.depthPull) * ease;
+    const toward = Math.min(TENT_FRAC, share) * ease * reach0;
     const off = travel.dot(n);
     const straight = moved > 1e-3 ? smooth((off / moved - STRAIGHT_FROM) / (STRAIGHT_FULL - STRAIGHT_FROM)) : 0;
     const wall = 1 - smooth((Math.abs(n.y) - WALL_UP) / WALL_FADE);
     const rim = Math.max(0, (BURST_ANGLE * this.head.distanceTo(grab.worldG) - 0.22) / 1.5);
-    let e = Math.min(EXPLODE_MAX, rim, this.look.radial * toward * Math.max(straight, wall));
+    let e = Math.min(EXPLODE_MAX, rim, BURST_SHARE * this.look.radial * toward * Math.max(straight, wall));
     const slid = grab.target.length();
     if (slid + e > PULL_MAX) e = Math.max(0, PULL_MAX - slid);
     grab.explodeTo = e;
-    grab.liftTo = Math.min(LIFT_MAX, this.look.depthPull * toward);
+    // The cone: the slid spot comes the same share of its way to your head as your hand came of its
+    // way, so it stays on the line of sight through your fingers at a depth that follows theirs.
+    const depth = this.tmp.copy(grab.worldG).add(grab.target).distanceTo(this.head);
+    // Its tip stays behind your fingers, and its foot inside the photo frozen for it.
+    const liftIn = Math.sqrt(Math.max(0, 1 - grab.lift.dot(n) ** 2));
+    const edge = this.overlay.uniforms.uCore.value + 0.1 + 0.55 * e;
+    const covered = Math.max(0, grab.coverR - edge - e) / Math.max(0.6, 1.2 * liftIn);
+    grab.liftTo = Math.min(TENT_MAX, depth * u, Math.max(0, depth - reach - TIP_CLEAR), covered);
+  }
+
+  /**
+   * How far the slot's photo reaches around the grab point in the surface: the nearest frame edge
+   * along four directions, found the way keepInPhoto finds the slide's. The cone stays inside it.
+   */
+  private measureCover(grab: Grab): void {
+    const n = grab.normal;
+    this.tanU.set(0, 1, 0).cross(n);
+    if (this.tanU.lengthSq() < 1e-6) this.tanU.set(1, 0, 0).cross(n);
+    this.tanU.normalize();
+    this.tanV.copy(n).cross(this.tanU);
+    let cover = COVER_MAX;
+    for (let d = 0; d < 4; d++) {
+      const axis = d < 2 ? this.tanU : this.tanV;
+      const sign = d % 2 === 0 ? 1 : -1;
+      let lo = 0;
+      let hi = cover;
+      for (let i = 0; i < 7; i++) {
+        const mid = (lo + hi) * 0.5;
+        this.tmp.copy(grab.worldG).addScaledVector(axis, sign * mid);
+        if (this.photo.slotContains(grab.slot, this.tmp, SLIDE_MARGIN)) lo = mid;
+        else hi = mid;
+      }
+      cover = Math.min(cover, lo);
+    }
+    grab.coverR = cover;
   }
 
   /**
@@ -1352,6 +1583,8 @@ export class RoomStretchSystem extends createSystem({
   private clearGrabs(): void {
     this.resetGrab(this.left);
     this.resetGrab(this.right);
+    this.resetSpike(this.left);
+    this.resetSpike(this.right);
     this.left.pending = false;
     this.right.pending = false;
     this.photo.drop(0);
@@ -1381,6 +1614,7 @@ export class RoomStretchSystem extends createSystem({
     grab.peakBurst = 0;
     grab.peakBloom = 0;
     grab.clipped = false;
+    grab.coverR = COVER_MAX;
     for (let i = 0; i < grab.springs.length; i++) grab.springs[i].reset(0);
   }
 
@@ -1405,10 +1639,11 @@ export class RoomStretchSystem extends createSystem({
     grab.axis.set(sign, 0, 0);
     grab.axisRel.copy(grab.axis);
     grab.normal.set(0, 0, 1);
-    grab.lift.copy(this.head).sub(grab.worldG).normalize();
+    grab.lift.copy(this.head).sub(grab.worldG).sub(grab.D).normalize();
     grab.dist = Math.max(0.2, this.head.distanceTo(grab.worldG));
     grab.ramp = this.look.ramp * Math.max(1, grab.dist / RAMP_NEAR);
-    grab.B = Math.min(LIFT_MAX, pull * 0.11);
+    // The right hand also pulls toward the camera, so a desk screenshot shows the cone.
+    grab.B = sign > 0 ? pull * 0.55 : Math.min(0.08, pull * 0.11);
     grab.E = 0;
     grab.rippleT = 10;
     grab.A = AHEAD;
@@ -1467,6 +1702,22 @@ export class RoomStretchSystem extends createSystem({
     const streaks = !slot.live || hasFill > 0;
     const angle = Math.atan2(len * sk, grab.dist) / DEG;
     grab.bloom = grab.on && streaks ? smooth((angle - this.look.stripes) / STREAK_SPAN_DEG) : 0;
+    // The cone carries the pinched spot's colours by how far of its way toward you it has come.
+    const tent = grab.on && streaks ? smooth((grab.B / Math.max(0.2, grab.dist) - TENT_STREAK_FROM) / TENT_STREAK_SPAN) : 0;
+    (first ? U.uTentBloom0 : U.uTentBloom1).value = tent;
+    // A fingertip spike, when this hand has one up.
+    // Its wobble back dips below the surface too.
+    const spike = Math.abs(grab.hoverH) > SPIKE_MIN;
+    const hov = first ? U.uHov0.value : U.uHov1.value;
+    const hovT = first ? U.uHovT0.value : U.uHovT1.value;
+    if (spike) {
+      hov.set(grab.hoverC.x, grab.hoverC.y, grab.hoverC.z, SPIKE_RADIUS + SPIKE_WIDEN * Math.abs(grab.hoverH));
+      hovT.copy(grab.hoverN).multiplyScalar(grab.hoverH);
+      (first ? U.uHovN0 : U.uHovN1).value.copy(grab.hoverN);
+    } else {
+      hovT.set(0, 0, 0);
+    }
+    const fade = Math.max(grab.fade, spike ? grab.hoverFade : 0);
     (first ? U.uRamp0 : U.uRamp1).value = grab.ramp;
     if (!first) U.uChain1.value = grab.chain ? 1 : 0;
     if (grab.holding && grab.bloom > grab.peakBloom) grab.peakBloom = grab.bloom;
@@ -1478,7 +1729,7 @@ export class RoomStretchSystem extends createSystem({
       U.uOn0.value = on;
       U.uBloom0.value = grab.bloom;
       U.uHasPhoto0.value = has;
-      U.uFade0.value = grab.fade;
+      U.uFade0.value = fade;
     } else {
       U.uA1.value = grab.A;
       U.uE1.value = grab.E;
@@ -1487,7 +1738,7 @@ export class RoomStretchSystem extends createSystem({
       U.uOn1.value = on;
       U.uBloom1.value = grab.bloom;
       U.uHasPhoto1.value = has;
-      U.uFade1.value = grab.fade;
+      U.uFade1.value = fade;
     }
   }
 
