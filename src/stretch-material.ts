@@ -155,6 +155,7 @@ varying vec3 vMid;  // after the first grab: where the second grab measures its 
 varying vec2 vMask; // x: visible displacement (m), y: how much a squeezed zone hands back to the room
 varying vec2 vW;    // how much each grab moved this point
 varying vec2 vTent; // how far up each grab's cone toward you this point is, 0 at its foot to 1 at its tip
+varying vec2 vFold; // each cone's folds here: +1 on a ridge, -1 in a valley, 0 off the folds
 varying float vViewZ; // metres in front of this eye, after the stretch
 
 // A fingertip held close (no pinch), per slot: where the spike rises from and its radius, the move
@@ -163,6 +164,10 @@ uniform vec4 uHov0; uniform vec3 uHovT0; uniform vec3 uHovN0;
 uniform vec4 uHov1; uniform vec3 uHovT1; uniform vec3 uHovN1;
 
 const float SQUASH = 2.0;       // squeezed zones are 2 m long per metre pulled; slope stays above -0.75
+const float FOLDS = 5.0;        // radial creases in a cone
+const float FOLD_DEPTH = 0.12;  // their depth, as a share of the cone's rise
+const float GATHER = 0.35;      // how far the cone's hem is drawn in toward the pinch, as a share of its rise
+const float SPIKE_GATHER = 0.6; // and a fingertip spike's surroundings toward the point under the finger
 ${SHARED}
 
 /**
@@ -172,7 +177,7 @@ ${SHARED}
  * included, is built per pixel in the fragment stage. 'hide' rises where a squeezed zone should
  * hand back to the real room.
  */
-void pinch(inout vec3 p, inout float seen, inout float hide, out float own, out float tent,
+void pinch(inout vec3 p, inout float seen, inout float hide, out float own, out float tent, out float fold,
            vec3 G, vec3 D, vec3 axis, vec3 n, vec3 lift, float A, float E, float B, float rip, float ramp) {
   vec3 q = p - G;
   float len = length(D);
@@ -221,21 +226,38 @@ void pinch(inout vec3 p, inout float seen, inout float hide, out float own, out 
   }
   p += moveT + moveR + moveW;
 
-  // Toward you: a cone up the line of sight through the fingers, its own step after the slide so the
-  // two cannot fold each other. It widens as it rises, more where the surface is seen at an angle
-  // (the lift then also moves it along the surface), and is pointed at the top.
+  // Toward you: cloth pinched between the fingers, up the line of sight through them. Its own step
+  // after the slide so the two cannot fold each other. Taut, nearly straight sides from the tip down
+  // to a soft hem, wider where the surface is seen at an angle (the lift then also moves it along the
+  // surface, and its steepest slope stays under 1), creased by radial folds, and drawn in a little
+  // toward the pinch instead of only stretching.
   vec3 q2 = p - G - D;
   float dn2 = dot(q2, n);
-  float rho2 = length(q2 - n * dn2);
+  vec3 in2 = q2 - n * dn2;
+  float rho2 = length(in2);
   float liftIn = length(lift - n * dot(lift, n));
-  // Sized by the rise only: the spring's dip after release must not shrink it to nothing.
-  float tentR = edge + e + max(0.6, 1.2 * liftIn) * max(B, 0.0);
-  float f = 1.0 - smoothstep(0.0, tentR, rho2);
-  tent = f * f * (1.0 - smoothstep(0.25, 0.75, abs(dn2)));
-  vec3 moveB = lift * (B * tent);
-  p += moveB;
+  float rise = max(B, 0.0);
+  // Sized by the rise only: the spring's dip after release must not shrink it to nothing. Wide enough
+  // that the steepest slope along the surface (1.8 at the tip, from the lift's in-plane share, plus
+  // the gather) stays under 0.9, so it never folds over (room-stretch-system.ts tentSpread).
+  float tentR = edge + e + max(0.6, (1.8 * liftIn + GATHER) / 0.9) * rise;
+  float r = min(rho2 / tentR, 1.0);
+  float flat2 = 1.0 - smoothstep(0.25, 0.75, abs(dn2));
+  float cloth = pow(1.0 - r, 1.8);
+  tent = cloth * flat2;
+  // Folds: FOLDS creases from the tip down the sides, gone at the tip and at the hem, along the
+  // surface normal so they never fold the surface over. Each pinch turns them its own way.
+  vec3 t1 = normalize(cross(n, abs(n.y) < 0.9 ? vec3(0.0, 1.0, 0.0) : vec3(1.0, 0.0, 0.0)));
+  float theta = atan(dot(in2, cross(n, t1)), dot(in2, t1));
+  float turn = fract(dot(G, vec3(12.9898, 78.233, 37.719))) * 6.2831853;
+  float crease = cos(FOLDS * theta + turn) * 4.0 * r * (1.0 - r) * flat2;
+  fold = crease * min(rise * 5.0, 1.0);
+  vec3 moveB = lift * (B * tent) + n * (FOLD_DEPTH * rise * crease);
+  // The hem drawn in toward the pinch; zero at the tip itself, so the centre never pinches through.
+  vec3 moveG = rho2 > 1e-5 ? in2 * (-GATHER * rise * cloth * flat2 / tentR) : vec3(0.0);
+  p += moveB + moveG;
 
-  own = length(moveT + moveR + moveB + moveW) + rippling;
+  own = length(moveT + moveR + moveB + moveW + moveG) + rippling;
   seen += own;
   float hideT = (1.0 - capT) * smoothstep(0.0, 0.02, length(moveT));
   float hideR = (1.0 - capR) * smoothstep(0.0, 0.02, length(moveR));
@@ -243,14 +265,19 @@ void pinch(inout vec3 p, inout float seen, inout float hide, out float own, out 
 }
 
 /**
- * A fingertip held close: the surface under it rises to a sharp point toward the tip. Only the
- * surface itself, within a few centimetres of its plane.
+ * A fingertip held close: the surface is sucked up toward it, a narrow neck rising out of a wide
+ * base, and drawn in along the surface toward the point under the finger, so you see it pulled in
+ * even from straight above. Only the surface itself, within a few centimetres of its plane.
  */
 vec3 hover(vec3 p, vec4 hov, vec3 tip, vec3 n) {
   vec3 q = p - hov.xyz;
   float dn = dot(q, n);
-  float f = 1.0 - smoothstep(0.0, hov.w, length(q - n * dn));
-  return tip * (f * f * (1.0 - smoothstep(0.03, 0.06, abs(dn))));
+  vec3 inPlane = q - n * dn;
+  float r = min(length(inPlane) / hov.w, 1.0);
+  float f = 1.0 - smoothstep(0.0, 1.0, r);
+  float h = max(dot(tip, n), 0.0);
+  vec3 pull = inPlane * (-SPIKE_GATHER * h * f / hov.w);
+  return (tip * pow(f, 2.5) + pull) * (1.0 - smoothstep(0.03, 0.06, abs(dn)));
 }
 
 void main() {
@@ -262,12 +289,14 @@ void main() {
   float own1 = 0.0;
   float tent0 = 0.0;
   float tent1 = 0.0;
-  if (uOn0 > 0.5) pinch(p, seen, hide, own0, tent0, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0, uRamp0);
+  float fold0 = 0.0;
+  float fold1 = 0.0;
+  if (uOn0 > 0.5) pinch(p, seen, hide, own0, tent0, fold0, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0, uRamp0);
   // A later grab that began on the already-moved surface bends what you saw; two grabs that began
   // together each bend the rest surface and their moves add, so neither squeezes into the other.
   vec3 base1 = uChain1 > 0.5 ? p : rest;
   vec3 p1 = base1;
-  if (uOn1 > 0.5) pinch(p1, seen, hide, own1, tent1, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1, uRamp1);
+  if (uOn1 > 0.5) pinch(p1, seen, hide, own1, tent1, fold1, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1, uRamp1);
   p += p1 - base1;
   // Fingertip spikes rise from the rest surface, each read through its own slot's photo.
   vec3 h0 = dot(uHovT0, uHovT0) > 0.0 ? hover(rest, uHov0, uHovT0, uHovN0) : vec3(0.0);
@@ -282,6 +311,7 @@ void main() {
   vMask = vec2(seen * (1.0 - smoothstep(0.6, 1.0, hide)), ease(hide));
   vW = vec2(own0, own1);
   vTent = vec2(tent0, tent1);
+  vFold = vec2(fold0, fold1);
   vec4 viewPos = viewMatrix * vec4(p, 1.0);
   vViewZ = -viewPos.z;
   gl_Position = projectionMatrix * viewPos;
@@ -350,6 +380,7 @@ varying vec3 vMid;
 varying vec2 vMask;
 varying vec2 vW;
 varying vec2 vTent;
+varying vec2 vFold;
 varying float vViewZ;
 /** How much each grab's cone carries the pinched spot's colours up into it, 0 to 1. */
 uniform float uTentBloom0;
@@ -666,6 +697,9 @@ void main() {
   float cover = p0.a * w0 + p1.a * w1;
   vec3 col = (p0.rgb * w0 + p1.rgb * w1) / max(cover, 1e-7);
   alpha = shown * max(own * max(p0.a * uFade0, p1.a * uFade1), frost);
+  // A cone's folds read as cloth even in a flat photo: valleys a little darker, ridges a little lighter.
+  float creases = clamp((uOn0 > 0.5 ? vFold.x : 0.0) + (uOn1 > 0.5 ? vFold.y : 0.0), -1.0, 1.0);
+  col *= 1.0 + 0.05 * max(creases, 0.0) - 0.18 * max(-creases, 0.0);
 #ifdef ENV_DEPTH
   // Debug views paint the cut instead of cutting.
   if (uOccDebug < 0.5) {
