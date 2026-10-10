@@ -21,12 +21,15 @@ import {
   type CameraDeviceInfo,
   type Entity,
 } from '@iwsdk/core';
+import { consoleShown, setConsoleStatus } from './debug-console.js';
 import { EnvDepth } from './env-depth.js';
 import { PREVIEW_FORCED, getMode } from './experience.js';
 import { HandOccluder, SEGMENTS } from './hand-occluder.js';
 import { drawHint, makeCanvas, type Canvas2D } from './labels.js';
 import { cameraMount, PassthroughPhoto, type CameraMount, type CameraSideSetting, type HandJoints } from './passthrough-photo.js';
-import { RoomMeshOverlay } from './room-mesh-overlay.js';
+import { FrameMeter } from './frame-meter.js';
+import { RaiseMaps } from './raise-map.js';
+import { RoomMeshOverlay, fillBound, moveReach, type BoundLook, type StretchBound } from './room-mesh-overlay.js';
 import { RoomPlanes, type PlaneHit, type PlaneMiss } from './room-planes.js';
 import { StretchLook } from './stretch-component.js';
 import { Spring, averageNormal, buildTriGrid, rayTriGrid, triangleNormal, type RayHit, type TriGrid } from './stretch-math.js';
@@ -57,8 +60,12 @@ const SPAN_EASE = 0.3;
 const RAMP_NEAR = 0.8;
 /** The smoothing step never exceeds this: a long frame cannot land a whole pull at once. */
 const STEP_MAX = 1 / 50;
-/** The surface never follows faster than this, m/s. */
-const FOLLOW_MAX = 2.5;
+/**
+ * The surface never follows faster than this, m/s over the capped step: above a quick pull's hand
+ * speed on a normal frame (at 2.5 m/s it held every quick pull to 5 cm a frame), and on a long
+ * frame it holds the jump to FOLLOW_MAX * STEP_MAX = 12 cm.
+ */
+const FOLLOW_MAX = 6;
 /** The pinch ray must meet the grabbed plane within ~78° of its normal to slide. */
 const GRAZE = 0.2;
 /** Toward-you travel ignored, and how much sideways travel cancels it (a shoulder sweep shortens reach too). */
@@ -332,6 +339,10 @@ const OCC_DELTA = OCC_MODE === 'delta';
 
 /** Developer check: `?lens=overlay` draws the live camera in stripes over the room at rest. */
 const LENS_OVERLAY = typeof location !== 'undefined' && new URLSearchParams(location.search).get('lens') === 'overlay';
+/** `?raise=0` keeps the scan as it is: no depth-raised objects under a pull. */
+const RAISE = typeof location === 'undefined' || new URLSearchParams(location.search).get('raise') !== '0';
+/** `?cull=0` draws the whole room with the stretch program, for comparing frame times. */
+const CULL = typeof location === 'undefined' || new URLSearchParams(location.search).get('cull') !== '0';
 
 /** The camera frame size, and whether it is the full square sensor or the 4:3 crop of it. */
 function frameShape(video: HTMLVideoElement | null): string {
@@ -398,6 +409,9 @@ export class RoomStretchSystem extends createSystem({
   private readonly tmpC = new Vector3();
   private readonly depth = new EnvDepth();
   private readonly sound = new StretchSound();
+  private meter!: FrameMeter;
+  private readonly bounding: BoundLook = { reach: 0.45, core: 0.12, ripple: 0.015, wobble: 0.035 };
+  private raise!: RaiseMaps;
   private overlay!: RoomMeshOverlay;
   private hands!: HandOccluder;
   private readonly handMap: { left: XRHand | null; right: XRHand | null } = { left: null, right: null };
@@ -461,6 +475,11 @@ export class RoomStretchSystem extends createSystem({
   init(): void {
     this.overlay = new RoomMeshOverlay(this.scene, LENS_OVERLAY);
     if (LENS_OVERLAY) console.info('[jonze] lens overlay: live camera in stripes over the room at rest; hold still to read it');
+    if (!CULL) console.info('[jonze] cull=0: the whole room draws with the stretch program');
+    this.meter = new FrameMeter(this.renderer, this.scene);
+    this.raise = new RaiseMaps(this.renderer);
+    if (!RAISE) console.info('[jonze] raise=0: unscanned objects stay flat under a pull');
+    else if (!this.raise.supported) console.info('[jonze] raise off: no half-float render targets here');
     this.hands = new HandOccluder(this.scene, OCC_DEBUG);
     this.photo.history = this.hands;
     this.joints.points = this.hands.points;
@@ -541,6 +560,7 @@ export class RoomStretchSystem extends createSystem({
     const stretch = getMode() === 'stretch';
     this.syncOutline(stretch);
     if (!stretch) {
+      this.meter.idle();
       this.hud.visible = false;
       this.room.visible = false;
       this.overlay.hide(true);
@@ -588,21 +608,32 @@ export class RoomStretchSystem extends createSystem({
         const live = !active && hasVideo && this.photo.projectFrame(true, this.camera, now);
         this.overlay.setLive(video, live, this.photo.worldToClip);
         this.overlay.uniforms.uLensOn.value = live ? 1 : 0;
+        // The stripes check the raise too: slot 0's map follows the live depth while nothing is held.
+        if (live && RAISE) this.captureRaise(0);
       }
-      // The depth debug views show the whole room, pinched or not.
-      this.overlay.setActive(active || this.overlay.uniforms.uLensOn.value > 0 || OCC_DEBUG || OCC_DELTA);
+      // The depth debug views show the whole room, pinched or not, so they draw all of it.
+      const debugView = this.overlay.uniforms.uLensOn.value > 0 || OCC_DEBUG || OCC_DELTA;
+      this.overlay.setActive(active || debugView, active);
+      this.overlay.setCull(CULL && !debugView);
+      // Uniforms and chunk bounds first: the chunks drawn this frame must match this frame's pull.
+      this.publish(this.left, this.right, time, hasVideo);
       this.overlay.sync(meshes, this.head);
       this.overlay.syncPlanes(this.roomPlanes);
-      this.publish(this.left, this.right, time, hasVideo);
       this.sing(this.left);
       this.sing(this.right);
       this.rearmCamera(now);
       const updateMs = performance.now() - startMs;
       if (this.left.pinchUpdateMs < 0) this.left.pinchUpdateMs = updateMs;
       if (this.right.pinchUpdateMs < 0) this.right.pinchUpdateMs = updateMs;
+      if (consoleShown()) {
+        const room = active || debugView ? this.overlay.chunksDrawn : -1;
+        const text = this.meter.frame(this.frameDt, updateMs, room, this.overlay.chunkCount, now);
+        if (text) setConsoleStatus(text);
+      }
     } else if (!this.previewRoom) {
       // A headset back on the launch page. Leaving a session stops the camera; the frames
       // between the Enter click and the session starting must not.
+      this.meter.idle();
       this.room.visible = false;
       this.overlay.hide(false);
       this.hands.setActive(false);
@@ -1101,11 +1132,12 @@ export class RoomStretchSystem extends createSystem({
       this.sound.miss(grab.slot, this.pinch.x, this.pinch.y, this.pinch.z);
       return;
     }
+    const raised = RAISE && this.captureRaise(grab.slot);
     const n = grab.normal;
     const surface = Math.abs(n.y) < 0.5 ? 'wall' : n.y > 0 ? 'table' : 'ceiling';
     console.info(
       `[jonze] pinch ${tag} ${surface} ${this.head.distanceTo(grab.worldG).toFixed(2)}m dense=${this.overlay.ready ? 'y' : 'n'} ` +
-        `hit=${this.hitNote} ${this.scanNote()}`,
+        `raise=${raised ? 'y' : 'n'} hit=${this.hitNote} ${this.scanNote()}`,
     );
     console.info(`[jonze] ${this.photo.pickLine(grab.slot)} | ${grab.freezeMs.toFixed(1)}ms`);
     grab.heldAt = now;
@@ -1438,7 +1470,61 @@ export class RoomStretchSystem extends createSystem({
     U.uRipple.value = this.look.ripple;
     U.uAnyPhoto.value = hasVideo ? 1 : 0;
     U.uLinear.value = this.look.linearBlend ? 1 : 0;
+    this.publishRaise();
+    const g0 = aFirst ? a : b;
+    const g1 = aFirst ? b : a;
+    const [b0, b1] = this.overlay.bounds;
+    this.boundGrab(b0, g0, 0);
+    // A chained second grab bends what the first already moved: its reach grows by that move.
+    this.boundGrab(b1, g1, g0.on && g1.chain ? moveReach(g0, this.boundLook()) : 0);
   }
+
+  /** Where a grab can move the room this frame. */
+  private boundGrab(bound: StretchBound, grab: Grab, grow: number): void {
+    bound.on = grab.on;
+    if (grab.on) fillBound(bound, grab, this.boundLook(), grow);
+  }
+
+  private boundLook(): BoundLook {
+    const b = this.bounding;
+    b.reach = this.look.reach;
+    b.core = this.overlay.uniforms.uCore.value;
+    b.ripple = this.look.ripple;
+    b.wobble = this.look.wobble;
+    return b;
+  }
+
+  /** Copies this frame's depth into photo slot `k`'s raise map, hands cleared. */
+  private captureRaise(k: 0 | 1): boolean {
+    return this.raise.capture(k, this.renderer, this.depth, this.camera.parent, this.hands.segA, this.hands.segB);
+  }
+
+  /**
+   * Each photo slot's raise map is used while its grab is on; slot 0's also while the lens stripes
+   * show, so they can be checked on the objects it raises.
+   */
+  private publishRaise(): void {
+    const U = this.overlay.uniforms;
+    const lens = U.uLensOn.value > 0;
+    for (let k = 0; k < 2; k++) {
+      const map = this.raise.maps[k];
+      const grab = k === 0 ? this.left : this.right;
+      const on = RAISE && map.on && (grab.on || (k === 0 && lens)) ? 1 : 0;
+      if (k === 0) {
+        U.uRaiseOn0.value = on;
+        U.uRaise0.value = map.target.texture;
+        U.uRaiseToMap0.value.copy(map.toMap);
+        U.uRaiseEye0.value.copy(map.eye);
+      } else {
+        U.uRaiseOn1.value = on;
+        U.uRaise1.value = map.target.texture;
+        U.uRaiseToMap1.value.copy(map.toMap);
+        U.uRaiseEye1.value.copy(map.eye);
+      }
+    }
+  }
+
+
 
   private writeGrab(U: RubberUniformSet, k: 0 | 1, grab: Grab): void {
     const first = k === 0;
@@ -1706,6 +1792,8 @@ export class RoomStretchSystem extends createSystem({
     outlineMaterial.visible = true;
     this.stopCamera();
     this.overlay.dispose();
+    this.meter.dispose();
+    this.raise.dispose();
     this.hands.dispose();
     this.photo.dispose();
     this.sound.dispose();

@@ -1,5 +1,6 @@
 import { DoubleSide, Matrix4, ShaderMaterial, Vector2, Vector3, Vector4, type Texture } from '@iwsdk/core';
 import { SEGMENTS } from './hand-occluder.js';
+import { RAISE_MAX, RAISE_MIN } from './raise-map.js';
 
 /**
  * Two grabs, in world space. The room mesh bends by both, then each grab reads its own photo first.
@@ -88,6 +89,16 @@ export function createRubberUniforms() {
     uSegB: { value: Array.from({ length: SEGMENTS }, () => new Vector4()) },
     /** 0 off, 1 `?occ=debug` (cut magenta, gate cyan), 2 `?occ=delta` (real depth against the room). */
     uOccDebug: { value: 0 },
+    // Per photo slot, the headset's depth frozen at the pinch (raise-map.ts): scanned points behind
+    // an unscanned object slide onto it before they bend.
+    uRaise0: { value: null as Texture | null },
+    uRaise1: { value: null as Texture | null },
+    uRaiseToMap0: { value: new Matrix4() },
+    uRaiseToMap1: { value: new Matrix4() },
+    uRaiseEye0: { value: new Vector3() },
+    uRaiseEye1: { value: new Vector3() },
+    uRaiseOn0: { value: 0 },
+    uRaiseOn1: { value: 0 },
   };
 }
 
@@ -140,6 +151,7 @@ uniform float uRippleK;
 uniform float uRippleSpeed;
 
 varying vec3 vRest;
+varying vec3 vScan; // the scanned point before any raise: what the bends and streak weights measure
 varying vec3 vWorld;
 varying vec3 vMid;  // after the first grab: where the second grab measures its column from
 varying vec2 vMask; // x: visible displacement (m), y: how much a squeezed zone hands back to the room
@@ -148,6 +160,34 @@ varying float vViewZ; // metres in front of this eye, after the stretch
 
 const float SQUASH = 2.0;       // squeezed zones are 2 m long per metre pulled; slope stays above -0.75
 ${SHARED}
+
+#ifdef ENV_DEPTH
+uniform sampler2D uRaise0;
+uniform sampler2D uRaise1;
+uniform mat4 uRaiseToMap0;
+uniform mat4 uRaiseToMap1;
+uniform vec3 uRaiseEye0;
+uniform vec3 uRaiseEye1;
+uniform float uRaiseOn0;
+uniform float uRaiseOn1;
+
+/**
+ * Slides a scanned point onto the real surface in front of it, along the line of sight of the eye
+ * the depth was frozen from, when it sits ${RAISE_MIN * 100}-${RAISE_MAX * 100} cm behind it: an object the scan missed.
+ * Nearest filtering, so a cleared (hand) texel never blends into a false depth.
+ */
+bool raiseOnto(inout vec3 p, sampler2D map, mat4 toMap, vec3 eye) {
+  vec4 h = toMap * vec4(p, 1.0);
+  if (h.w < 0.1) return false;
+  vec2 uv = h.xy / h.w;
+  if (uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return false;
+  float real = textureLod(map, uv, 0.0).r;
+  float gap = h.w - real;
+  if (real <= 0.0 || gap < ${RAISE_MIN.toFixed(3)} || gap > ${RAISE_MAX.toFixed(3)}) return false;
+  p = eye + (p - eye) * (real / h.w);
+  return true;
+}
+#endif
 
 /**
  * One pinch. Slides the surface along the pull (stretched behind the pinch, rigid for A ahead,
@@ -220,8 +260,16 @@ void pinch(inout vec3 p, inout float seen, inout float hide, out float own,
 }
 
 void main() {
-  vec3 rest = (modelMatrix * vec4(position, 1.0)).xyz;
-  vec3 p = rest;
+  vec3 scan = (modelMatrix * vec4(position, 1.0)).xyz;
+  vec3 rest = scan;
+#ifdef ENV_DEPTH
+  bool raised = uRaiseOn0 > 0.5 && raiseOnto(rest, uRaise0, uRaiseToMap0, uRaiseEye0);
+  if (!raised && uRaiseOn1 > 0.5) raiseOnto(rest, uRaise1, uRaiseToMap1, uRaiseEye1);
+#endif
+  // The bends are measured on the scan, as the grab point and its plane are, and the raise rides
+  // along as a fixed offset: weighed from the raised point, an object standing off the grabbed
+  // surface fell outside its falloffs and stayed put while the patch behind the hand slid away.
+  vec3 p = scan;
   float seen = 0.0;
   float hide = 0.0;
   float own0 = 0.0;
@@ -229,11 +277,13 @@ void main() {
   if (uOn0 > 0.5) pinch(p, seen, hide, own0, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0, uRamp0);
   // A later grab that began on the already-moved surface bends what you saw; two grabs that began
   // together each bend the rest surface and their moves add, so neither squeezes into the other.
-  vec3 base1 = uChain1 > 0.5 ? p : rest;
+  vec3 base1 = uChain1 > 0.5 ? p : scan;
   vec3 p1 = base1;
   if (uOn1 > 0.5) pinch(p1, seen, hide, own1, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1, uRamp1);
   p += p1 - base1;
+  p += rest - scan;
   vMid = base1;
+  vScan = scan;
   vRest = rest;
   vWorld = p;
   vMask = vec2(seen * (1.0 - smoothstep(0.6, 1.0, hide)), ease(hide));
@@ -301,6 +351,7 @@ const float LENS_STRIPE = 96.0;
 #endif
 
 varying vec3 vRest;
+varying vec3 vScan; // the scanned point before any raise: what the bends and streak weights measure
 varying vec3 vWorld;
 varying vec3 vMid;
 varying vec2 vMask;
@@ -481,6 +532,21 @@ vec4 photoTexel(sampler2D tex, vec2 uv) {
 }
 
 /**
+ * What surrounds a hand cut-out, as an opaque premultiplied colour: the photo's mip levels are
+ * alpha-weighted averages over 8, 32, 128 and 512 texels, so the finest one with any picture in it
+ * leads (a pull-push fill, one tap per level). Clear only if the whole photo is. Read raw: WebGL2
+ * builds SRGB8_ALPHA8 mips from decoded texels, so above level 0 they are already linear
+ * premultiplied, and photoTexel's fix would brighten every partly covered one.
+ */
+vec4 holeFill(sampler2D tex, vec2 uv) {
+  vec4 acc = textureLod(tex, uv, 3.0);
+  acc += textureLod(tex, uv, 5.0) * (1.0 - acc.a);
+  acc += textureLod(tex, uv, 7.0) * (1.0 - acc.a);
+  acc += textureLod(tex, uv, 9.0) * (1.0 - acc.a);
+  return acc.a > 1e-3 ? acc / acc.a : vec4(0.0);
+}
+
+/**
  * One slot's picture: its own photo, then its fill wherever the first is masked or off its frame.
  * The photos are premultiplied SRGB8_ALPHA8, so the sampler returns linear light times alpha
  * (decoding again crushed every photo to a flat grey). Returns gain * rgb premultiplied, and
@@ -490,6 +556,11 @@ vec4 slotPicture(sampler2D own, vec2 uv, float c, sampler2D fill, vec2 fuv, floa
   vec4 a = c > 0.0 ? photoTexel(own, uv) * c : vec4(0.0);
   if (cf > 0.0 && a.a < 0.999) a += photoTexel(fill, fuv) * (cf * (1.0 - a.a));
   return vec4(a.rgb * gain, a.a);
+}
+
+/** The colour around a cut-out in one slot's pictures: its own photo where it covers, else its fill. */
+vec3 slotHole(sampler2D own, vec2 uv, float c, sampler2D fill, vec2 fuv, vec3 gain) {
+  return (c > 0.0 ? holeFill(own, uv) : holeFill(fill, fuv)).rgb * gain;
 }
 
 /**
@@ -526,6 +597,16 @@ void main() {
   }
 #endif
 
+#ifdef ENV_DEPTH
+  // Neither grab moved this triangle: it stays real. Leave before any streak or photo work, which
+  // would only arrive at alpha 0: below 1e-4 m, own is under 3e-4, so alpha takes the clear below
+  // anyway (a strict 0 test failed on sway's sin(pi) rounding). The debug views draw everywhere.
+  if (uOccDebug < 0.5 && max(vW.x, vW.y) <= 1e-4) {
+    gl_FragColor = vec4(0.0);
+    return;
+  }
+#endif
+
   // Where the photo is read. The texture rides the surface (rest position) and the streaks pull it
   // toward the grabbed column, per pixel so it is exact on any triangle.
   // Where two grabs' streaks overlap, their pulls on the lookup are averaged, each weighted by its own
@@ -533,7 +614,7 @@ void main() {
   // fades out exactly where its pull does, so the blend has no seam at either pinch.
   float st0 = 0.0;
   float st1 = 0.0;
-  vec4 o0 = uOn0 > 0.5 && uBloom0 > 0.0 && vW.x > 0.0 ? streakOffset(vRest, uG0, uD0, uAxis0, uN0, uBloom0, uRamp0, st0) : vec4(0.0);
+  vec4 o0 = uOn0 > 0.5 && uBloom0 > 0.0 && vW.x > 0.0 ? streakOffset(vScan, uG0, uD0, uAxis0, uN0, uBloom0, uRamp0, st0) : vec4(0.0);
   vec4 o1 = uOn1 > 0.5 && uBloom1 > 0.0 && vW.y > 0.0 ? streakOffset(vMid, uG1, uD1, uAxis1, uN1, uBloom1, uRamp1, st1) : vec4(0.0);
   float m0 = length(o0.xyz);
   float m1 = length(o1.xyz);
@@ -613,6 +694,14 @@ void main() {
   float cover = p0.a * w0 + p1.a * w1;
   vec3 col = (p0.rgb * w0 + p1.rgb * w1) / max(cover, 1e-7);
   alpha = shown * max(own * max(p0.a * uFade0, p1.a * uFade1), frost);
+  // A hand cut out of every photo here takes the colour around it, from the leading slot. Left clear,
+  // the real room showed through the moving surface as a dark hand-shaped hole.
+  float wanted = shown * max(own * max(k0, k1), frost);
+  if (alpha < wanted - 0.002) {
+    vec3 hole = k0 >= k1 ? slotHole(uPhoto0, uv0, c0, uFill0, fuv0, uGain0) : slotHole(uPhoto1, uv1, c1, uFill1, fuv1, uGain1);
+    col = (col * alpha + hole * (wanted - alpha)) / wanted;
+    alpha = wanted;
+  }
 #ifdef ENV_DEPTH
   // Debug views paint the cut instead of cutting.
   if (uOccDebug < 0.5) {
