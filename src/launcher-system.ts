@@ -20,7 +20,7 @@ import { TableTouchSystem } from './table-touch-system.js';
 const NO_PASSTHROUGH = 'Open this page in the Meta Quest browser to use passthrough.';
 const DEPTH_WAIT = 'Downloading the depth model. Passthrough unlocks when it’s ready.';
 const DEPTH_FAIL = 'The depth model didn’t load. Reload the page to try again.';
-const STRETCH_HINT = 'Round 6b. Hold an index fingertip near a surface, without pinching.';
+const STRETCH_HINT = 'Round 6c. Hold an index fingertip near a surface, without pinching.';
 const STRETCH_CAMERA = 'Camera on. Hold a fingertip near the mesh, or pinch and pull toward you.';
 const STRETCH_ASKING = 'Allow the camera so the pull can show your room.';
 const STRETCH_BLOCKED = 'Camera blocked. Allow it for this site so the pull can show your room.';
@@ -64,8 +64,8 @@ export class LauncherSystem extends createSystem({}) {
     const version = document.getElementById('stretchVersion');
     if (version) {
       version.textContent =
-        `Round 6b · jonze-${__BUILD_SHA__}. A pull toward you lifts like pinched cloth. ` +
-        'An index fingertip near a surface sucks it up. Touching or tapping the mesh does nothing.';
+        `Round 6c · jonze-${__BUILD_SHA__}. Pinch a table and pull toward you: it follows your fingers like cloth. ` +
+        'A fingertip within 25 cm sucks the surface up. Touching or tapping the mesh does nothing.';
     }
 
     enter.disabled = true;
