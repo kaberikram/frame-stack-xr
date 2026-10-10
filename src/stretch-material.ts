@@ -228,7 +228,8 @@ void pinch(inout vec3 p, inout float seen, inout float hide, out float own, out 
   float dn2 = dot(q2, n);
   float rho2 = length(q2 - n * dn2);
   float liftIn = length(lift - n * dot(lift, n));
-  float tentR = edge + e + max(0.6, 1.2 * liftIn) * B;
+  // Sized by the rise only: the spring's dip after release must not shrink it to nothing.
+  float tentR = edge + e + max(0.6, 1.2 * liftIn) * max(B, 0.0);
   float f = 1.0 - smoothstep(0.0, tentR, rho2);
   tent = f * f * (1.0 - smoothstep(0.25, 0.75, abs(dn2)));
   vec3 moveB = lift * (B * tent);
@@ -249,7 +250,7 @@ vec3 hover(vec3 p, vec4 hov, vec3 tip, vec3 n) {
   vec3 q = p - hov.xyz;
   float dn = dot(q, n);
   float f = 1.0 - smoothstep(0.0, hov.w, length(q - n * dn));
-  return tip * (f * f * f * (1.0 - smoothstep(0.03, 0.06, abs(dn))));
+  return tip * (f * f * (1.0 - smoothstep(0.03, 0.06, abs(dn))));
 }
 
 void main() {
@@ -587,8 +588,9 @@ void main() {
   vec3 s = vRest + (o0.xyz * m0 + o1.xyz * m1) / max(m0 + m1, 1e-5);
   // A cone pulled toward you reads, up its sides, ever closer to the pinched spot: taffy drawn out
   // of it, streaking into the tip on a long pull.
-  if (uOn0 > 0.5 && uTentBloom0 > 0.0) s = mix(s, uG0, uTentBloom0 * pow(vTent.x, 0.7));
-  if (uOn1 > 0.5 && uTentBloom1 > 0.0) s = mix(s, uG1, uTentBloom1 * pow(vTent.y, 0.7));
+  // Only where the picture is fully shown: at the cone's rim it must still match passthrough.
+  if (uOn0 > 0.5 && uTentBloom0 > 0.0) s = mix(s, uG0, uTentBloom0 * pow(vTent.x, 0.7) * smoothstep(0.02, 0.1, vW.x));
+  if (uOn1 > 0.5 && uTentBloom1 > 0.0) s = mix(s, uG1, uTentBloom1 * pow(vTent.y, 0.7) * smoothstep(0.02, 0.1, vW.y));
   float st = max(st0, st1);
   // A squeezed zone reads the photo where it is drawn, which is what passthrough shows there,
   // so it fades into the real room without a seam.

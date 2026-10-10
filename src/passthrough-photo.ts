@@ -141,7 +141,7 @@ interface MeanRgb {
 }
 
 /** Why the last freeze found no photo. A string literal, so recording it allocates nothing. */
-export type PhotoMiss = 'none' | 'no-video' | 'no-pose' | 'off-frame' | 'dark';
+export type PhotoMiss = 'none' | 'no-video' | 'no-pose' | 'off-frame' | 'dark' | 'no-bank';
 
 /** What the last freeze chose and why, for one console line per pinch. */
 interface PickNote {
@@ -584,6 +584,7 @@ export class PassthroughPhoto {
     now: number,
     joints: HandJoints | null,
     eye: Vector3,
+    liveOk = true,
   ): boolean {
     const note = this.pickNote;
     note.source = 'none';
@@ -644,6 +645,11 @@ export class PassthroughPhoto {
       this.lastMiss = 'none';
       this.chooseFill(k, footprint, count, best, now, eye);
       return true;
+    }
+    // A fingertip spike can't use the live frame: the finger is cut out right where it rises.
+    if (!liveOk) {
+      this.lastMiss = 'no-bank';
+      return false;
     }
     const video = this.video;
     if (!video || !this.videoW) {
