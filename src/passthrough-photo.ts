@@ -157,6 +157,11 @@ interface PickNote {
   hand: number;
 }
 
+/** Where the hands were at an earlier moment: the joints to cut out of a frame exposed then. */
+export interface JointHistory {
+  jointsAt(time: number): HandJoints | null;
+}
+
 /** Packed world-space joints, with where each hand's run starts and how long it is. */
 export interface HandJoints {
   points: Float32Array;
@@ -279,6 +284,11 @@ export class PassthroughPhoto {
 
   /** Textures created since the last drain: the system uploads them once, so a pinch never allocates. */
   readonly warmList: CanvasTexture[] = [];
+  /**
+   * The hands' recent past. Tracking predicts the hands for the display time, but a camera frame
+   * was exposed ~0.1 s earlier: its masks and hand boxes must come from where the hands were then.
+   */
+  history: JointHistory | null = null;
 
   private readonly bank: BankEntry[] = [];
   private readonly stores: [SlotStore, SlotStore];
@@ -413,6 +423,7 @@ export class PassthroughPhoto {
       this.videoH = video.videoHeight;
       this.activeAt = now;
       for (let i = 0; i < this.bank.length; i++) this.bank[i].used = false;
+      this.measuredAt = -Infinity;
       this.prepare(this.videoW, this.videoH);
       console.info(`[jonze] camera frame ${this.videoW}x${this.videoH}`);
     }
@@ -516,6 +527,7 @@ export class PassthroughPhoto {
         this.polledFrames = frames;
       }
       captured = this.exposedAt(now);
+      joints = this.history?.jointsAt(captured) ?? joints;
       this.notePath();
       if (!this.steady(captured - 0.06, now)) {
         this.stats.unsteady++;
@@ -630,7 +642,7 @@ export class PassthroughPhoto {
       note.margin = bestMargin;
       note.tier = bestTier;
       this.lastMiss = 'none';
-      this.chooseFill(k, footprint, best, now, eye);
+      this.chooseFill(k, footprint, count, best, now, eye);
       return true;
     }
     const video = this.video;
@@ -661,12 +673,13 @@ export class PassthroughPhoto {
     note.tier = 0;
     this.fill(k, video, this.videoW, this.videoH, this.probeMean);
     const store = this.stores[k];
+    const then = presenting ? this.history?.jointsAt(this.exposedAt(now)) ?? joints : joints;
     // Its grabbed column sits next to the hand, so `live` alone keeps streaks off without a fill.
-    slot.masked = this.maskHands(store.ctx, store.w, store.h, this.worldToClip, joints);
+    slot.masked = this.maskHands(store.ctx, store.w, store.h, this.worldToClip, then);
     slot.live = true;
     slot.toClip.copy(this.worldToClip);
     slot.cam.copy(this.liveCam);
-    this.chooseFill(k, footprint, null, now, eye);
+    this.chooseFill(k, footprint, count, null, now, eye);
     return true;
   }
 
@@ -712,6 +725,7 @@ export class PassthroughPhoto {
     for (let i = 0; i < this.bank.length; i++) this.bank[i].used = false;
     this.drop(0);
     this.drop(1);
+    this.measuredAt = -Infinity;
     this.poseCount = 0;
     this.poseHead = -1;
     this.lastAdmit = -Infinity;
@@ -879,19 +893,30 @@ export class PassthroughPhoto {
     }
     let chosen: BankEntry | null = null;
     const incoming = coverage(this.boxesFor(joints, toClip), this.armsFor(joints, toClip));
+    // Every entry of this view: the cleanest-first copy, and at most one masked companion.
+    let first: BankEntry | null = null;
+    let twin: BankEntry | null = null;
     for (let i = 0; i < this.bank.length; i++) {
       const entry = this.bank[i];
       if (!entry.used || entry.dir.dot(dir) <= SAME_VIEW || entry.cam.distanceToSquared(cam) > SAME_PLACE_SQ) continue;
-      const age = now - entry.time;
-      if (age < REFRESH_GAP) return null;
-      if (age < MAX_AGE && incoming > CLEANER && incoming > coverage(entry.hands, entry.arms)) {
-        // Keep the cleaner view; with room to spare, keep this one too, since its hands are masked.
-        const free = this.freeEntry();
-        if (!free) this.stats.dirtier++;
-        return free;
+      if (now - entry.time < REFRESH_GAP) return null;
+      if (!first || coverage(entry.hands, entry.arms) < coverage(first.hands, first.arms)) {
+        twin = first;
+        first = entry;
+      } else if (!twin) {
+        twin = entry;
       }
-      chosen = entry;
-      break;
+    }
+    if (first) {
+      const age = now - first.time;
+      if (age < MAX_AGE && incoming > CLEANER && incoming > coverage(first.hands, first.arms)) {
+        // Keep the cleaner view; with room to spare keep this one too as its one companion, since
+        // its hands are masked. The companion is refreshed in place, never multiplied.
+        const spare = twin ?? this.freeEntry();
+        if (!spare) this.stats.dirtier++;
+        return spare;
+      }
+      chosen = first;
     }
     if (!chosen) {
       for (let i = 0; i < this.bank.length; i++) {
@@ -1023,9 +1048,11 @@ export class PassthroughPhoto {
 
   /**
    * Lines up a second bank photo behind slot `k`'s own: the one that best holds the grab spot,
-   * other than `except`. Copied in next frame, so the pinch frame carries one copy, not two.
+   * other than `except`. Copied in next frame, so the pinch frame carries one copy, not two. A live
+   * photo (`except` null) is cut out at the grab spot itself, and its streaks read exactly there, so
+   * its fill must be clear of hands there.
    */
-  private chooseFill(k: 0 | 1, footprint: Float32Array, except: BankEntry | null, now: number, eye: Vector3): void {
+  private chooseFill(k: 0 | 1, footprint: Float32Array, count: number, except: BankEntry | null, now: number, eye: Vector3): void {
     this.slots[k].fill.has = false;
     this.pendingFill[k] = null;
     let best: BankEntry | null = null;
@@ -1035,6 +1062,8 @@ export class PassthroughPhoto {
       if (!entry.used || entry === except) continue;
       const center = footprintMargin(entry.toClip, footprint, 1);
       if (center < 0.02) continue;
+      // freeze() left the grab spot's inner ring in `inner`.
+      if (except === null && touchesHands(entry, this.inner, count)) continue;
       const age = now - entry.time;
       const score = center / ((1 + age / 6) * (1 + entry.cam.distanceTo(eye) / BASE_HALF));
       if (score > bestScore) {

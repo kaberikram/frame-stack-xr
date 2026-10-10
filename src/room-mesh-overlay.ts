@@ -125,8 +125,11 @@ export class RoomMeshOverlay {
       this.triangles = 0;
       return;
     }
-    if (this.changed(sources)) this.submit(sources, eye);
-    else if (!this.building && this.ready && eye.distanceTo(this.focus) > FOCUS_MOVE) this.submit(sources, eye);
+    if (this.changed(sources)) {
+      // The merged room carries the old poses in its vertices: draw the scans themselves until it's rebuilt.
+      this.ready = false;
+      this.submit(sources, eye);
+    } else if (!this.building && this.ready && eye.distanceTo(this.focus) > FOCUS_MOVE) this.submit(sources, eye);
 
     const showing = this.active || this.warm > 0;
     if (this.warm > 0) this.warm--;

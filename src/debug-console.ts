@@ -95,7 +95,10 @@ class ConsoleLines {
   readonly text: string[] = new Array<string>(ROWS).fill('');
   readonly level = new Uint8Array(ROWS);
   readonly tagged = new Uint8Array(ROWS);
-  /** Which line a full buffer drops first: log 0, info 1, [jonze] 3, any warn 4, error 5, pinned session line 6. */
+  /**
+   * Which line a full buffer drops first: log 0, info 1, [jonze] 3, any warn 4, the newest session line
+   * of each kind 5, error 6. An older copy of a session line drops back to 3.
+   */
   readonly rank = new Uint8Array(ROWS);
   readonly repeat = new Uint32Array(ROWS);
   readonly time = new Float64Array(ROWS);
@@ -134,8 +137,13 @@ class ConsoleLines {
       }
       return;
     }
-    const rank =
-      level === Level.Error ? 5 : level === Level.Warn ? 4 : tagged ? (PINNED.test(line) ? 6 : 3) : level;
+    const pinned = tagged && level < Level.Warn ? PINNED.exec(line) : null;
+    if (pinned) {
+      for (let i = 0; i < this.count; i++) {
+        if (this.rank[i] === 5 && this.text[i].startsWith(pinned[1])) this.rank[i] = 3;
+      }
+    }
+    const rank = level === Level.Error ? 6 : level === Level.Warn ? 4 : pinned ? 5 : tagged ? 3 : level;
     let at = this.count;
     if (at < ROWS) {
       this.count++;

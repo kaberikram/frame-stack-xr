@@ -432,7 +432,7 @@ float handOcclusion(vec3 world, out float gate) {
 }
 
 /**
- * Developer views, premultiplied colour and alpha. ?occ=debug: the cut magenta, the gate a faint
+ * Developer views, straight colour and alpha. ?occ=debug: the cut magenta, the gate a faint
  * cyan. ?occ=delta: real depth minus the room's, red where the real surface is nearer, blue where
  * it is farther, white where they agree, over a +-8 cm range.
  */
@@ -467,14 +467,28 @@ float photoCover(mat4 toClip, vec3 cam, float has, vec3 p, vec3 nr, float streak
 }
 
 /**
+ * A premultiplied photo texel in linear light. The GPU decodes sRGB per channel after premultiplying,
+ * so a half-transparent edge texel of a hand cut-out came back too dark; that is undone here. Opaque
+ * and empty texels need nothing.
+ */
+vec4 photoTexel(sampler2D tex, vec2 uv) {
+  vec4 t = textureLod(tex, uv, 0.0);
+  if (t.a > 0.004 && t.a < 0.996) {
+    vec3 encoded = sRGBTransferOETF(vec4(t.rgb, 1.0)).rgb / t.a;
+    t.rgb = sRGBTransferEOTF(vec4(encoded, 1.0)).rgb * t.a;
+  }
+  return t;
+}
+
+/**
  * One slot's picture: its own photo, then its fill wherever the first is masked or off its frame.
  * The photos are premultiplied SRGB8_ALPHA8, so the sampler returns linear light times alpha
  * (decoding again crushed every photo to a flat grey). Returns gain * rgb premultiplied, and
  * coverage in alpha. textureLod needs no derivatives.
  */
 vec4 slotPicture(sampler2D own, vec2 uv, float c, sampler2D fill, vec2 fuv, float cf, vec3 gain) {
-  vec4 a = c > 0.0 ? textureLod(own, uv, 0.0) * c : vec4(0.0);
-  if (cf > 0.0 && a.a < 0.999) a += textureLod(fill, fuv, 0.0) * (cf * (1.0 - a.a));
+  vec4 a = c > 0.0 ? photoTexel(own, uv) * c : vec4(0.0);
+  if (cf > 0.0 && a.a < 0.999) a += photoTexel(fill, fuv) * (cf * (1.0 - a.a));
   return vec4(a.rgb * gain, a.a);
 }
 
@@ -514,13 +528,16 @@ void main() {
 
   // Where the photo is read. The texture rides the surface (rest position) and the streaks pull it
   // toward the grabbed column, per pixel so it is exact on any triangle.
-  // Where two grabs' streaks overlap, their pulls on the lookup are averaged by band weight, not
-  // added: added, they ran past each other into a mirrored strip.
+  // Where two grabs' streaks overlap, their pulls on the lookup are averaged, each weighted by its own
+  // size, not added: added, they ran past each other into a mirrored strip. Weighted by size, each
+  // fades out exactly where its pull does, so the blend has no seam at either pinch.
   float st0 = 0.0;
   float st1 = 0.0;
   vec4 o0 = uOn0 > 0.5 && uBloom0 > 0.0 && vW.x > 0.0 ? streakOffset(vRest, uG0, uD0, uAxis0, uN0, uBloom0, uRamp0, st0) : vec4(0.0);
   vec4 o1 = uOn1 > 0.5 && uBloom1 > 0.0 && vW.y > 0.0 ? streakOffset(vMid, uG1, uD1, uAxis1, uN1, uBloom1, uRamp1, st1) : vec4(0.0);
-  vec3 s = vRest + (o0.xyz * o0.w + o1.xyz * o1.w) / max(o0.w + o1.w, 1e-4);
+  float m0 = length(o0.xyz);
+  float m1 = length(o1.xyz);
+  vec3 s = vRest + (o0.xyz * m0 + o1.xyz * m1) / max(m0 + m1, 1e-5);
   float st = max(st0, st1);
   // A squeezed zone reads the photo where it is drawn, which is what passthrough shows there,
   // so it fades into the real room without a seam.
@@ -611,8 +628,10 @@ void main() {
 #else
 #ifdef ENV_DEPTH
   if (dbg.a > 0.0) {
-    col = mix(col, dbg.rgb, dbg.a);
-    alpha = max(alpha, dbg.a);
+    // Over the stretch, premultiplied: a debug colour over a masked hole stays its own colour.
+    vec4 over = vec4(dbg.rgb * dbg.a, dbg.a) + vec4(col * alpha, alpha) * (1.0 - dbg.a);
+    alpha = over.a;
+    col = over.rgb / max(over.a, 1e-5);
   }
 #endif
   writeColor(col, alpha);

@@ -1,4 +1,5 @@
 import { CapsuleGeometry, InstancedMesh, Matrix4, MeshBasicMaterial, Object3D, ShaderMaterial, SphereGeometry, Vector3, Vector4, type Material } from '@iwsdk/core';
+import type { HandJoints } from './passthrough-photo.js';
 
 const JOINTS = [
   'wrist',
@@ -27,19 +28,26 @@ const FOREARM_CENTER = 0.15;
 const WRIST = 0;
 const THUMB_TIP = 4;
 const INDEX_TIP = 9;
+const MIDDLE_TIP = 14;
 const PINKY_TIP = 24;
 /** Thumb and index distal and tip joints: the pinching fingertips, drawn without lag and a little larger. */
 const PINCH_JOINTS = [3, 4, 8, 9] as const;
 const PINCH_RADIUS = 0.017;
 const PER_HAND = JOINT_COUNT + BONES.length;
 const HANDS = 2;
-/** Joint frames kept per hand for drawing the occluders a little in the past. */
-const RING = 8;
 /**
- * Where the depth cut may act: three segments fanned from the wrist to the thumb, index and pinky
- * tips (they cover the palm and fingers), and the forearm. Reach is from the segment's axis.
+ * Joint frames kept per hand, about 0.2 s: enough to draw the occluders a little in the past, and
+ * to look up where the hands were when a camera frame was exposed.
  */
-export const SEGMENTS_PER_HAND = 4;
+const RING = 16;
+/** A history lookup this much older than the oldest frame kept has no answer. */
+const HISTORY_SLACK = 0.03;
+/**
+ * Where the depth cut may act: four segments fanned from the wrist to the thumb, index, middle and
+ * pinky tips (they cover the palm and fingers, spread or not), and the forearm. Reach is from the
+ * segment's axis.
+ */
+export const SEGMENTS_PER_HAND = 5;
 export const SEGMENTS = SEGMENTS_PER_HAND * HANDS;
 const HAND_REACH = 0.035;
 const FOREARM_REACH = FOREARM_RADIUS + 0.02;
@@ -58,7 +66,8 @@ const UPPER_ARM = 0.29;
 const FOREARM = 0.26;
 const POLE_OUT = 0.6;
 const UP = new Vector3(0, 1, 0);
-const TIPS = [THUMB_TIP, INDEX_TIP, PINKY_TIP] as const;
+const TIPS = [THUMB_TIP, INDEX_TIP, MIDDLE_TIP, PINKY_TIP] as const;
+const ARM_SEGMENT = TIPS.length;
 
 type Side = 'left' | 'right';
 const SIDES: readonly Side[] = ['left', 'right'];
@@ -94,7 +103,7 @@ export class HandOccluder {
   /** Set by the system: that hand is holding a pinch, so its fingertips are drawn without lag. */
   readonly pinching = { left: false, right: false };
   /**
-   * Where the depth cut may act, from the trailing joints, SEGMENTS_PER_HAND per hand: three hand
+   * Where the depth cut may act, from the trailing joints, SEGMENTS_PER_HAND per hand: four hand
    * segments then the forearm. `segA[i]` is the start and the kind in w (0 off, 1 hand, 2 arm);
    * `segB[i]` the end and the reach in w.
    */
@@ -115,11 +124,22 @@ export class HandOccluder {
   private readonly toWrist = new Vector3();
   private readonly pole = new Vector3();
   private readonly ring = [new Float32Array(RING * JOINT_COUNT * 3), new Float32Array(RING * JOINT_COUNT * 3)];
+  /** Per ring frame: wrist xyz, forearm direction xyz, 1 when the arm was valid. */
+  private readonly ringArm = [new Float32Array(RING * 7), new Float32Array(RING * 7)];
+  /** jointsAt() writes here: both hands as they were at one moment. */
+  private readonly past: HandJoints = {
+    points: new Float32Array(JOINT_COUNT * HANDS * 3), leftStart: 0, leftCount: 0, rightStart: 0, rightCount: 0,
+    arms: new Float32Array(6 * HANDS), armOk: new Uint8Array(HANDS),
+  };
   private readonly ringTime = [new Float64Array(RING), new Float64Array(RING)];
   private readonly ringHead = [-1, -1];
   private readonly ringCount = [0, 0];
   /** One hand's joints `lag` seconds ago, world space. */
   private readonly drawn = new Float32Array(JOINT_COUNT * 3);
+  /** bracket()'s answer: ring indices around a time and the mix between them. */
+  private older = 0;
+  private newer = 0;
+  private mixF = 0;
   private readonly poses = new Float32Array(JOINT_COUNT * 16);
   private readonly spaces: Record<Side, XRSpace[]> = { left: [], right: [] };
   private readonly handRef: Record<Side, XRHand | null> = { left: null, right: null };
@@ -169,7 +189,7 @@ export class HandOccluder {
     ref: XRReferenceSpace | null,
     playerWorld: Matrix4,
     hands: Record<Side, XRHand | null>,
-    now: number,
+    shownAt: number,
     head: Matrix4,
   ): void {
     this.jointCount = 0;
@@ -196,7 +216,7 @@ export class HandOccluder {
         continue;
       }
       const start = this.jointCount;
-      this.writeHand(side, base, playerWorld, now);
+      this.writeHand(side, base, playerWorld, shownAt);
       if (side === 'left') {
         this.leftStart = start;
         this.leftCount = JOINT_COUNT;
@@ -259,7 +279,8 @@ export class HandOccluder {
     return list;
   }
 
-  private writeHand(side: Side, base: number, playerWorld: Matrix4, now: number): void {
+  /** `shownAt` is when these joints are for: the XR frame's display time, on the page clock. */
+  private writeHand(side: Side, base: number, playerWorld: Matrix4, shownAt: number): void {
     const e = playerWorld.elements;
     for (let i = 0; i < JOINT_COUNT; i++) {
       const px = this.poses[i * 16 + 12];
@@ -291,7 +312,7 @@ export class HandOccluder {
       this.arms[o + 5] = this.dir.z;
     }
 
-    this.record(h, now);
+    this.record(h, shownAt);
     const d = this.drawn;
     const pinching = this.pinching[side];
     // A pinching hand's fingertips hold the sheet: tracking is right there, so no lag.
@@ -324,14 +345,14 @@ export class HandOccluder {
       this.segA[s0 + i].set(d[w], d[w + 1], d[w + 2], KIND_HAND);
       this.segB[s0 + i].set(d[t], d[t + 1], d[t + 2], HAND_REACH);
     }
-    const arm = this.segA[s0 + 3];
+    const arm = this.segA[s0 + ARM_SEGMENT];
     if (!this.forearm(d, h, this.dir)) {
       arm.w = 0;
       this.hideArm(h);
       return;
     }
     arm.set(d[w], d[w + 1], d[w + 2], KIND_ARM);
-    this.segB[s0 + 3].set(
+    this.segB[s0 + ARM_SEGMENT].set(
       d[w] + this.dir.x * FOREARM_GATE,
       d[w + 1] + this.dir.y * FOREARM_GATE,
       d[w + 2] + this.dir.z * FOREARM_GATE,
@@ -394,33 +415,99 @@ export class HandOccluder {
   }
 
   /** Pushes this frame's joints for hand `h` and leaves the joints `lag` ago in `drawn`. */
-  private record(h: number, now: number): void {
+  private record(h: number, at: number): void {
     const ring = this.ring[h];
     const times = this.ringTime[h];
+    // Display times only move forward; a repeated one (a dropped frame) replaces nothing.
+    if (this.ringCount[h] > 0 && at <= times[this.ringHead[h]]) at = times[this.ringHead[h]] + 1e-4;
     const head = (this.ringHead[h] + 1) % RING;
     this.ringHead[h] = head;
     this.ringCount[h] = Math.min(RING, this.ringCount[h] + 1);
     ring.set(this.local, head * JOINT_COUNT * 3);
-    times[head] = now;
-    const target = now - this.lag;
+    const arm = this.ringArm[h];
+    const o = head * 7;
+    const okArm = this.armOk[h] === 1;
+    for (let i = 0; i < 6; i++) arm[o + i] = okArm ? this.arms[h * 6 + i] : 0;
+    arm[o + 6] = okArm ? 1 : 0;
+    times[head] = at;
+    this.bracket(h, at - this.lag);
+    const a = this.older * JOINT_COUNT * 3;
+    const b = this.newer * JOINT_COUNT * 3;
+    const f = this.mixF;
+    for (let i = 0; i < JOINT_COUNT * 3; i++) this.drawn[i] = ring[a + i] + (ring[b + i] - ring[a + i]) * f;
+  }
+
+  /**
+   * Finds the two ring frames of hand `h` around `time` into older/newer/mixF. Past the oldest frame,
+   * both are the oldest; past the newest, both are the newest. False when the hand has no frames.
+   */
+  private bracket(h: number, time: number): boolean {
     const n = this.ringCount[h];
+    if (n === 0) return false;
+    const times = this.ringTime[h];
+    const head = this.ringHead[h];
     let newer = head;
     let older = head;
     let f = 0;
     for (let i = 0; i < n; i++) {
       const idx = (head - i + RING) % RING;
       older = idx;
-      if (times[idx] <= target) {
+      if (times[idx] <= time) {
         const span = times[newer] - times[idx];
-        f = span > 1e-6 ? (target - times[idx]) / span : 0;
+        f = span > 1e-6 ? (time - times[idx]) / span : 0;
         break;
       }
       newer = idx;
     }
-    // Ring younger than the lag: `older` is the oldest frame and `f` stays 0.
-    const a = older * JOINT_COUNT * 3;
-    const b = newer * JOINT_COUNT * 3;
-    for (let i = 0; i < JOINT_COUNT * 3; i++) this.drawn[i] = ring[a + i] + (ring[b + i] - ring[a + i]) * f;
+    // Ring younger than the time: `older` is the oldest frame and `f` stays 0.
+    this.older = older;
+    this.newer = older === head ? head : newer;
+    this.mixF = Math.min(1, Math.max(0, f));
+    return true;
+  }
+
+  /**
+   * Both hands as they were at `time` (page-clock seconds), from the ring: the joints and forearms to
+   * cut out of a camera frame exposed then. Null when no tracked hand has history that far back; a
+   * hand missing at that time is left out. Reuses one object.
+   */
+  jointsAt(time: number): HandJoints | null {
+    const out = this.past;
+    out.leftCount = 0;
+    out.rightCount = 0;
+    out.armOk[0] = 0;
+    out.armOk[1] = 0;
+    let n = 0;
+    let any = false;
+    for (let h = 0; h < HANDS; h++) {
+      if (!this.bracket(h, time)) continue;
+      const times = this.ringTime[h];
+      const oldest = (this.ringHead[h] - this.ringCount[h] + 1 + RING) % RING;
+      if (time < times[oldest] - HISTORY_SLACK) continue;
+      const ring = this.ring[h];
+      const a = this.older * JOINT_COUNT * 3;
+      const b = this.newer * JOINT_COUNT * 3;
+      const f = this.mixF;
+      const start = n;
+      for (let i = 0; i < JOINT_COUNT * 3; i++) out.points[n * 3 + i] = ring[a + i] + (ring[b + i] - ring[a + i]) * f;
+      n += JOINT_COUNT;
+      if (h === 0) {
+        out.leftStart = start;
+        out.leftCount = JOINT_COUNT;
+      } else {
+        out.rightStart = start;
+        out.rightCount = JOINT_COUNT;
+      }
+      const arm = this.ringArm[h];
+      const oa = this.older * 7;
+      const ob = this.newer * 7;
+      if (arm[oa + 6] > 0 && arm[ob + 6] > 0) {
+        for (let i = 0; i < 6; i++) out.arms[h * 6 + i] = arm[oa + i] + (arm[ob + i] - arm[oa + i]) * f;
+        out.armOk[h] = 1;
+      }
+      any = true;
+    }
+    return any ? out : null;
   }
 
   private hideArm(h: number): void {

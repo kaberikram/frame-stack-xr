@@ -48,8 +48,11 @@ const SLIDE_SOFT = 1;
 const SLIDE_MAX = 1.5;
 const SOFT_PER_SPAN = 2;
 const MAX_PER_SPAN = 3;
-/** Two grabs whose normals are within ~25° are on one surface and share a span. */
+/** Two grabs facing within ~25° and within 5 cm of one plane are on one surface and share a span. */
 const SAME_SURFACE = Math.cos((25 * Math.PI) / 180);
+const SAME_PLANE = 0.05;
+/** The span between two hands eases over this long when one pinches or lets go. */
+const SPAN_EASE = 0.3;
 /** Ramps stay as set up to this distance and grow in proportion beyond it, so far pulls bend alike. */
 const RAMP_NEAR = 0.8;
 /** The smoothing step never exceeds this: a long frame cannot land a whole pull at once. */
@@ -389,6 +392,7 @@ export class RoomStretchSystem extends createSystem({
   /** This frame's real delta, uncapped, for the onset timing line. */
   private frameDt = 0;
   private xrLogged = false;
+  private eyeWaits = 0;
   private readonly tmpA = new Vector3();
   private readonly tmpB = new Vector3();
   private readonly tmpC = new Vector3();
@@ -458,6 +462,7 @@ export class RoomStretchSystem extends createSystem({
     this.overlay = new RoomMeshOverlay(this.scene, LENS_OVERLAY);
     if (LENS_OVERLAY) console.info('[jonze] lens overlay: live camera in stripes over the room at rest; hold still to read it');
     this.hands = new HandOccluder(this.scene, OCC_DEBUG);
+    this.photo.history = this.hands;
     this.joints.points = this.hands.points;
     this.joints.arms = this.hands.arms;
     this.joints.armOk = this.hands.armOk;
@@ -584,7 +589,8 @@ export class RoomStretchSystem extends createSystem({
         this.overlay.setLive(video, live, this.photo.worldToClip);
         this.overlay.uniforms.uLensOn.value = live ? 1 : 0;
       }
-      this.overlay.setActive(active || this.overlay.uniforms.uLensOn.value > 0);
+      // The depth debug views show the whole room, pinched or not.
+      this.overlay.setActive(active || this.overlay.uniforms.uLensOn.value > 0 || OCC_DEBUG || OCC_DELTA);
       this.overlay.sync(meshes, this.head);
       this.overlay.syncPlanes(this.roomPlanes);
       this.publish(this.left, this.right, time, hasVideo);
@@ -671,8 +677,8 @@ export class RoomStretchSystem extends createSystem({
       if (global === undefined) {
         global = this.isGlobal(entity);
         this.globalCache.set(entity, global);
-        this.meshLabels.set(mesh, this.meshLabel(entity));
       }
+      if (!this.meshLabels.has(mesh)) this.meshLabels.set(mesh, this.meshLabel(entity));
       if (global) globals.push(mesh);
       else objects.push(mesh);
     }
@@ -790,6 +796,7 @@ export class RoomStretchSystem extends createSystem({
       if (session) logSession(session);
       this.depth.reset();
       this.xrLogged = false;
+      this.eyeWaits = 0;
       this.clearGrabs();
       this.photo.clear();
       this.pinched = false;
@@ -858,9 +865,13 @@ export class RoomStretchSystem extends createSystem({
     this.player.head.updateWorldMatrix(true, false);
     this.handMap.left = this.input.xr.isPrimary('hand', 'left') ? this.input.xr.getPrimaryInputSource('left')?.hand ?? null : null;
     this.handMap.right = this.input.xr.isPrimary('hand', 'right') ? this.input.xr.getPrimaryInputSource('right')?.hand ?? null : null;
+    // Joints are predicted for the display time; stamp them with it, the clock the head poses use.
+    const now = performance.now() / 1000;
+    const shownMs = this.world.xrFrame?.predictedDisplayTime;
+    const shownAt = shownMs !== undefined && Math.abs(shownMs / 1000 - now) <= 0.25 ? shownMs / 1000 : now;
     this.hands.update(
       this.world.xrFrame, this.world.xrReferenceSpace, this.player.matrixWorld, this.handMap,
-      performance.now() / 1000, this.player.head.matrixWorld,
+      shownAt, this.player.head.matrixWorld,
     );
   }
 
@@ -877,7 +888,8 @@ export class RoomStretchSystem extends createSystem({
     const left = this.tmpB.setFromMatrixPosition(cam.cameras[0].matrixWorld);
     const right = this.tmpC.setFromMatrixPosition(cam.cameras[1].matrixWorld);
     const apart = left.distanceTo(right);
-    if (apart < 0.01) return;
+    // Unposed until three draws a frame; a view that never separates its eyes is reported anyway.
+    if (apart < 0.01 && ++this.eyeWaits < 300) return;
     this.xrLogged = true;
     left.add(right).multiplyScalar(0.5);
     console.info(
@@ -1070,6 +1082,7 @@ export class RoomStretchSystem extends createSystem({
     this.poseGrab(grab);
     grab.dist = Math.max(0.2, this.head.distanceTo(grab.worldG));
     grab.ramp = this.look.ramp * Math.max(1, grab.dist / RAMP_NEAR);
+    grab.span = grab.ramp;
     grab.lift.copy(this.head).sub(grab.worldG).normalize();
     this.writeFootprint(grab);
     const freezeAt = performance.now();
@@ -1130,7 +1143,7 @@ export class RoomStretchSystem extends createSystem({
     if (grab.holding) {
       if (this.pinchPoint(grab.side, this.pinch)) {
         grab.lostT = 0;
-        this.aim(grab, this.pinch);
+        this.aim(grab, this.pinch, dt);
       } else {
         grab.lostT += dt;
         if (grab.lostT > LOST_RELEASE) this.release(grab);
@@ -1222,7 +1235,7 @@ export class RoomStretchSystem extends createSystem({
    * toward you. Bringing the hand closer to your head bursts a wall outward from the pinch; a table
    * or floor bursts only when the hand comes nearly straight off it.
    */
-  private aim(grab: Grab, hand: Vector3): void {
+  private aim(grab: Grab, hand: Vector3, dt: number): void {
     const travel = this.raw.copy(hand).sub(grab.hand0);
     const moved = travel.length();
     const ease = smooth((moved - 0.5 * DEAD) / DEAD);
@@ -1237,7 +1250,7 @@ export class RoomStretchSystem extends createSystem({
       const slide = this.tmp2.copy(this.head).addScaledVector(ray, k).sub(grab.worldG);
       slide.addScaledVector(n, -slide.dot(n)).multiplyScalar(this.look.gain * ease);
       const len = slide.length();
-      const span = this.slideSpan(grab);
+      const span = this.slideSpan(grab, dt);
       const soft = Math.min(SLIDE_SOFT, SOFT_PER_SPAN * span);
       const hard = Math.min(SLIDE_MAX, MAX_PER_SPAN * span);
       if (len > soft) {
@@ -1266,26 +1279,33 @@ export class RoomStretchSystem extends createSystem({
    * What a slide is measured against: the distance between the two hands when both hold the same
    * surface (pulling them apart stretches what is between them), else this grab's ramp.
    */
-  private slideSpan(grab: Grab): number {
+  private slideSpan(grab: Grab, dt: number): number {
     const other = grab === this.left ? this.right : this.left;
-    let span = grab.ramp;
-    if (other.holding && other.mesh === grab.mesh && Math.abs(other.normal.dot(grab.normal)) > SAME_SURFACE) {
-      span = Math.max(0.1, other.worldG.distanceTo(grab.worldG));
+    let want = grab.ramp;
+    // One surface: facing the same way and in one plane, not just parallel (floor and table, or two walls).
+    if (other.holding && other.mesh === grab.mesh && other.normal.dot(grab.normal) > SAME_SURFACE) {
+      const n = grab.normal;
+      const a = other.worldG;
+      const b = grab.worldG;
+      const off = (a.x - b.x) * n.x + (a.y - b.y) * n.y + (a.z - b.z) * n.z;
+      if (Math.abs(off) < SAME_PLANE) want = Math.max(0.1, a.distanceTo(b));
     }
-    grab.span = span;
-    return span;
+    // Eased, so the caps don't jump when the other hand pinches or lets go.
+    grab.span += (want - grab.span) * (1 - Math.exp(-Math.min(dt, STEP_MAX) / SPAN_EASE));
+    return grab.span;
   }
 
   /** One line per pull, when it lets go: how far it went and whether streaks or the photo edge came in. */
   private logPull(grab: Grab): void {
     const held = performance.now() / 1000 - grab.heldAt;
+    // Short, with the limiters first: the panel cuts lines at 72 characters.
     const short = (v: number) => v.toFixed(2).replace(/^0\./, '.');
     const ratio = grab.span > 1e-3 ? grab.peakSlide / grab.span : 0;
     const limit = (grab.clipped ? ' clip' : '') + (grab.capped ? ' cap' : '');
     console.info(
-      `[jonze] pull ${grab.side === 'left' ? 'L' : 'R'} ${held.toFixed(1)}s ${grab.dist.toFixed(1)}m ` +
-        `slide=${short(grab.peakSlide)} x${ratio.toFixed(1)} lift=${short(grab.peakLift)} ` +
-        `burst=${short(grab.peakBurst)} bloom=${short(grab.peakBloom)} chain=${grab.chain ? 'y' : 'n'}${limit}`,
+      `[jonze] pull ${grab.side === 'left' ? 'L' : 'R'} ${held.toFixed(1)}s${limit} ${grab.dist.toFixed(1)}m ` +
+        `D${short(grab.peakSlide)} x${ratio.toFixed(1)} lift${short(grab.peakLift)} ` +
+        `burst${short(grab.peakBurst)} bloom${short(grab.peakBloom)} chain=${grab.chain ? 'y' : 'n'}`,
     );
     this.logOnset(grab);
   }
@@ -1386,6 +1406,8 @@ export class RoomStretchSystem extends createSystem({
     grab.axisRel.copy(grab.axis);
     grab.normal.set(0, 0, 1);
     grab.lift.copy(this.head).sub(grab.worldG).normalize();
+    grab.dist = Math.max(0.2, this.head.distanceTo(grab.worldG));
+    grab.ramp = this.look.ramp * Math.max(1, grab.dist / RAMP_NEAR);
     grab.B = Math.min(LIFT_MAX, pull * 0.11);
     grab.E = 0;
     grab.rippleT = 10;
