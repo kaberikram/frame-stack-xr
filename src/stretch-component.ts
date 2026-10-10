@@ -22,12 +22,12 @@ export const StretchLook = createComponent('StretchLook', {
   stiffness: { type: Types.Float32, default: 90, min: 10, max: 400, step: 5, label: 'Spring stiffness' },
   damping: { type: Types.Float32, default: 9, min: 1, max: 40, step: 0.5, label: 'Spring damping' },
   depthPull: {
-    type: Types.Float32, default: 0.35, min: 0, max: 1, step: 0.05, label: 'Toward-you lift',
-    help: 'How much of a pull toward you lifts the surface. The rest bursts outward along it.',
+    type: Types.Float32, default: 1, min: 0, max: 1.5, step: 0.05, label: 'Toward-you pull',
+    help: 'How far the pinched spot follows your hand toward you: 1 keeps it on the line through your fingers, at the same share of the way to your head.',
   },
   radial: {
     type: Types.Float32, default: 2.5, min: 0, max: 6, step: 0.1, label: 'Toward-you burst',
-    help: 'Metres of outward burst per metre the hand comes toward you.',
+    help: 'Outward burst along the surface per metre the hand comes toward you, at a third of this: the cone leads.',
   },
   ripple: { type: Types.Float32, default: 0.015, min: 0, max: 0.02, step: 0.001, label: 'Pinch ripple' },
   exposure: { type: Types.Float32, default: 1.1, min: 0.5, max: 2, step: 0.01, label: 'Photo exposure' },

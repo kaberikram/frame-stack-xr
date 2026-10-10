@@ -88,6 +88,16 @@ export function createRubberUniforms() {
     uSegB: { value: Array.from({ length: SEGMENTS }, () => new Vector4()) },
     /** 0 off, 1 `?occ=debug` (cut magenta, gate cyan), 2 `?occ=delta` (real depth against the room). */
     uOccDebug: { value: 0 },
+    // The cone toward you: how far up it the pinched spot's colours reach (room-stretch-system.ts writeGrab).
+    uTentBloom0: { value: 0 },
+    uTentBloom1: { value: 0 },
+    // A fingertip held close, per slot: spike centre and radius, the move of its tip, the surface normal.
+    uHov0: { value: new Vector4() },
+    uHovT0: { value: new Vector3() },
+    uHovN0: { value: new Vector3(0, 1, 0) },
+    uHov1: { value: new Vector4() },
+    uHovT1: { value: new Vector3() },
+    uHovN1: { value: new Vector3(0, 1, 0) },
   };
 }
 
@@ -144,7 +154,13 @@ varying vec3 vWorld;
 varying vec3 vMid;  // after the first grab: where the second grab measures its column from
 varying vec2 vMask; // x: visible displacement (m), y: how much a squeezed zone hands back to the room
 varying vec2 vW;    // how much each grab moved this point
+varying vec2 vTent; // how far up each grab's cone toward you this point is, 0 at its foot to 1 at its tip
 varying float vViewZ; // metres in front of this eye, after the stretch
+
+// A fingertip held close (no pinch), per slot: where the spike rises from and its radius, the move
+// of its tip, and the surface's normal there.
+uniform vec4 uHov0; uniform vec3 uHovT0; uniform vec3 uHovN0;
+uniform vec4 uHov1; uniform vec3 uHovT1; uniform vec3 uHovN1;
 
 const float SQUASH = 2.0;       // squeezed zones are 2 m long per metre pulled; slope stays above -0.75
 ${SHARED}
@@ -156,7 +172,7 @@ ${SHARED}
  * included, is built per pixel in the fragment stage. 'hide' rises where a squeezed zone should
  * hand back to the real room.
  */
-void pinch(inout vec3 p, inout float seen, inout float hide, out float own,
+void pinch(inout vec3 p, inout float seen, inout float hide, out float own, out float tent,
            vec3 G, vec3 D, vec3 axis, vec3 n, vec3 lift, float A, float E, float B, float rip, float ramp) {
   vec3 q = p - G;
   float len = length(D);
@@ -205,11 +221,17 @@ void pinch(inout vec3 p, inout float seen, inout float hide, out float own,
   }
   p += moveT + moveR + moveW;
 
-  // lift toward the viewer: its own step after the slide, so the two cannot fold each other
+  // Toward you: a cone up the line of sight through the fingers, its own step after the slide so the
+  // two cannot fold each other. It widens as it rises, more where the surface is seen at an angle
+  // (the lift then also moves it along the surface), and is pointed at the top.
   vec3 q2 = p - G - D;
   float dn2 = dot(q2, n);
   float rho2 = length(q2 - n * dn2);
-  vec3 moveB = lift * (B * (1.0 - smoothstep(0.0, edge + e, rho2)) * (1.0 - smoothstep(0.25, 0.75, abs(dn2))));
+  float liftIn = length(lift - n * dot(lift, n));
+  float tentR = edge + e + max(0.6, 1.2 * liftIn) * B;
+  float f = 1.0 - smoothstep(0.0, tentR, rho2);
+  tent = f * f * (1.0 - smoothstep(0.25, 0.75, abs(dn2)));
+  vec3 moveB = lift * (B * tent);
   p += moveB;
 
   own = length(moveT + moveR + moveB + moveW) + rippling;
@@ -219,6 +241,17 @@ void pinch(inout vec3 p, inout float seen, inout float hide, out float own,
   hide = max(hide, max(hideT, hideR));
 }
 
+/**
+ * A fingertip held close: the surface under it rises to a sharp point toward the tip. Only the
+ * surface itself, within a few centimetres of its plane.
+ */
+vec3 hover(vec3 p, vec4 hov, vec3 tip, vec3 n) {
+  vec3 q = p - hov.xyz;
+  float dn = dot(q, n);
+  float f = 1.0 - smoothstep(0.0, hov.w, length(q - n * dn));
+  return tip * (f * f * f * (1.0 - smoothstep(0.03, 0.06, abs(dn))));
+}
+
 void main() {
   vec3 rest = (modelMatrix * vec4(position, 1.0)).xyz;
   vec3 p = rest;
@@ -226,18 +259,28 @@ void main() {
   float hide = 0.0;
   float own0 = 0.0;
   float own1 = 0.0;
-  if (uOn0 > 0.5) pinch(p, seen, hide, own0, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0, uRamp0);
+  float tent0 = 0.0;
+  float tent1 = 0.0;
+  if (uOn0 > 0.5) pinch(p, seen, hide, own0, tent0, uG0, uD0, uAxis0, uN0, uLift0, uA0, uE0, uB0, uRip0, uRamp0);
   // A later grab that began on the already-moved surface bends what you saw; two grabs that began
   // together each bend the rest surface and their moves add, so neither squeezes into the other.
   vec3 base1 = uChain1 > 0.5 ? p : rest;
   vec3 p1 = base1;
-  if (uOn1 > 0.5) pinch(p1, seen, hide, own1, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1, uRamp1);
+  if (uOn1 > 0.5) pinch(p1, seen, hide, own1, tent1, uG1, uD1, uAxis1, uN1, uLift1, uA1, uE1, uB1, uRip1, uRamp1);
   p += p1 - base1;
+  // Fingertip spikes rise from the rest surface, each read through its own slot's photo.
+  vec3 h0 = dot(uHovT0, uHovT0) > 0.0 ? hover(rest, uHov0, uHovT0, uHovN0) : vec3(0.0);
+  vec3 h1 = dot(uHovT1, uHovT1) > 0.0 ? hover(rest, uHov1, uHovT1, uHovN1) : vec3(0.0);
+  p += h0 + h1;
+  own0 += length(h0);
+  own1 += length(h1);
+  seen += length(h0) + length(h1);
   vMid = base1;
   vRest = rest;
   vWorld = p;
   vMask = vec2(seen * (1.0 - smoothstep(0.6, 1.0, hide)), ease(hide));
   vW = vec2(own0, own1);
+  vTent = vec2(tent0, tent1);
   vec4 viewPos = viewMatrix * vec4(p, 1.0);
   vViewZ = -viewPos.z;
   gl_Position = projectionMatrix * viewPos;
@@ -305,7 +348,11 @@ varying vec3 vWorld;
 varying vec3 vMid;
 varying vec2 vMask;
 varying vec2 vW;
+varying vec2 vTent;
 varying float vViewZ;
+/** How much each grab's cone carries the pinched spot's colours up into it, 0 to 1. */
+uniform float uTentBloom0;
+uniform float uTentBloom1;
 
 ${SHARED}
 
@@ -538,6 +585,10 @@ void main() {
   float m0 = length(o0.xyz);
   float m1 = length(o1.xyz);
   vec3 s = vRest + (o0.xyz * m0 + o1.xyz * m1) / max(m0 + m1, 1e-5);
+  // A cone pulled toward you reads, up its sides, ever closer to the pinched spot: taffy drawn out
+  // of it, streaking into the tip on a long pull.
+  if (uOn0 > 0.5 && uTentBloom0 > 0.0) s = mix(s, uG0, uTentBloom0 * pow(vTent.x, 0.7));
+  if (uOn1 > 0.5 && uTentBloom1 > 0.0) s = mix(s, uG1, uTentBloom1 * pow(vTent.y, 0.7));
   float st = max(st0, st1);
   // A squeezed zone reads the photo where it is drawn, which is what passthrough shows there,
   // so it fades into the real room without a seam.
