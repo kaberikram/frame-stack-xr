@@ -141,15 +141,18 @@ float taffyBehind(float t, float ramp) {
 `;
 
 /**
- * A pushed-in box: the room over its opening is not drawn, so the box shows through it, from this far
- * in front of the wall to this far behind the box's back. A picture frame goes in with the wall; a
- * shelf, or anyone in front of it, stays and hides the box behind (and a pinch there grabs it).
+ * A pushed-in box: the room over its mapped area is not drawn, so the box shows through it, from
+ * BOX_FRONT in front of the wall (the fridge, the counters, the TV unit: whatever stands against it
+ * goes in, as part of the box's picture) to BOX_SKIN behind the box's back. Further out (a coffee
+ * table) the room stays, hides the box behind it, and a pinch there grabs it.
  */
-export const BOX_SKIN = 0.06;
+export const BOX_FRONT = 1;
+const BOX_SKIN = 0.06;
 
 const BOX_HOLE = /* glsl */ `
 #ifdef BOX_HOLE
 const float BOX_SKIN = ${BOX_SKIN.toFixed(3)};
+const float BOX_FRONT = ${BOX_FRONT.toFixed(3)};
 // The opening stops this far short of the box's rim, so the room overlaps it: a pixel the rim's edge
 // only grazes is still the wall, never a crack.
 const float BOX_LIP = 0.004;
@@ -157,7 +160,7 @@ bool inBoxOpening(vec3 rest) {
   if (uBoxOn < 0.5) return false;
   vec3 q = rest - uBoxC;
   float dn = dot(q, uBoxN);
-  return dn < BOX_SKIN && dn > -max(uBoxDepth, 0.0) - BOX_SKIN &&
+  return dn < BOX_FRONT && dn > -max(uBoxDepth, 0.0) - BOX_SKIN &&
     abs(dot(q, uBoxU.xyz)) < uBoxU.w - BOX_LIP && abs(dot(q, uBoxV.xyz)) < uBoxV.w - BOX_LIP;
 }
 #endif
