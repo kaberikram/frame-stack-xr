@@ -1004,6 +1004,8 @@ export class RoomStretchSystem extends createSystem({
       this.player.head.getWorldQuaternion(this.headQuat);
       this.photo.recordHead(this.player.head, this.world.xrFrame?.predictedDisplayTime, now);
       if (!this.xrLogged) this.logEyes();
+      // Against the void's black, slimmer spheres: only where the headset's depth cuts the hand's real edge.
+      this.hands.setSlim(this.blackHole.phase !== 'none' && this.depth.on);
       this.refreshHands();
       this.publishDepth();
       this.roomPlanes.sync(this.queries.planes.entities);
@@ -2514,7 +2516,6 @@ export class RoomStretchSystem extends createSystem({
     bh.growing = false;
     bh.startAt = now;
     bh.frameCount = 0;
-    this.hands.setSlim(true);
     console.info(`[jonze] void ${side === 'left' ? 'L' : 'R'} start ${set.count} shards ${short(bh.dmin)}-${bh.dmax.toFixed(1)}m`);
     this.freezeViews(now, liveOk);
   }
@@ -2617,15 +2618,20 @@ export class RoomStretchSystem extends createSystem({
         const view = views[i];
         const ready = view.has && view.ready;
         U.uViewOn.value[i] = ready ? 1 : 0;
-        this.viewSlots[i].value = view.texture;
         if (!ready) continue;
         U.uViewToClip.value[i].copy(view.toClip);
         U.uViewMean.value[i].copy(view.mean);
       }
       U.uViewGain.value.copy(this.photo.viewGain);
     }
-    // On the desk the stand-in room still draws under the black, so its shards' black stays too.
-    this.voidDraw.sync(on, preview, preview || bh.back < 1);
+    // Every frame, not just with the void up: a camera restart replaces the view textures, and the
+    // warmers must never bind a disposed one.
+    for (let i = 0; i < VOID_VIEWS; i++) this.viewSlots[i].value = this.photo.views[i].texture;
+    // A new cut of the room uploads only when nothing is being pinched, pushed or mapped.
+    const idle =
+      preview || !(this.left.on || this.right.on || this.left.hovering || this.right.hovering ||
+        this.box.phase === 'seek' || this.box.phase === 'held' || this.box.phase === 'out' || this.map.phase === 'drag');
+    this.voidDraw.sync(on, preview, bh.phase === 'on', idle);
   }
 
   /** The hole's voice: a suction that rises with the front, quieting as the last shards land. */

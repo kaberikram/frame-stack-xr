@@ -352,6 +352,68 @@ export interface ShardMesh {
   bounds: Float32Array;
 }
 
+/**
+ * Coarsens a mesh past `maxTriangles` by welding every vertex in a grid cell into one (their mean),
+ * starting at `cell` and doubling until it fits. Triangles that weld flat are dropped. Only for a
+ * scan already too dense to cut into shards within budget; under the cap it is returned as is.
+ */
+export function clusterMesh(positions: Float32Array, indices: Uint32Array, cell: number, maxTriangles: number): DenseMesh {
+  let size = Math.max(cell, 1e-3);
+  if (indices.length / 3 <= maxTriangles) return { positions, indices, edge: size };
+  const vertices = positions.length / 3;
+  const remap = new Int32Array(vertices);
+  for (let attempt = 0; attempt < 12; attempt++, size *= 2) {
+    const inv = 1 / size;
+    const cells = new Map<string, number>();
+    const sums: number[] = [];
+    for (let v = 0; v < vertices; v++) {
+      const x = positions[v * 3];
+      const y = positions[v * 3 + 1];
+      const z = positions[v * 3 + 2];
+      const key = `${Math.floor(x * inv)},${Math.floor(y * inv)},${Math.floor(z * inv)}`;
+      let id = cells.get(key);
+      if (id === undefined) {
+        id = cells.size;
+        cells.set(key, id);
+        sums.push(0, 0, 0, 0);
+      }
+      remap[v] = id;
+      sums[id * 4] += x;
+      sums[id * 4 + 1] += y;
+      sums[id * 4 + 2] += z;
+      sums[id * 4 + 3]++;
+    }
+    let kept = 0;
+    for (let t = 0; t < indices.length; t += 3) {
+      const a = remap[indices[t]];
+      const b = remap[indices[t + 1]];
+      const c = remap[indices[t + 2]];
+      if (a !== b && b !== c && a !== c) kept++;
+    }
+    if (kept > maxTriangles) continue;
+    const out = new Float32Array(cells.size * 3);
+    for (let id = 0; id < cells.size; id++) {
+      const n = sums[id * 4 + 3];
+      out[id * 3] = sums[id * 4] / n;
+      out[id * 3 + 1] = sums[id * 4 + 1] / n;
+      out[id * 3 + 2] = sums[id * 4 + 2] / n;
+    }
+    const idx = new Uint32Array(kept * 3);
+    let k = 0;
+    for (let t = 0; t < indices.length; t += 3) {
+      const a = remap[indices[t]];
+      const b = remap[indices[t + 1]];
+      const c = remap[indices[t + 2]];
+      if (a === b || b === c || a === c) continue;
+      idx[k++] = a;
+      idx[k++] = b;
+      idx[k++] = c;
+    }
+    return { positions: out, indices: idx, edge: size };
+  }
+  return { positions, indices, edge: size };
+}
+
 /** What the worker posts after each subdivide: the shard mesh for request `id`, its buffers transferred. */
 export interface ShardReply extends ShardMesh {
   kind: 'shards';

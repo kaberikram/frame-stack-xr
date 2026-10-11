@@ -1,4 +1,4 @@
-import { DoubleSide, Matrix4, ShaderMaterial, Vector2, Vector3, Vector4, type Texture } from '@iwsdk/core';
+import { CustomBlending, DoubleSide, MaxEquation, Matrix4, ShaderMaterial, Vector2, Vector3, Vector4, type Texture } from '@iwsdk/core';
 import { SEGMENTS } from './hand-occluder.js';
 
 /**
@@ -1316,6 +1316,13 @@ export function voidMaterial(uniforms: VoidUniformSet, preview: boolean, role: V
     material.polygonOffset = true;
     material.polygonOffsetFactor = -1;
     material.polygonOffsetUnits = -4;
+  } else if (!preview && (role === 'torn' || role === 'backstop')) {
+    // Black layers that write no depth stack up: the most opaque one wins. A torn floor behind a torn
+    // desk then can't cut the desk's hand-ring open, and the backstop fading in can only add black.
+    // Still drawn with the opaque pass, in its render order.
+    material.blending = CustomBlending;
+    material.blendEquation = MaxEquation;
+    material.blendEquationAlpha = MaxEquation;
   }
   return material;
 }

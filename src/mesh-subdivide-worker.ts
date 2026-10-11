@@ -1,5 +1,6 @@
 import {
   buildShards,
+  clusterMesh,
   SHARD_EDGE,
   SHARD_MAX_TRIANGLES,
   snapToPlanes,
@@ -80,7 +81,9 @@ scope.onmessage = (event) => {
  * `subdivideMesh` only reads them, and the dense reply sends copies, never them.
  */
 function postShards(request: SubdivideRequest): void {
-  const coarse = subdivideMesh(request.positions, request.indices, SHARD_EDGE, SHARD_MAX_TRIANGLES, request.focus);
+  // A scan already denser than the cap is welded down first: subdividing never removes triangles.
+  const base = clusterMesh(request.positions, request.indices, SHARD_EDGE / 2, SHARD_MAX_TRIANGLES);
+  const coarse = subdivideMesh(base.positions, base.indices, SHARD_EDGE, SHARD_MAX_TRIANGLES, request.focus);
   const snapped = new Float32Array(coarse.positions.length);
   snapToPlanes(coarse.positions, coarse.indices, request.planes, snapped);
   const mesh = buildShards(snapped, coarse.indices);
