@@ -342,6 +342,8 @@ export interface ShardMesh {
   position: Float32Array;
   /** Per vertex: the shard's area-weighted centre xyz and its seed in [0, 1). 12 floats per triangle. */
   shard: Float32Array;
+  /** Per vertex: the shard's index, one float, so the catch texture can be sampled by it. */
+  shardId: Float32Array;
   /** Per shard, in the order the triangles are grouped: centre xyz, seed. */
   centres: Float32Array;
   /** Number of shards. */
@@ -497,6 +499,7 @@ export function buildShards(positions: ArrayLike<number>, indices: ArrayLike<num
   const centres = new Float32Array(count * 4);
   const position = new Float32Array(kept * 9);
   const shard = new Float32Array(kept * 12);
+  const shardId = new Float32Array(kept * 3);
   const bounds = new Float32Array(6);
   if (kept > 0) bounds.set([Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity]);
   for (let k = 0; k < count; k++) {
@@ -544,8 +547,9 @@ export function buildShards(positions: ArrayLike<number>, indices: ArrayLike<num
         shard[q + 1] = cy;
         shard[q + 2] = cz;
         shard[q + 3] = seeds[k];
+        shardId[j * 3 + corner] = k;
       }
     }
   }
-  return { position, shard, centres, count, triangles: kept, bounds };
+  return { position, shard, shardId, centres, count, triangles: kept, bounds };
 }

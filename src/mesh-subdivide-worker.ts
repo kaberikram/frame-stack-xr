@@ -85,5 +85,5 @@ function postShards(request: SubdivideRequest): void {
   snapToPlanes(coarse.positions, coarse.indices, request.planes, snapped);
   const mesh = buildShards(snapped, coarse.indices);
   const reply: ShardReply = { kind: 'shards', id: request.id, ...mesh };
-  scope.postMessage(reply, [mesh.position.buffer, mesh.shard.buffer, mesh.centres.buffer, mesh.bounds.buffer]);
+  scope.postMessage(reply, [mesh.position.buffer, mesh.shard.buffer, mesh.shardId.buffer, mesh.centres.buffer, mesh.bounds.buffer]);
 }

@@ -1,4 +1,15 @@
-import { DoubleSide, Matrix4, ShaderMaterial, Vector2, Vector3, Vector4, type Texture } from '@iwsdk/core';
+import {
+  CustomBlending,
+  DoubleSide,
+  Matrix4,
+  OneFactor,
+  OneMinusSrcAlphaFactor,
+  ShaderMaterial,
+  Vector2,
+  Vector3,
+  Vector4,
+  type Texture,
+} from '@iwsdk/core';
 import { SEGMENTS } from './hand-occluder.js';
 
 /**
@@ -981,18 +992,19 @@ export function createVoidUniforms(room: RubberUniformSet) {
   return {
     /** 0 collapses every shard: off, or the two frames that only upload a new set. */
     uVoidOn: { value: 0 },
-    /** Where the fist first closed: the front's centre. */
-    uVoidO: { value: new Vector3() },
     /** The hole, inside the fist: where every shard flies to. */
     uHole: { value: new Vector3() },
     uHead: { value: new Vector3() },
-    /** The spiral's axis, from the hole toward your head when the fist closed. */
-    uSpin: { value: new Vector3(0, 0, 1) },
-    // The tear front and its timeline (room-stretch-system.ts stepVoid).
-    uRip: { value: 0 },
-    uMark: { value: 0 },
-    uDone: { value: 0 },
-    uDrain: { value: 0 },
+    /** Where the fist points, the nozzle. Unit length. */
+    uAim: { value: new Vector3(0, 0, -1) },
+    /** A unit axis perpendicular to the aim, for the tug's wobble. */
+    uSpin: { value: new Vector3(1, 0, 0) },
+    /** Seconds since the vacuum opened. */
+    uClock: { value: 0 },
+    /** One RGBA texel per shard: catch time in r (1e6 = never), distance from the hole in g. */
+    uCatch: { value: null as Texture | null },
+    /** Width and height of uCatch, in texels. */
+    uCatchSize: { value: new Vector2(256, 1) },
     /** The black past the scan, 0 to 1, once the last shard has gone. */
     uBackFade: { value: 0 },
     uView0: { value: null as Texture | null },
@@ -1052,15 +1064,17 @@ vec4 viewLod(int i, vec2 uv) {
 const VOID_VERTEX = /* glsl */ `
 attribute vec4 aShard;
 uniform float uVoidOn;
-uniform vec3 uVoidO;
+uniform float uBackFade;
+#ifndef BACKSTOP
+attribute float aShardId;
 uniform vec3 uHole;
 uniform vec3 uHead;
+uniform vec3 uAim;
 uniform vec3 uSpin;
-uniform float uRip;
-uniform float uMark;
-uniform float uDone;
-uniform float uDrain;
-uniform float uBackFade;
+uniform float uClock;
+uniform sampler2D uCatch;
+uniform vec2 uCatchSize;
+#endif
 varying vec3 vRest;
 varying float vViewZ;
 #ifdef VOID_FLY
@@ -1074,22 +1088,29 @@ varying vec3 vFlat;
 varying float vLight;
 #endif
 
-/** The front is ragged: each shard tears up to this much later than its distance says. */
-const float JAG = 0.5;
+#ifndef BACKSTOP
 /** Shards stay this far from your eyes: nothing flies through your face. */
-const float HEAD_CLEAR = 0.35;
+const float HEAD_CLEAR = 0.5;
+/** Must match VOID_TUG, VOID_FLIGHT_NEAR, VOID_FLIGHT_FAR and VOID_FLIGHT_FAR_AT in room-stretch-system.ts. */
+const float TUG = 0.4;
+const float FLIGHT_NEAR = 1.8;
+const float FLIGHT_FAR = 2.2;
+const float FLIGHT_FAR_AT = 5.0;
 
 /**
- * How far along its trip a shard is: -1 untouched, 0 to 1 flying, 1 gone. Only the shard's centre,
- * seed and the uniforms go in, so all three corners of every triangle agree.
+ * Catch record for this shard, packed xyz: age, trip, stage. Stage 0 is untouched, 1 is the tug,
+ * 2 is in the funnel, 3 has landed. Trip is 0 through the tug, then 0 to 1 over the flight.
+ * Every corner of a triangle shares aShardId.
  */
-float tripOf(vec4 shard) {
-  float d = distance(shard.xyz, uVoidO) + shard.w * JAG;
-  float span = 0.6 + 0.35 * d;
-  if (d < uDone) return 1.0;
-  if (d < uMark) return clamp((uMark - d) / span + uDrain, 0.0, 1.0);
-  if (d < uRip) return clamp((uRip - d) / span, 0.0, 1.0);
-  return -1.0;
+vec3 catchState(float id) {
+  vec2 uv = (vec2(mod(id, uCatchSize.x), floor(id / uCatchSize.x)) + 0.5) / uCatchSize;
+  vec4 rec = textureLod(uCatch, uv, 0.0);
+  if (uVoidOn < 0.5 || rec.r > 1.0e5) return vec3(-1.0, -1.0, 0.0);
+  float age = uClock - rec.r;
+  float flight = mix(FLIGHT_NEAR, FLIGHT_FAR, clamp(max(rec.g, 0.0) / FLIGHT_FAR_AT, 0.0, 1.0));
+  float trip = age < TUG ? 0.0 : clamp((age - TUG) / max(flight, 1.0e-3), 0.0, 1.0);
+  float stage = age < TUG ? 1.0 : trip < 1.0 ? 2.0 : 3.0;
+  return vec3(age, trip, stage);
 }
 
 vec3 turn(vec3 v, vec3 axis, float angle) {
@@ -1097,6 +1118,7 @@ vec3 turn(vec3 v, vec3 axis, float angle) {
   float s = sin(angle);
   return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0 - c);
 }
+#endif
 
 void main() {
 #ifdef BACKSTOP
@@ -1108,18 +1130,23 @@ void main() {
   vViewZ = -(viewMatrix * vec4(vRest, 1.0)).z;
   gl_Position = uBackFade > 0.0 ? clip : vec4(2.0, 2.0, 2.0, 1.0);
 #else
-  float trip = uVoidOn > 0.5 ? tripOf(aShard) : -2.0;
+  vec3 caught = catchState(aShardId);
+  float age = caught.x;
+  float trip = caught.y;
+  float stage = caught.z;
 #if defined(VOID_REST)
 #ifdef PREVIEW
   // The desk's stand-in room draws the untouched part itself.
   bool on = false;
 #else
-  bool on = trip > -1.5 && trip < 0.0;
+  // Untouched, and still while it tugs: the real wall shows until the shard rips free.
+  bool on = stage < 1.5;
 #endif
 #elif defined(VOID_TORN)
-  bool on = trip >= 0.0;
+  // Black only once it has ripped. The tug is still the real surface.
+  bool on = stage >= 2.0;
 #else
-  bool on = trip >= 0.0 && trip < 1.0;
+  bool on = stage > 0.5 && stage < 2.5;
 #endif
   vRest = position;
   if (!on) {
@@ -1131,29 +1158,44 @@ void main() {
 #ifdef VOID_FLY
   vec3 c = aShard.xyz;
   float seed = aShard.w;
-  vec3 toHole = uHole - c;
-  float span = length(toHole);
-  vec3 dir = span > 1e-4 ? toHole / span : uSpin;
-  // A peel first: it lifts off toward the hole (5 mm at once, so it never fights its own black),
-  // then accelerates in along a spiral round the hole, closing as it goes.
-  float run = clamp((trip - 0.1) / 0.9, 0.0, 1.0);
-  float closing = run * run;
-  vec3 lift = dir * (0.005 + 0.04 * smoothstep(0.0, 0.1, trip));
-  vec3 q = uHole + turn((c + lift - uHole) * (1.0 - closing), uSpin, closing * (2.0 + 3.0 * seed) * 3.14159);
-  vec3 fromHead = q - uHead;
-  float headGap = length(fromHead);
-  if (headGap < HEAD_CLEAR) q = uHead + (headGap > 1e-4 ? fromHead / headGap : -dir) * HEAD_CLEAR;
-  // A shard nearing your head shrinks, so none fills your view; one nearing the hole shrinks into it.
-  float nearer = clamp(length(q - uHead) / max(length(c - uHead), 1e-3), 0.0, 1.0);
-  vec3 toGo = uHole - q;
-  float left = length(toGo);
-  vec3 heading = left > 1e-4 ? toGo / left : dir;
-  float size = smoothstep(0.02, 0.25, left) * pow(nearer, 0.6);
-  // Tumbling once it is clear of the wall, and drawn out along its flight as it speeds up.
-  vec3 axis = normalize(fract(sin(vec3(seed * 91.3, seed * 47.7, seed * 13.1) + 1.0) * 43758.5453) - 0.5 + 1e-3);
-  vec3 off = turn(position - c, axis, smoothstep(0.1, 0.3, trip) * trip * (4.0 + 8.0 * seed));
-  off += heading * dot(off, heading) * (2.0 * trip);
-  world = q + off * size;
+  vec3 q;
+  vec3 off;
+  if (stage < 1.5) {
+    // The tug: it shakes and lifts toward the fist, still on the wall, before it rips.
+    float u = clamp(age / TUG, 0.0, 1.0);
+    vec3 toHole = uHole - c;
+    float span = length(toHole);
+    vec3 dir = span > 1.0e-4 ? toHole / span : uAim;
+    q = c + dir * (0.01 + 0.02 * u) + uSpin * (sin(age * 48.0 + seed * 31.0) * 0.004 * u);
+    off = turn(position - c, uSpin, sin(age * 36.0 + seed * 10.0) * u * 0.35);
+  } else {
+    // Down the nozzle: moving the whole way, quicker near the fist. The radius stays out long
+    // enough to show the swirl, then drops onto the axis. Every shard swirls the same way.
+    vec3 from = c - uHole;
+    float along0 = dot(from, uAim);
+    vec3 off0 = from - uAim * along0;
+    // Off the wall quickly, then coasting, then into the fist. A slow start left every piece
+    // sitting on the hole it had torn, so the flight never read as a stream.
+    float ease = 1.0 - pow(1.0 - trip, 1.55);
+    float along = along0 * (1.0 - ease);
+    // Radius falls ahead of the travel, so the path is a funnel rather than an orbit.
+    float radK = pow(max(1.0 - ease, 0.0), 1.35);
+    float turns = 0.85 * (0.9 + 0.2 * seed);
+    float swirl = smoothstep(0.08, 1.0, trip) * turns * 6.283185;
+    q = uHole + uAim * along + turn(off0, uAim, swirl) * radK;
+    vec3 fromHead = q - uHead;
+    float headGap = length(fromHead);
+    if (headGap < HEAD_CLEAR) q = uHead + (headGap > 1.0e-4 ? fromHead / headGap : -uAim) * HEAD_CLEAR;
+    vec3 toGo = uHole - q;
+    float left = length(toGo);
+    vec3 heading = left > 1.0e-4 ? toGo / left : uAim;
+    float size = smoothstep(0.0, 0.15, left);
+    vec3 axis = normalize(fract(sin(vec3(seed * 91.3, seed * 47.7, seed * 13.1) + 1.0) * 43758.5453) - 0.5 + 1.0e-3);
+    off = turn(position - c, axis, trip * 1.2);
+    off += heading * dot(off, heading) * (0.35 * smoothstep(0.72, 1.0, trip));
+    off *= size;
+  }
+  world = q + off;
 
   // Which photo it wears: the one whose frame holds the shard's centre deepest, and the runner-up.
   float best = -1.0;
@@ -1253,10 +1295,10 @@ void main() {
   }
   if (uCoverDebug > 0.5) col = mix(col, covered > 0.5 ? vec3(1.0, 0.1, 0.1) : vec3(0.1, 0.2, 1.0), 0.5);
   float trip = vPick.z;
-  // Fast and small, a shard is its own colour (the photos have no mips to shimmer from), and it
-  // darkens into the hole.
-  col = mix(col, vFlat, smoothstep(0.4, 0.8, trip));
-  col *= vLight * mix(1.0, 0.12, smoothstep(0.45, 1.0, trip));
+  // The photo stays until late, with a lift as it nears the fist, and only then darkens into it.
+  float glow = smoothstep(0.55, 0.85, trip) * (1.0 - smoothstep(0.88, 1.0, trip));
+  col = mix(col, vFlat, smoothstep(0.8, 0.95, trip));
+  col *= vLight * (1.0 + 0.45 * glow) * mix(1.0, 0.2, smoothstep(0.9, 1.0, trip));
 #ifdef PREVIEW
   gl_FragColor = vec4(col, 1.0);
   #include <colorspace_fragment>
@@ -1318,4 +1360,106 @@ export function voidMaterial(uniforms: VoidUniformSet, preview: boolean, role: V
     material.polygonOffsetUnits = -4;
   }
   return material;
+}
+
+const VORTEX_VERTEX = /* glsl */ `
+attribute vec3 aVortex;
+uniform float uTime;
+varying vec3 vRest;
+varying float vViewZ;
+varying float vAlong;
+varying float vBand;
+
+void main() {
+  vec3 p;
+  if (aVortex.y < 0.0) {
+    float ang = uTime * 1.2;
+    float c = cos(ang);
+    float s = sin(ang);
+    p = vec3(position.x * c - position.y * s, position.x * s + position.y * c, position.z);
+    vAlong = 0.0;
+  } else {
+    // Scroll toward the mouth. The strip wraps, and the fragment fades both ends so the wrap is hidden.
+    float along = fract(aVortex.x - uTime * 0.35);
+    float ang = aVortex.y * 2.094395102 + along * 4.2;
+    float rad = mix(0.046, 0.22, along);
+    float w = (aVortex.z - 0.5) * 0.014 * mix(0.6, 1.4, along);
+    float ca = cos(ang);
+    float sa = sin(ang);
+    p = vec3(ca * rad - sa * w, sa * rad + ca * w, along * 0.6);
+    vAlong = along;
+  }
+  vBand = aVortex.y;
+  vec4 world = modelMatrix * vec4(p, 1.0);
+  vRest = world.xyz;
+  vec4 viewPos = viewMatrix * world;
+  vViewZ = -viewPos.z;
+  gl_Position = projectionMatrix * viewPos;
+}
+`;
+
+const VORTEX_FRAGMENT = /* glsl */ `
+uniform float uSuck;
+uniform float uFeather;
+uniform float uLinear;
+varying vec3 vRest;
+varying float vViewZ;
+varying float vAlong;
+varying float vBand;
+${DEPTH_CUT}
+${PHOTO}
+
+void main() {
+  float alpha = uSuck;
+  vec3 col = vec3(0.62, 0.86, 1.0) * (0.35 + 0.65 * uSuck);
+  if (vBand < 0.0) alpha *= 0.9;
+  else {
+    float fade = smoothstep(0.0, 0.12, vAlong) * (1.0 - smoothstep(0.7, 0.98, vAlong));
+    alpha *= 0.5 * fade;
+  }
+#ifdef ENV_DEPTH
+  float gate = 0.0;
+  float occ = handOcclusion(vRest, vViewZ, gate);
+  alpha *= 1.0 - occ;
+#endif
+  if (alpha < 0.004) discard;
+  writeColor(col, alpha);
+}
+`;
+
+/** The nozzle: a ring at the fist and faint streaks funneling into it. Premultiplied, no depth write. */
+export function vortexMaterial(room: RubberUniformSet, preview: boolean): ShaderMaterial {
+  const defines: Record<string, string> = {};
+  if (!preview) defines.ENV_DEPTH = '';
+  return new ShaderMaterial({
+    uniforms: {
+      uSuck: { value: 0 },
+      uTime: { value: 0 },
+      uFeather: room.uFeather,
+      uLinear: room.uLinear,
+      uEnvDepth: room.uEnvDepth,
+      uDepthOn: room.uDepthOn,
+      uDepthRaw: room.uDepthRaw,
+      uDepthNear: room.uDepthNear,
+      uEyeSize: room.uEyeSize,
+      uNormDepth0: room.uNormDepth0,
+      uNormDepth1: room.uNormDepth1,
+      uSegA: room.uSegA,
+      uSegB: room.uSegB,
+      uOccDebug: room.uOccDebug,
+      uHandBall: room.uHandBall,
+    },
+    vertexShader: VORTEX_VERTEX,
+    fragmentShader: VORTEX_FRAGMENT,
+    name: `jonze-vortex${preview ? '-preview' : ''}`,
+    defines,
+    transparent: true,
+    depthTest: true,
+    depthWrite: false,
+    blending: CustomBlending,
+    blendSrc: OneFactor,
+    blendDst: OneMinusSrcAlphaFactor,
+    side: DoubleSide,
+    toneMapped: false,
+  });
 }

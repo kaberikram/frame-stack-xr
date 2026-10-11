@@ -1,6 +1,25 @@
-import { BufferAttribute, BufferGeometry, Mesh, Sphere, type Object3D, type ShaderMaterial } from '@iwsdk/core';
+import {
+  BufferAttribute,
+  BufferGeometry,
+  ClampToEdgeWrapping,
+  DataTexture,
+  FloatType,
+  Mesh,
+  NearestFilter,
+  NoColorSpace,
+  RGBAFormat,
+  Sphere,
+  Vector3,
+  type Object3D,
+  type ShaderMaterial,
+} from '@iwsdk/core';
 import type { ShardMesh } from './mesh-subdivide.js';
 import { createVoidUniforms, voidMaterial, type RubberUniformSet, type VoidRole, type VoidUniformSet } from './stretch-material.js';
+import { VoidVortex } from './void-vortex.js';
+
+/** Catch times live in a float texture this many texels wide. A texel at or above this was never caught. */
+const CATCH_WIDTH = 256;
+const CATCH_NEVER = 1e6;
 
 /** The draws that share the shard geometry, in the order they draw. The backstop has its own triangle. */
 const SHARD_ROLES: readonly VoidRole[] = ['rest', 'torn', 'fly'];
@@ -15,8 +34,8 @@ const ORDER: Record<VoidRole, number> = { rest: 2, torn: 2.1, fly: 3, backstop: 
 /**
  * The fist's black hole: the room torn into shards that fly into your fist, black where they were.
  * One de-indexed copy of the room, cut into flat shards in the worker (mesh-subdivide.ts
- * buildShards), drawn three ways from the same buffers; every shard's state comes from its centre,
- * its seed and the tear front's uniforms, so the CPU never touches a vertex once it is uploaded.
+ * buildShards), drawn three ways from the same buffers. The CPU only writes a catch time per shard;
+ * the shader reads it and moves the vertices.
  */
 export class RoomVoid {
   readonly uniforms: VoidUniformSet;
@@ -34,6 +53,11 @@ export class RoomVoid {
   private readonly preview: ShaderMaterial[] = [];
   private readonly warmers: Mesh[] = [];
   private readonly speck: BufferGeometry;
+  private readonly vortex: VoidVortex;
+  private catchTex: DataTexture | null = null;
+  private catchData = new Float32Array(0);
+  private catchHeight = 0;
+  private catchDirty = false;
   /** Frames left to draw a new set collapsed, so its upload doesn't land on the fist. */
   private warm = 0;
   private previewMode = false;
@@ -48,6 +72,9 @@ export class RoomVoid {
     this.speck = new BufferGeometry();
     this.speck.setAttribute('position', new BufferAttribute(new Float32Array(9), 3));
     this.speck.setAttribute('aShard', new BufferAttribute(new Float32Array(12), 4));
+    this.speck.setAttribute('aShardId', new BufferAttribute(new Float32Array(3), 1));
+    this.ensureCatch(1);
+    this.vortex = new VoidVortex(parent, room);
     for (let i = 0; i < ROLES.length; i++) {
       const warmer = this.place(new Mesh(this.speck, this.headset[i]), ORDER[ROLES[i]]);
       this.warmers.push(warmer);
@@ -84,6 +111,36 @@ export class RoomVoid {
     for (let i = 0; i < this.meshes.length; i++) this.meshes[i].visible = drawn;
     this.backstop.visible = on;
     for (let i = 0; i < this.warmers.length; i++) this.warmers[i].visible = true;
+    this.vortex.warm(true);
+  }
+
+  /** The nozzle at the fist. `suck` is 0 to 1; `aim` is a unit vector. */
+  placeVortex(show: boolean, suck: number, hole: Vector3, aim: Vector3, time: number, preview: boolean): void {
+    this.vortex.place(show, suck, hole, aim, time, preview);
+  }
+
+  /** Every shard uncaught. The texture grows to fit `count`, and only uploads again after a catch. */
+  resetCatch(count: number): void {
+    this.ensureCatch(count);
+    this.catchData.fill(CATCH_NEVER);
+    this.catchDirty = true;
+    this.uploadCatch();
+  }
+
+  /** Shard `index` caught at `time` seconds, `dist` metres from the hole. */
+  catchShard(index: number, time: number, dist: number): void {
+    const o = index * 4;
+    if (o + 1 >= this.catchData.length) return;
+    this.catchData[o] = time;
+    this.catchData[o + 1] = dist;
+    this.catchDirty = true;
+  }
+
+  /** Sends the catch texture up, and only on a frame that caught something. */
+  uploadCatch(): void {
+    if (!this.catchDirty || !this.catchTex) return;
+    this.catchTex.needsUpdate = true;
+    this.catchDirty = false;
   }
 
   hide(): void {
@@ -91,6 +148,7 @@ export class RoomVoid {
     for (let i = 0; i < this.meshes.length; i++) this.meshes[i].visible = false;
     this.backstop.visible = false;
     for (let i = 0; i < this.warmers.length; i++) this.warmers[i].visible = false;
+    this.vortex.hide();
   }
 
   dispose(): void {
@@ -100,6 +158,8 @@ export class RoomVoid {
     this.speck.dispose();
     this.backstop.geometry.dispose();
     for (const material of [...this.headset, ...this.preview]) material.dispose();
+    this.catchTex?.dispose();
+    this.vortex.dispose();
   }
 
   private adopt(): void {
@@ -108,6 +168,7 @@ export class RoomVoid {
     const geometry = new BufferGeometry();
     geometry.setAttribute('position', new BufferAttribute(set.position, 3));
     geometry.setAttribute('aShard', new BufferAttribute(set.shard, 4));
+    geometry.setAttribute('aShardId', new BufferAttribute(set.shardId, 1));
     // From the worker's bounds: computing it here would walk every vertex on the main thread.
     const b = set.bounds;
     const sphere = new Sphere();
@@ -124,7 +185,29 @@ export class RoomVoid {
     this.geometry = geometry;
     this.shards = set;
     this.buildId = this.pendingId;
+    this.resetCatch(set.count);
     this.warm = 2;
+  }
+
+  private ensureCatch(count: number): void {
+    const height = Math.max(1, Math.ceil(count / CATCH_WIDTH));
+    if (this.catchTex && this.catchHeight === height) return;
+    this.catchTex?.dispose();
+    this.catchHeight = height;
+    this.catchData = new Float32Array(CATCH_WIDTH * height * 4);
+    this.catchData.fill(CATCH_NEVER);
+    const texture = new DataTexture(this.catchData, CATCH_WIDTH, height, RGBAFormat, FloatType);
+    texture.magFilter = NearestFilter;
+    texture.minFilter = NearestFilter;
+    texture.wrapS = ClampToEdgeWrapping;
+    texture.wrapT = ClampToEdgeWrapping;
+    texture.generateMipmaps = false;
+    texture.colorSpace = NoColorSpace;
+    texture.flipY = false;
+    texture.needsUpdate = true;
+    this.catchTex = texture;
+    this.uniforms.uCatch.value = texture;
+    this.uniforms.uCatchSize.value.set(CATCH_WIDTH, height);
   }
 
   private place(mesh: Mesh, order: number): Mesh {

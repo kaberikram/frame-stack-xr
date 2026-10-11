@@ -180,16 +180,40 @@ const HOLE_BACK = 0.015;
 /** The hole glides after the fist with this time constant. */
 const HOLE_GLIDE = 0.06;
 /**
- * The tear front runs out from where the fist closed at VOID_SPEED m/s, VOID_SPEED_UP faster for
- * every second it has been held. Shards let go of land within VOID_LAND. VOID_JAG is the shader's
- * JAG (stretch-material.ts): the front is ragged by up to that much.
+ * The vacuum in front of the fist. The cone opens from VOID_CONE_START to a full sphere over
+ * VOID_WIDEN seconds of holding, and the catch rate climbs from VOID_RATE_START to VOID_RATE_END.
+ * The cone follows vacuumOpen and the rate follows vacuumRate, so the first seconds stay a narrow
+ * trickle and the rush comes once the cone is wide. Reach starts at VOID_REACH_START and grows to
+ * cover the room. A caught shard tugs for VOID_TUG, then flies for VOID_FLIGHT_NEAR to
+ * VOID_FLIGHT_FAR seconds. Those four
+ * numbers are repeated in the void shader (stretch-material.ts).
  */
-const VOID_SPEED = 0.6;
-const VOID_SPEED_UP = 1;
-const VOID_LAND = 0.7;
-const VOID_JAG = 0.5;
-/** Once the last shard lands, the black past the scan fades in over this. */
-const VOID_BACK_FADE = 0.5;
+const VOID_CONE_START = (25 * Math.PI) / 180;
+const VOID_CONE_END = Math.PI;
+const VOID_WIDEN = 8;
+const VOID_REACH_START = 1.5;
+const VOID_REACH_END = 8;
+const VOID_RATE_START = 8;
+const VOID_RATE_END = 320;
+const VOID_TUG = 0.4;
+const VOID_FLIGHT_NEAR = 1.8;
+const VOID_FLIGHT_FAR = 2.2;
+const VOID_FLIGHT_FAR_AT = 5;
+/** The most shards one frame will pick up. The rate cap is what actually limits the trickle. */
+const VOID_CATCH_SLOTS = 8;
+
+/** 0 when the fist has just closed, 1 after VOID_WIDEN. Squared so the nozzle stays aimed first. */
+function vacuumOpen(held: number): number {
+  const u = Math.min(1, held / VOID_WIDEN);
+  return u * u;
+}
+
+/** The catch rate. Cubed, so the first seconds stay a handful of pieces and the rush comes late. */
+function vacuumRate(held: number): number {
+  const u = Math.min(1, held / VOID_WIDEN);
+  const o = u * u * u;
+  return VOID_RATE_START + (VOID_RATE_END - VOID_RATE_START) * o;
+}
 /** Frame times kept while the void runs, for the line it prints when the room is gone. */
 const VOID_FRAMES = 2048;
 /**
@@ -671,7 +695,7 @@ const OCC_DELTA = OCC_MODE === 'delta';
 
 /** Desk preview: `?demo=push` loops a box pushed into the stand-in wall instead of the two-hand pull. */
 const DEMO_PUSH = typeof location !== 'undefined' && new URLSearchParams(location.search).get('demo') === 'push';
-/** Desk preview: `?demo=void` loops a fist tearing the stand-in room into its black hole. */
+/** Desk preview: `?demo=void` loops a fist vacuuming the stand-in room. */
 const DEMO_VOID = typeof location !== 'undefined' && new URLSearchParams(location.search).get('demo') === 'void';
 /** `&at=<s>` with `demo=void` holds the loop at that moment, for screenshots. */
 const DEMO_AT = typeof location !== 'undefined' ? Number(new URLSearchParams(location.search).get('at') ?? NaN) : NaN;
@@ -845,26 +869,26 @@ export class RoomStretchSystem extends createSystem({
   private readonly fists: Record<Side, FistTrack> = { left: makeFistTrack('left'), right: makeFistTrack('right') };
   private voidDraw!: RoomVoid;
   /**
-   * The fist's black hole: `on` while it tears the room and its shards fly, `gone` once the last has
-   * landed and the black closes over the rest; it stays until the mode, the session or a recentre
-   * ends it. The front `rip` runs out from O, where the fist closed; `mark`, `done` and `drain` time
-   * the shards let go of (stretch-material.ts tripOf). `at` is the hole, gliding after the fist.
+   * The fist's vacuum: `on` while it catches shards and they fly in, `gone` once the last has landed
+   * and the view is black; it stays until the mode, the session or a recentre ends it. `at` is the
+   * hole, `aim` where the fist points. `held` is how long the fist has been closed, which widens the
+   * cone. `clock` times each shard's flight (stretch-material.ts catchState).
    */
   private readonly blackHole = {
     phase: 'none' as 'none' | 'on' | 'gone',
     side: 'right' as Side,
     holding: false,
-    growing: false,
-    O: new Vector3(),
     at: new Vector3(),
-    spin: new Vector3(0, 0, 1),
-    rip: 0,
-    mark: 0,
-    done: 0,
-    drain: 0,
+    aim: new Vector3(0, 0, -1),
+    spin: new Vector3(1, 0, 0),
+    clock: 0,
     held: 0,
-    dmin: 0,
-    dmax: 0,
+    budget: 0,
+    caughtCount: 0,
+    lastLand: 0,
+    reachEnd: VOID_REACH_END,
+    rate: 0,
+    logAt: -Infinity,
     back: 0,
     startAt: 0,
     views: 0,
@@ -879,6 +903,12 @@ export class RoomStretchSystem extends createSystem({
   private demoFist!: Mesh;
   private demoCut = false;
   private demoHeldAt = false;
+  private readonly demoAim = new Vector3(0, 0, -1);
+  private readonly demoAt = new Vector3();
+  /** Shards already caught this vacuum, 1 once caught. Grown only when a room has more shards than the last. */
+  private caught = new Uint8Array(0);
+  private readonly catchBest = new Int32Array(VOID_CATCH_SLOTS);
+  private readonly catchDist = new Float32Array(VOID_CATCH_SLOTS);
 
   init(): void {
     this.overlay = new RoomMeshOverlay(this.scene, LENS_OVERLAY);
@@ -2466,7 +2496,7 @@ export class RoomStretchSystem extends createSystem({
       for (let i = 0; i < SIDES.length; i++) {
         const fist = this.fists[SIDES[i]];
         if (fist.on) {
-          this.startVoid(fist.side, fist.point, now, false);
+          this.startVoid(fist.side, fist.point, this.palms[SIDES[i]].pose.up, now, false);
           break;
         }
       }
@@ -2477,11 +2507,12 @@ export class RoomStretchSystem extends createSystem({
       if (other.on) bh.side = other.side;
     }
     const fist = this.fists[bh.side];
-    this.runVoid(dt, fist.on, fist.point, now);
+    const track = this.palms[bh.side];
+    this.runVoid(dt, fist.on, fist.point, track.valid ? track.pose.up : bh.aim, now);
   }
 
-  /** The hole opens at `point`: everything else stops, and the room's photos are frozen for its shards. */
-  private startVoid(side: Side, point: Vector3, now: number, liveOk: boolean): void {
+  /** The hole opens at `point`, aimed along `aim`: everything else stops, and the room's photos are frozen. */
+  private startVoid(side: Side, point: Vector3, aim: Vector3, now: number, liveOk: boolean): void {
     const set = this.voidDraw.shards;
     if (!set) return;
     this.sound.stop();
@@ -2489,33 +2520,32 @@ export class RoomStretchSystem extends createSystem({
     const bh = this.blackHole;
     bh.phase = 'on';
     bh.side = side;
-    bh.O.copy(point);
     bh.at.copy(point);
-    bh.spin.copy(this.head).sub(point);
-    if (bh.spin.lengthSq() < 1e-6) bh.spin.set(0, 1, 0);
-    bh.spin.normalize();
-    let near = Infinity;
+    bh.aim.copy(aim);
+    if (bh.aim.lengthSq() < 1e-6) bh.aim.set(0, 0, -1);
+    bh.aim.normalize();
+    this.aimSide(bh.aim, bh.spin);
     let far = 0;
     const c = set.centres;
     for (let i = 0; i < set.count; i++) {
       const d = Math.hypot(c[i * 4] - point.x, c[i * 4 + 1] - point.y, c[i * 4 + 2] - point.z);
-      if (d < near) near = d;
       if (d > far) far = d;
     }
-    bh.dmin = Number.isFinite(near) ? near : 0;
-    bh.dmax = far + VOID_JAG;
-    bh.rip = bh.dmin;
-    bh.mark = bh.dmin;
-    bh.done = bh.dmin;
-    // Nothing is landing yet, so the front may grow at once.
-    bh.drain = 2;
+    bh.reachEnd = Math.max(VOID_REACH_END, far + 0.25);
+    bh.clock = 0;
     bh.held = 0;
+    bh.budget = 0;
+    bh.caughtCount = 0;
+    bh.lastLand = 0;
+    bh.rate = 0;
+    bh.logAt = now;
     bh.back = 0;
-    bh.growing = false;
     bh.startAt = now;
     bh.frameCount = 0;
+    this.ensureCaught(set.count);
+    this.voidDraw.resetCatch(set.count);
     this.hands.setSlim(true);
-    console.info(`[jonze] void ${side === 'left' ? 'L' : 'R'} start ${set.count} shards ${short(bh.dmin)}-${bh.dmax.toFixed(1)}m`);
+    console.info(`[jonze] void ${side === 'left' ? 'L' : 'R'} start ${set.count} shards`);
     this.freezeViews(now, liveOk);
   }
 
@@ -2533,37 +2563,124 @@ export class RoomStretchSystem extends createSystem({
   }
 
   /**
-   * The tear front and its timeline, shared with the desk demo. While the fist holds, the front runs
-   * out faster and faster; let go, the shards already torn finish their flight. It grows again only
-   * once those have landed, so a flick of the fist never snaps any out of the air.
+   * The vacuum, shared with the desk demo. While the fist holds, shards in the cone in front of it
+   * are caught, nearest first, up to a rate that climbs as the cone opens. Let go and nothing new
+   * is caught; shards already caught finish the flight they started, so none snap out of the air.
    */
-  private runVoid(dt: number, holding: boolean, point: Vector3, now: number): void {
+  private runVoid(dt: number, holding: boolean, point: Vector3, aim: Vector3, now: number): void {
     const bh = this.blackHole;
+    if (bh.phase !== 'on') return;
     bh.holding = holding;
-    if (holding) bh.at.lerp(point, 1 - Math.exp(-Math.min(dt, STEP_MAX) / HOLE_GLIDE));
-    const grow = holding && bh.rip < bh.dmax && (bh.rip > bh.mark || bh.drain >= 1);
-    if (grow) {
+    bh.clock += dt;
+    if (holding) {
       bh.held += dt;
-      bh.rip = Math.min(bh.dmax, bh.rip + (VOID_SPEED + VOID_SPEED_UP * bh.held) * dt);
-    } else if (bh.rip > bh.mark) {
-      bh.done = bh.mark;
-      bh.mark = bh.rip;
-      bh.drain = 0;
+      const glide = 1 - Math.exp(-Math.min(dt, STEP_MAX) / HOLE_GLIDE);
+      bh.at.lerp(point, glide);
+      bh.aim.lerp(aim, glide);
+      if (bh.aim.lengthSq() < 1e-8) bh.aim.set(0, 0, -1);
+      else bh.aim.normalize();
+      this.aimSide(bh.aim, bh.spin);
     }
-    bh.drain = Math.min(2, bh.drain + dt / VOID_LAND);
-    bh.growing = grow;
-    if (bh.phase === 'on') {
-      if (bh.frameCount < VOID_FRAMES) bh.frames[bh.frameCount++] = this.frameDt * 1000;
-      if (bh.mark >= bh.dmax && bh.drain >= 1) this.voidGone(now);
-    } else {
-      bh.back = Math.min(1, bh.back + dt / VOID_BACK_FADE);
+    const catches = holding ? this.catchShards(dt) : 0;
+    const instant = catches / Math.max(dt, 1e-3);
+    bh.rate += (instant - bh.rate) * (1 - Math.exp(-Math.min(dt, STEP_MAX) / 0.25));
+    if (bh.frameCount < VOID_FRAMES) bh.frames[bh.frameCount++] = this.frameDt * 1000;
+    const set = this.voidDraw.shards;
+    if (set && set.count > 0 && bh.caughtCount >= set.count && bh.clock >= bh.lastLand) this.voidGone(now);
+    else if (holding && now - bh.logAt > 0.5) {
+      bh.logAt = now;
+      const u = vacuumOpen(bh.held);
+      const cone = VOID_CONE_START + (VOID_CONE_END - VOID_CONE_START) * u;
+      const count = set?.count ?? 0;
+      console.info(`[jonze] void catch ${bh.caughtCount}/${count} ${Math.round(bh.rate)}/s cone ${Math.round(cone / DEG)}°`);
     }
   }
 
-  /** The last shard has landed: a thunk, and the black closes over everything past the scan too. */
+  /** A unit axis perpendicular to `aim`, for the tug's sideways wobble. */
+  private aimSide(aim: Vector3, out: Vector3): void {
+    out.set(0, 1, 0).cross(aim);
+    if (out.lengthSq() < 1e-6) out.set(1, 0, 0).cross(aim);
+    out.normalize();
+  }
+
+  /** Clears the caught flags. A bigger room allocates once; a later vacuum reuses the buffer. */
+  private ensureCaught(count: number): void {
+    if (this.caught.length < count) this.caught = new Uint8Array(count);
+    else this.caught.fill(0, 0, count);
+  }
+
+  /**
+   * Catches the nearest shards inside the cone, up to the budget the rate cap has saved.
+   * No allocation: a fixed list of slots, filled by a partial insert.
+   */
+  private catchShards(dt: number): number {
+    const set = this.voidDraw.shards;
+    const bh = this.blackHole;
+    if (!set || set.count === 0 || this.caught.length < set.count) return 0;
+    const u = vacuumOpen(bh.held);
+    const cosMin = Math.cos(VOID_CONE_START + (VOID_CONE_END - VOID_CONE_START) * u);
+    const reach = VOID_REACH_START + (bh.reachEnd - VOID_REACH_START) * u;
+    const rate = vacuumRate(bh.held);
+    bh.budget = Math.min(VOID_CATCH_SLOTS, bh.budget + rate * dt);
+    const slots = Math.min(VOID_CATCH_SLOTS, Math.floor(bh.budget));
+    if (slots < 1) return 0;
+    for (let s = 0; s < slots; s++) {
+      this.catchDist[s] = Infinity;
+      this.catchBest[s] = -1;
+    }
+    const hole = bh.at;
+    const aim = bh.aim;
+    const reach2 = reach * reach;
+    const centres = set.centres;
+    const caught = this.caught;
+    for (let i = 0; i < set.count; i++) {
+      if (caught[i]) continue;
+      const dx = centres[i * 4] - hole.x;
+      const dy = centres[i * 4 + 1] - hole.y;
+      const dz = centres[i * 4 + 2] - hole.z;
+      const dist2 = dx * dx + dy * dy + dz * dz;
+      if (dist2 > reach2 || dist2 < 1e-8) continue;
+      const inv = 1 / Math.sqrt(dist2);
+      if ((dx * aim.x + dy * aim.y + dz * aim.z) * inv < cosMin) continue;
+      this.considerCatch(i, 1 / inv, slots);
+    }
+    let n = 0;
+    for (let s = 0; s < slots; s++) {
+      const index = this.catchBest[s];
+      if (index < 0) break;
+      const dist = this.catchDist[s];
+      caught[index] = 1;
+      this.voidDraw.catchShard(index, bh.clock, dist);
+      const flight = VOID_FLIGHT_NEAR + (VOID_FLIGHT_FAR - VOID_FLIGHT_NEAR) * Math.min(1, dist / VOID_FLIGHT_FAR_AT);
+      const land = bh.clock + VOID_TUG + flight;
+      if (land > bh.lastLand) bh.lastLand = land;
+      bh.caughtCount++;
+      bh.budget -= 1;
+      n++;
+    }
+    if (n > 0) this.voidDraw.uploadCatch();
+    return n;
+  }
+
+  /** Inserts one shard into the nearest-slots list, which stays sorted closest first. */
+  private considerCatch(index: number, dist: number, slots: number): void {
+    if (dist >= this.catchDist[slots - 1]) return;
+    let i = slots - 1;
+    while (i > 0 && dist < this.catchDist[i - 1]) {
+      this.catchDist[i] = this.catchDist[i - 1];
+      this.catchBest[i] = this.catchBest[i - 1];
+      i--;
+    }
+    this.catchDist[i] = dist;
+    this.catchBest[i] = index;
+  }
+
+  /** The last shard has landed: a thunk, and the whole view is black at once, past the scan too. */
   private voidGone(now: number): void {
     const bh = this.blackHole;
     bh.phase = 'gone';
+    // Full black the same frame. A fade from clear repaints the walls and shows passthrough through them.
+    bh.back = 1;
     if (this.renderer.xr.isPresenting) this.sound.gone(bh.at.x, bh.at.y, bh.at.z);
     else console.info('[jonze] void sound gone');
     const n = bh.frameCount;
@@ -2580,7 +2697,6 @@ export class RoomStretchSystem extends createSystem({
     console.info(`[jonze] void end after ${(performance.now() / 1000 - bh.startAt).toFixed(1)}s`);
     bh.phase = 'none';
     bh.holding = false;
-    bh.growing = false;
     bh.back = 0;
     bh.views = 0;
     this.photo.releaseViews();
@@ -2601,14 +2717,11 @@ export class RoomStretchSystem extends createSystem({
     const on = bh.phase !== 'none';
     if (on) {
       const U = this.voidDraw.uniforms;
-      U.uVoidO.value.copy(bh.O);
       U.uHole.value.copy(bh.at);
       U.uHead.value.copy(this.head);
+      U.uAim.value.copy(bh.aim);
       U.uSpin.value.copy(bh.spin);
-      U.uRip.value = bh.rip;
-      U.uMark.value = bh.mark;
-      U.uDone.value = bh.done;
-      U.uDrain.value = bh.drain;
+      U.uClock.value = bh.clock;
       U.uBackFade.value = bh.back;
       // One photo uploads per frame, in the order they were chosen: the fist's own view first.
       this.photo.uploadView(this.renderer);
@@ -2626,17 +2739,19 @@ export class RoomStretchSystem extends createSystem({
     }
     // On the desk the stand-in room still draws under the black, so its shards' black stays too.
     this.voidDraw.sync(on, preview, preview || bh.back < 1);
+    const suck = !on || bh.back >= 1 ? 0 : bh.holding ? Math.max(0.45, Math.min(1, 0.35 + bh.rate / VOID_RATE_END)) : 0.18;
+    this.voidDraw.placeVortex(on && bh.back < 1, suck, bh.at, bh.aim, bh.clock, preview);
   }
 
-  /** The hole's voice: a suction that rises with the front, quieting as the last shards land. */
+  /** The hole's voice: a suction that follows how fast shards are being caught. */
   private singVoid(): void {
     const bh = this.blackHole;
     if (bh.phase !== 'on') return;
-    const level = bh.growing ? Math.min(1, 0.35 + 0.65 * (bh.held / 3)) : 0.5 * Math.max(0, 1 - bh.drain);
+    const level = bh.holding ? Math.max(0.2, Math.min(1, bh.rate / VOID_RATE_END)) : Math.min(0.15, bh.rate / VOID_RATE_END);
     this.sound.suck(level, bh.at.x, bh.at.y, bh.at.z);
   }
 
-  /** Desk preview, `?demo=void`: a fist tears the stand-in room in, opens, closes again, and the black stays. */
+  /** Desk preview, `?demo=void`: a fist aims at the wardrobe, sweeps wider, and the black stays. */
   private updateVoidDemo(dt: number, now: number): void {
     if (!this.demoCut) this.cutStandIn();
     this.gaze.set(0, 0, -1).applyQuaternion(this.headQuat);
@@ -2658,21 +2773,26 @@ export class RoomStretchSystem extends createSystem({
 
   private voidDemoStep(dt: number, now: number): void {
     this.demoT += dt;
-    const t = this.demoT % 9;
+    const t = this.demoT % 16;
     const bh = this.blackHole;
-    if (t < 0.3) {
+    if (t < 0.4) {
       if (bh.phase !== 'none') this.endVoid();
       return;
     }
     const fist = this.demoFist.position;
-    fist.set(0.25 + 0.03 * Math.sin(t * 2), 1.15 + 0.02 * Math.sin(t * 3), -0.9);
-    const holding = (t >= 0.5 && t < 1.7) || (t >= 2.6 && t < 5);
+    fist.set(0.15 + 0.12 * Math.sin(t * 0.4), 1.15 + 0.04 * Math.sin(t * 0.7), -0.85);
+    const sweep = smooth(Math.min(1, Math.max(0, (t - 2) / 6)));
+    this.demoAt.set(WARDROBE.x + (1.1 - WARDROBE.x) * sweep, 1.05, WARDROBE.z + (-2 - WARDROBE.z) * sweep);
+    this.demoAim.copy(this.demoAt).sub(fist);
+    if (this.demoAim.lengthSq() < 1e-6) this.demoAim.set(0, 0, -1);
+    else this.demoAim.normalize();
+    const holding = t >= 0.5 && t < 12;
     if (bh.phase === 'none') {
       if (!holding || !this.voidDraw.shards) return;
-      this.startVoid('right', fist, now, true);
+      this.startVoid('right', fist, this.demoAim, now, true);
       if (bh.phase === 'none') return;
     }
-    this.runVoid(dt, holding, fist, now);
+    this.runVoid(dt, holding, fist, this.demoAim, now);
   }
 
   /** The stand-in room, cut into shards the way the worker cuts a scanned one. */
