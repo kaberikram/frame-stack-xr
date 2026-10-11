@@ -1,4 +1,10 @@
-export type ExperienceMode = 'stack' | 'stretch';
+export type ExperienceMode = 'stack' | 'stretch' | 'sorang';
+
+export const MODES: readonly ExperienceMode[] = ['stack', 'stretch', 'sorang'];
+
+export function isMode(value: unknown): value is ExperienceMode {
+  return typeof value === 'string' && (MODES as readonly string[]).includes(value);
+}
 
 /**
  * `?preview=1` forces the desk stand-in room and webcam even where the dev server's

@@ -1,10 +1,12 @@
-# Frame stack and Jonze stretch
+# Frame stack, Jonze stretch and Sorang
 
-Two passthrough modes in one page.
+Two passthrough modes and a desktop preview in one page.
 
 **Frame stack** cuts a video into slices and stacks them along a time axis on a real table, with a filmstrip you scrub by touch.
 
 **Jonze stretch** pinches the scanned room and pulls. The spot under your fingers follows your hand, the surface behind it stretches like taffy with its real texture, and a long pull smears into streaks of the column you grabbed. One hand or both. Let go and it springs back.
+
+**Sorang** hangs a painting in the dark, as tall as you. It takes on depth, splits into 100 slices by depth, turns out to be a mosaic of 100 stock photos, and then the pieces fly out and orbit you. Desktop only for now.
 
 ## Run
 
@@ -41,6 +43,21 @@ Finish **Space Setup** on the headset first, allow the camera when the page asks
 - Without a headset, `?preview=1` (or any browser without passthrough) runs the same material on a stand-in room. The wardrobe pulls apart on its own, and a webcam stands in for passthrough. `?preview=1&demo=push` loops a box pushed into the stand-in wall instead.
 - A small console panel at the upper left of the headset view shows the page's console: camera, photo and pull lines, warnings and errors. It is on under `npm run dev`; `?debug=0` hides it for recordings, `?debug=1` forces it on in a build.
 
+### Sorang
+
+Pick **Sorang** on the 2D page. The card folds down to a **Show card** button and the painting plays in the window.
+
+- It opens as the clean painting, 1.83 m square, filling most of the window. Then the bright paint pushes toward you and the edges between near and far break into stepped slits.
+- The relief snaps onto 100 sheets, one per band of depth, and they fan about 0.6 m toward you, nearest first, while the view swings about 20° to the side so you see them as layers. A bright contour sweeps from the nearest sheet to the farthest, and behind it each tile turns out to be a stock photo, darkened or lightened to match the paint. From the front it still reads as the painting.
+- Then the tiles burst outward from a point behind the centre, nearest sheets first, and settle into slow orbits around you with fine dust and a few faint lines. About 3% fly three times larger.
+- Click the window or press **R** to bring the pieces back to the painting, and again to send them out. Space pauses, Esc shows or hides the card, and moving the mouse shifts the view a little so the depth shows.
+- **Load image** plays any JPEG, PNG or WebP instead. Its depth comes from the in-browser model, which downloads the first time (about 25 MB), so it waits on the flat picture until depth arrives. If the model can't load, brightness stands in for depth.
+- The default painting's depth is baked, so it never needs the model. Depth Anything reads a photo of a flat painting as a tilted card, so where a flat plane explains nearly all of the depth Sorang removes the tilt and lets brightness carry most of the relief: bright paint stands forward. Real photos keep the model's depth.
+- With reduced motion the view doesn't swing or sway, the burst is shorter and the orbits are slow.
+- `?mode=sorang` opens straight into it. `?sorangT=<seconds>` freezes the timeline at that moment (no parallax or sway), and `?ui=0` hides the card, for repeatable screenshots. `window.__sorang` has `seek`, `freeze`, `reform`, `stage` and `stats()` for tests.
+
+Assets: `public/sorang/painting.jpg` is the painting, perspective-cropped from a screenshot by `scripts/sorang/crop_painting.py`. Its depth was baked with `node scripts/bake-depth/bake.mjs public/sorang/painting.jpg public/depth/sorang-painting --size 512` (stills skip ffmpeg). `public/sorang/photos.jpg` and `photos.json` are 100 photos from [Lorem Picsum](https://picsum.photos), by Unsplash photographers under the Unsplash License, built by `scripts/sorang/build_atlas.py` with fixed seeds. `photos.json` credits each one.
+
 ## Tuning
 
 - `src/layout.ts`: stack size, strip length, touch and hover heights.
@@ -51,3 +68,4 @@ Finish **Space Setup** on the headset first, allow the camera when the page asks
 - Checking the hand cut: `?debug=1&occ=debug` shows the hand occluders 30% green, where the depth cut may act faint cyan, and what it cuts magenta instead of cutting it. `?debug=1&occ=delta` paints the real depth against the scanned room: white where they agree, red where the real surface is nearer, blue where it is farther, over 8 cm. The console keeps its `depth …`, `xr multiview …`, `camera pick …` and `lens …` lines on screen. `StretchLook` has the occluder lag as a developer trim.
 - Timing a pull: each pull prints two `onset` lines at release, with its first 12 frames: frame times, how long the photo freeze and that frame's update took, how far the surface had moved (cm) and the fade (0-9). A hitch is one long frame; a pop is a jump in D.
 - `MAX_LAYERS` in `src/frame-stack-system.ts`: raise it if the headset holds frame rate.
+- The `SorangLook` component (the "Sorang painting" node): painting size, tiles across (each one photo), dust, relief depth, radial push, slice fan, photo contrast, mouse parallax, pace and reform speed. The stage timings are in `src/sorang-timeline.ts`.

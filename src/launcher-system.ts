@@ -1,6 +1,6 @@
 import { CameraUtils, Quaternion, Vector3, VisibilityState, createSystem } from '@iwsdk/core';
 import { prepareDepthModel } from './depth-model.js';
-import { PREVIEW_FORCED, getMode, launchSession, setMode, type ExperienceMode } from './experience.js';
+import { PREVIEW_FORCED, getMode, isMode, launchSession, setMode, type ExperienceMode } from './experience.js';
 import {
   DEFAULT_CLIP_DEPTH,
   DEFAULT_CLIP_NAME,
@@ -15,6 +15,7 @@ import {
 } from './frame-sources.js';
 import { FrameStackSystem } from './frame-stack-system.js';
 import { RoomStretchSystem } from './room-stretch-system.js';
+import { SorangSystem } from './sorang-system.js';
 import { TableTouchSystem } from './table-touch-system.js';
 
 const NO_PASSTHROUGH = 'Open this page in the Meta Quest browser to use passthrough.';
@@ -24,6 +25,10 @@ const STRETCH_HINT = 'Round 7. Hold an open palm up to a wall, then push.';
 const STRETCH_CAMERA = 'Camera on. Push a palm into a wall, or pinch and pull.';
 const STRETCH_ASKING = 'Allow the camera so the pull can show your room.';
 const STRETCH_BLOCKED = 'Camera blocked. Allow it for this site so the pull can show your room.';
+const SORANG_HINT = 'Desktop preview. Headset support comes later.';
+const SORANG_TIP_MS = 4000;
+
+const TITLES: Record<ExperienceMode, string> = { stack: 'Frame stack', stretch: 'Jonze stretch', sorang: 'Sorang' };
 
 /** Wires the 2D launch card in index.html: pick a clip and a sample rate, then enter passthrough. */
 export class LauncherSystem extends createSystem({}) {
@@ -38,6 +43,12 @@ export class LauncherSystem extends createSystem({}) {
   private readonly previewPos = new Vector3();
   private readonly previewQuat = new Quaternion();
   private previewSaved = false;
+  /** Sorang plays behind a collapsed card; the chip or Esc opens it. */
+  private cardOpen = true;
+  private immersive = false;
+  private readonly uiOff = typeof location !== 'undefined' && new URLSearchParams(location.search).get('ui') === '0';
+  private tipShown = false;
+  private tipTimer = 0;
 
   init(): void {
     const stack = this.world.getSystem(FrameStackSystem)!;
@@ -61,6 +72,16 @@ export class LauncherSystem extends createSystem({}) {
     }
     const touch = this.world.getSystem(TableTouchSystem)!;
     const stretch = this.world.getSystem(RoomStretchSystem)!;
+    const sorang = this.world.getSystem(SorangSystem)!;
+    // Optional, so a page from before Sorang still runs the other two modes.
+    const modeSorang = document.getElementById('modeSorang');
+    const sorangPanel = document.getElementById('sorangPanel');
+    const sorangSource = document.getElementById('sorangSource');
+    const imageBtn = document.getElementById('imageBtn');
+    const playBtn = document.getElementById('playBtn');
+    const imageFile = document.getElementById('imageFile') as HTMLInputElement | null;
+    const cardBtn = document.getElementById('cardBtn');
+    const tip = document.getElementById('sorangTip');
     const version = document.getElementById('stretchVersion');
     if (version) {
       version.textContent =
@@ -76,6 +97,11 @@ export class LauncherSystem extends createSystem({}) {
     let depthReady = false;
     let depthNote = DEPTH_WAIT;
     const syncEnter = () => {
+      if (getMode() === 'sorang') {
+        enter.disabled = true;
+        hint.textContent = SORANG_HINT;
+        return;
+      }
       const stackMode = getMode() === 'stack';
       const depthOk = !stackMode || depthReady || !stack.needsDepthModel;
       const cameraOk = stackMode || !this.cameraAsking;
@@ -85,20 +111,64 @@ export class LauncherSystem extends createSystem({}) {
       else if (stackMode && !depthOk) hint.textContent = depthNote;
       else hint.textContent = stackMode ? placeHint : this.stretchHint;
     };
+    let defaultOpened = false;
+    const openDefaultOnce = () => {
+      if (defaultOpened) return;
+      defaultOpened = true;
+      void this.openDefault(stack, rate, source);
+    };
+    const syncCard = () => {
+      const sorangMode = getMode() === 'sorang';
+      launch.hidden = this.immersive || (sorangMode && (!this.cardOpen || this.uiOff));
+      if (cardBtn) cardBtn.hidden = this.immersive || !sorangMode || this.cardOpen || this.uiOff;
+      if (tip && (!sorangMode || this.uiOff || this.immersive)) tip.hidden = true;
+    };
+    const renderSorang = () => {
+      if (sorangSource) sorangSource.textContent = sorang.status().text;
+      const drifting = sorang.stage === 'drift' || sorang.stage === 'orbit';
+      if (!tip || this.tipShown || this.uiOff || getMode() !== 'sorang' || !drifting) return;
+      this.tipShown = true;
+      tip.hidden = false;
+      clearTimeout(this.tipTimer);
+      this.tipTimer = window.setTimeout(() => {
+        tip.hidden = true;
+      }, SORANG_TIP_MS);
+    };
+    const tabs: ReadonlyArray<readonly [ExperienceMode, HTMLElement | null]> = [
+      ['stack', modeStack],
+      ['stretch', modeStretch],
+      ['sorang', modeSorang],
+    ];
     const applyMode = (mode: ExperienceMode) => {
+      const was = getMode();
       setMode(mode);
-      const stackMode = mode === 'stack';
-      document.title = stackMode ? 'Frame stack' : 'Jonze stretch';
+      document.title = TITLES[mode];
       const title = document.getElementById('title');
-      if (title) title.textContent = stackMode ? 'Frame stack' : 'Jonze stretch';
-      stackPanel.hidden = !stackMode;
-      stretchPanel.hidden = stackMode;
-      load.hidden = !stackMode;
-      modeStack.setAttribute('aria-selected', stackMode ? 'true' : 'false');
-      modeStretch.setAttribute('aria-selected', stackMode ? 'false' : 'true');
+      if (title) title.textContent = TITLES[mode];
+      stackPanel.hidden = mode !== 'stack';
+      stretchPanel.hidden = mode !== 'stretch';
+      if (sorangPanel) sorangPanel.hidden = mode !== 'sorang';
+      load.hidden = mode !== 'stack';
+      if (imageBtn) imageBtn.hidden = mode !== 'sorang';
+      if (playBtn) playBtn.hidden = mode !== 'sorang';
+      enter.hidden = mode === 'sorang';
+      for (const [m, tab] of tabs) tab?.setAttribute('aria-selected', m === mode ? 'true' : 'false');
       this.applyPreview(mode);
-      if (!stackMode) this.armStretchCamera(stretch, syncEnter);
-      if (stackMode) requestDepthModel();
+      if (mode === 'stretch') this.armStretchCamera(stretch, syncEnter);
+      if (mode === 'stack') {
+        openDefaultOnce();
+        requestDepthModel();
+      }
+      if (mode === 'sorang') {
+        // The painting plays behind a collapsed card; a second click on the tab doesn't restart it.
+        if (was !== 'sorang') this.tipShown = false;
+        this.cardOpen = false;
+      } else {
+        this.cardOpen = true;
+        if (tip) tip.hidden = true;
+      }
+      syncCard();
+      renderSorang();
       syncEnter();
     };
     const requestDepthModel = () => {
@@ -140,6 +210,7 @@ export class LauncherSystem extends createSystem({}) {
       if (f) void this.open(f, stack, rate, source);
     };
     const onEnter = () => {
+      if (getMode() === 'sorang') return; // desktop only for now
       touch.unlockAudio(); // this click is the gesture that lets scrub ticks play in the headset
       const stretchMode = getMode() === 'stretch';
       if (stretchMode) {
@@ -150,12 +221,48 @@ export class LauncherSystem extends createSystem({}) {
     };
     const onStack = () => applyMode('stack');
     const onStretch = () => applyMode('stretch');
+    const onSorang = () => applyMode('sorang');
+    const onImage = () => {
+      // Start the model download while the picker is open; a loaded picture needs it.
+      prepareDepthModel().catch(() => {});
+      imageFile?.click();
+    };
+    const onImageFile = () => {
+      const f = imageFile?.files?.[0];
+      if (imageFile) imageFile.value = '';
+      if (!f) return;
+      if (f.type && !f.type.startsWith('image/')) {
+        this.toast(`${f.name} isn’t an image file.`);
+        return;
+      }
+      void sorang.useImage(f);
+    };
+    const onPlay = () => {
+      sorang.restart();
+      this.cardOpen = false;
+      syncCard();
+    };
+    const onCard = () => {
+      this.cardOpen = true;
+      syncCard();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.code !== 'Escape' || e.repeat || getMode() !== 'sorang') return;
+      this.cardOpen = !this.cardOpen;
+      syncCard();
+    };
     rate.addEventListener('change', onRate);
     load.addEventListener('click', onLoad);
     file.addEventListener('change', onFile);
     enter.addEventListener('click', onEnter);
     modeStack.addEventListener('click', onStack);
     modeStretch.addEventListener('click', onStretch);
+    modeSorang?.addEventListener('click', onSorang);
+    imageBtn?.addEventListener('click', onImage);
+    imageFile?.addEventListener('change', onImageFile);
+    playBtn?.addEventListener('click', onPlay);
+    cardBtn?.addEventListener('click', onCard);
+    window.addEventListener('keydown', onKey);
     const params = new URLSearchParams(location.search);
     const lensOn = params.get('lens') === 'overlay';
     const handsOn = params.get('occ') === 'debug';
@@ -163,7 +270,9 @@ export class LauncherSystem extends createSystem({}) {
     const pushDemo = params.get('demo') === 'push';
     const checkId = lensOn ? 'checkLens' : handsOn ? 'checkHands' : consoleOn ? 'checkConsole' : '';
     if (checkId) document.getElementById(checkId)?.setAttribute('aria-current', 'page');
-    if (lensOn || handsOn || consoleOn || pushDemo) applyMode('stretch');
+    const modeParam = params.get('mode');
+    if (isMode(modeParam)) applyMode(modeParam);
+    else if (lensOn || handsOn || consoleOn || pushDemo) applyMode('stretch');
 
     if (this.world.xrEnabled && navigator.xr) {
       navigator.xr.isSessionSupported('immersive-ar').then(
@@ -182,12 +291,21 @@ export class LauncherSystem extends createSystem({}) {
       syncEnter();
     }
 
-    void this.openDefault(stack, rate, source);
+    // Sorang doesn't need the clip; slicing it in the background would only cost frames.
+    if (getMode() !== 'sorang') openDefaultOnce();
 
     this.cleanupFuncs.push(
       stack.onChange(render),
+      sorang.onChange(renderSorang),
+      sorang.onMessage((message) => {
+        this.toast(message);
+        if (getMode() !== 'sorang') return;
+        this.cardOpen = true;
+        syncCard();
+      }),
       this.visibilityState.subscribe((state) => {
-        launch.hidden = state !== VisibilityState.NonImmersive;
+        this.immersive = state !== VisibilityState.NonImmersive;
+        syncCard();
       }),
       () => {
         rate.removeEventListener('change', onRate);
@@ -196,6 +314,13 @@ export class LauncherSystem extends createSystem({}) {
         enter.removeEventListener('click', onEnter);
         modeStack.removeEventListener('click', onStack);
         modeStretch.removeEventListener('click', onStretch);
+        modeSorang?.removeEventListener('click', onSorang);
+        imageBtn?.removeEventListener('click', onImage);
+        imageFile?.removeEventListener('change', onImageFile);
+        playBtn?.removeEventListener('click', onPlay);
+        cardBtn?.removeEventListener('click', onCard);
+        window.removeEventListener('keydown', onKey);
+        clearTimeout(this.tipTimer);
         if (this.video) disposeVideo(this.video);
       },
     );
@@ -296,6 +421,7 @@ export class LauncherSystem extends createSystem({}) {
       this.previewQuat.copy(cam.quaternion);
       this.previewSaved = true;
     }
+    if (mode === 'sorang') return; // SorangSystem places the camera itself
     if (mode === 'stretch') {
       cam.position.set(0.25, 1.6, 2.5);
       cam.lookAt(0, 1, -1.7);
