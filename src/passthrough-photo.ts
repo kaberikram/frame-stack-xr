@@ -1085,15 +1085,32 @@ export class PassthroughPhoto {
     this.pendingFill[k] = null;
     let best: BankEntry | null = null;
     let bestScore = 0;
+    const main = this.slots[k].toClip;
     for (let i = 0; i < this.bank.length; i++) {
       const entry = this.bank[i];
       if (!entry.used || entry === except) continue;
-      const center = footprintMargin(entry.toClip, footprint, 1);
-      if (center < 0.02) continue;
-      // freeze() left the grab spot's inner ring in `inner`.
-      if (except === null && this.handsOn(entry, this.inner, count)) continue;
       const age = now - entry.time;
-      const score = center / ((1 + age / 6) * (1 + entry.cam.distanceTo(eye) / BASE_HALF));
+      let score: number;
+      if (this.wholeClean) {
+        // Something wider than one frame (a pushed-in box): the frame that covers the most of it the
+        // photo misses, clean over all of it, the newest first among equals.
+        if (this.handsOn(entry, this.inner, count)) continue;
+        let gain = 0;
+        for (let p = 0; p < count; p++) {
+          const x = footprint[p * 3];
+          const y = footprint[p * 3 + 1];
+          const z = footprint[p * 3 + 2];
+          if (uvMargin(entry.toClip, x, y, z) >= FILL_REACH && uvMargin(main, x, y, z) < FILL_REACH) gain++;
+        }
+        if (gain === 0) continue;
+        score = gain + 1 / (1 + age);
+      } else {
+        const center = footprintMargin(entry.toClip, footprint, 1);
+        if (center < 0.02) continue;
+        // freeze() left the grab spot's inner ring in `inner`.
+        if (except === null && this.handsOn(entry, this.inner, count)) continue;
+        score = center / ((1 + age / 6) * (1 + entry.cam.distanceTo(eye) / BASE_HALF));
+      }
       if (score > bestScore) {
         bestScore = score;
         best = entry;
@@ -1415,6 +1432,9 @@ function footprintSpread(clip: Matrix4, points: Float32Array, count: number): nu
   }
   return far;
 }
+
+/** A footprint point counts as covered by a frame this far (uv) inside its edge, for choosing a fill by coverage. */
+const FILL_REACH = 0.02;
 
 /** Samples per side of the grid laid over a footprint's area in the frame, for touchesHandsArea. */
 const AREA_GRID = 9;
