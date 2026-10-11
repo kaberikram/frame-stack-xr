@@ -199,6 +199,27 @@ export class StretchSound {
     this.release(h, slot, now);
   }
 
+  /**
+   * Takes hold of a still voice at `pull` (a box taken in hand again where it rests): the hum at the
+   * step it stands on, without the strum or a climb to get there.
+   */
+  resume(slot: SoundSlot, pull: number, x: number, y: number, z: number): void {
+    const ctx = this.running();
+    const h = this.hands[slot];
+    if (!ctx || !h.out || h.phase === 'held') return;
+    const now = ctx.currentTime;
+    this.place(h, now, x, y, z);
+    this.cancelPending(slot, now);
+    let step = 0;
+    while (step < TOP && pull >= (step + 1) * STEP + BAND) step++;
+    h.phase = 'held';
+    h.step = step;
+    h.pull = pull;
+    h.lastNote = now;
+    h.glint = false;
+    this.startHum(h, now);
+  }
+
   /** A pinch that found nothing to grab. */
   miss(slot: SoundSlot, x: number, y: number, z: number): void {
     const ctx = this.running();

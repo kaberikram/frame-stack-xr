@@ -34,7 +34,7 @@ import { RoomPlanes, type PlaneHit, type PlaneMiss } from './room-planes.js';
 import { StretchLook } from './stretch-component.js';
 import { Spring, averageNormal, buildTriGrid, rayTriGrid, triangleNormal, type RayHit, type TriGrid } from './stretch-math.js';
 import { Stillness } from './touch-logic.js';
-import type { RubberUniformSet } from './stretch-material.js';
+import { BOX_SKIN, type RubberUniformSet } from './stretch-material.js';
 import { StretchSound } from './stretch-sound.js';
 
 type Side = 'left' | 'right';
@@ -199,8 +199,8 @@ const PUSH_KICK = 0.15;
 const PUSH_OUT_STIFF = 250;
 const PUSH_OUT_DAMP = 16;
 const PUSH_COOL = 0.4;
-/** A pinch on the box springs it back out, unless the mesh under it is this much nearer (something in front). */
-const PUSH_UNDO_NEARER = 0.1;
+/** A box resting on a live photo (the palm cut out of it) looks for a clean bank photo this often. */
+const PUSH_SWAP = 0.5;
 /**
  * A table or floor bursts only when the hand leaves it nearly straight off: the off-surface share of
  * the hand's travel ramps from 0.8 (37° off the normal) to full at 0.95 (18°). Pulling a table edge
@@ -407,6 +407,8 @@ interface PalmTrack {
   readonly still: Stillness;
   /** Must close (or leave the pose) before it can arm again. */
   latch: boolean;
+  /** How long it has not been an open palm: the latch lets go only after a moment of it. */
+  closedT: number;
   coolUntil: number;
   /** The wall under it, for arming. */
   readonly hit: Vector3;
@@ -422,7 +424,7 @@ interface PalmTrack {
 function makePalmTrack(side: Side): PalmTrack {
   return {
     side, pose: makePalmPose(), valid: false, open: false, keep: false,
-    still: new Stillness(PALM_STILL_RADIUS, PALM_STILL_HOLD), latch: false, coolUntil: 0,
+    still: new Stillness(PALM_STILL_RADIUS, PALM_STILL_HOLD), latch: false, closedT: 0, coolUntil: 0,
     hit: new Vector3(), n: new Vector3(0, 0, 1), dist: 0, plane: -1, why: '', openSince: -1, whyLogged: false,
     hold: { on: false, ray0: new Vector3(), reach0: 0.4, depth0: 0, gain: 1, curlT: 0, turnT: 0, lostT: 0, leaveT: 0, onset: -1 },
   };
@@ -439,6 +441,13 @@ interface BoxState {
   readonly N: Vector3;
   hw: number;
   hh: number;
+  /** The size laid out on the wall, before any photo shrank it: each photo attempt starts from it. */
+  hw0: number;
+  hh0: number;
+  fit0: number;
+  /** Where the arming palm's line of sight met the wall, and how far below it the gaze met it. */
+  readonly hit: Vector3;
+  bias: number;
   dist: number;
   /** How much of its first size it kept, after the wall's outline and the photo. */
   fit: number;
@@ -460,6 +469,8 @@ interface BoxState {
   /** Recent depth targets, for the look-back when let go. */
   readonly ringT: Float32Array;
   readonly ringD: Float32Array;
+  /** Which palm led each sample: 0 left, 1 right, 2 neither. */
+  readonly ringL: Uint8Array;
   ringHead: number;
 }
 
@@ -740,9 +751,9 @@ export class RoomStretchSystem extends createSystem({
   private readonly palms: Record<Side, PalmTrack> = { left: makePalmTrack('left'), right: makePalmTrack('right') };
   private readonly box: BoxState = {
     phase: 'none', side: 'right', C: new Vector3(), U: new Vector3(1, 0, 0), V: new Vector3(0, 1, 0), N: new Vector3(0, 0, 1),
-    hw: 0.3, hh: 0.24, dist: 2, fit: 1, plane: -1, spring: new Spring(), depthTo: 0, target: 0, peak: 0, fade: 0,
+    hw: 0.3, hh: 0.24, hw0: 0.3, hh0: 0.24, fit0: 1, hit: new Vector3(), bias: 0, dist: 2, fit: 1, plane: -1, spring: new Spring(), depthTo: 0, target: 0, peak: 0, fade: 0,
     seekAt: 0, retryAt: 0, startAt: 0, restAt: 0, outStiff: 90, outDamp: 9, next: null,
-    ringT: new Float32Array(PUSH_RING).fill(-Infinity), ringD: new Float32Array(PUSH_RING), ringHead: 0,
+    ringT: new Float32Array(PUSH_RING).fill(-Infinity), ringD: new Float32Array(PUSH_RING), ringL: new Uint8Array(PUSH_RING), ringHead: 0,
   };
   private readonly pushFootprint = new Float32Array(PUSH_FOOTPRINT * 3);
   private readonly gaze = new Vector3(0, 0, -1);
@@ -1583,8 +1594,8 @@ export class RoomStretchSystem extends createSystem({
   /** Every presenting frame, before pinches resolve: read both palms, then move the box along. */
   private stepPush(dt: number, now: number): void {
     this.gaze.set(0, 0, -1).applyQuaternion(this.headQuat);
-    this.readPalmTrack(this.palms.left, now);
-    this.readPalmTrack(this.palms.right, now);
+    this.readPalmTrack(this.palms.left, dt, now);
+    this.readPalmTrack(this.palms.right, dt, now);
     const box = this.box;
     switch (box.phase) {
       case 'none':
@@ -1605,6 +1616,9 @@ export class RoomStretchSystem extends createSystem({
           for (const side of SIDES) {
             const track = this.palms[side];
             if (!track.hold.on && this.candidate(track, dt, now) === 'box') {
+              // Both palms start from where the box is now, so either one moves it from there.
+              const other = this.palms[side === 'left' ? 'right' : 'left'];
+              if (other.hold.on && other.valid) this.rebaseHold(other, box.depthTo);
               this.startHold(track, now, box.depthTo, 'join');
             }
           }
@@ -1612,6 +1626,7 @@ export class RoomStretchSystem extends createSystem({
         break;
       case 'rest':
         box.spring.step(box.target, dt, this.look.stiffness, this.look.damping);
+        this.swapPhoto(now);
         for (const side of SIDES) {
           const kind = this.candidate(this.palms[side], dt, now);
           if (kind === 'box') {
@@ -1641,7 +1656,7 @@ export class RoomStretchSystem extends createSystem({
   }
 
   /** Reads one hand's palm and whether it is open toward a wall in front of your eyes. */
-  private readPalmTrack(track: PalmTrack, now: number): void {
+  private readPalmTrack(track: PalmTrack, dt: number, now: number): void {
     const j = this.joints;
     const right = track.side === 'right';
     const count = right ? j.rightCount : j.leftCount;
@@ -1664,12 +1679,15 @@ export class RoomStretchSystem extends createSystem({
         toPalm.dot(this.gaze) > PALM_CONE;
     }
     if (!track.open) {
-      track.latch = false;
+      // A finger dipping under straight for a frame is not a closed hand.
+      track.closedT += dt;
+      if (track.closedT > PUSH_CURL) track.latch = false;
       track.still.reset();
       track.openSince = -1;
       track.whyLogged = false;
-    } else if (track.openSince < 0) {
-      track.openSince = now;
+    } else {
+      track.closedT = 0;
+      if (track.openSince < 0) track.openSince = now;
     }
   }
 
@@ -1737,13 +1755,19 @@ export class RoomStretchSystem extends createSystem({
     box.hh = PUSH_ASPECT * half;
     box.fit = 1;
     // The camera sees little above your gaze: a palm raised high centres the box nearer the gaze.
+    box.hit.copy(C);
+    box.bias = 0;
     const along = this.gaze.dot(N);
     if (along < -1e-3) {
       const t = this.tmpA.copy(C).sub(this.head).dot(N) / along;
       const below = this.tmpA.copy(this.head).addScaledVector(this.gaze, t).sub(C).dot(V);
-      if (t > 0 && below < 0) C.addScaledVector(V, Math.max(below, -PUSH_BIAS * box.hh));
+      if (t > 0 && below < 0) box.bias = -below;
     }
+    this.centreBox();
     this.fitBox((p) => this.onPlane(p));
+    box.hw0 = box.hw;
+    box.hh0 = box.hh;
+    box.fit0 = box.fit;
     if (box.hw < PUSH_HALF_FLOOR || box.hh < PUSH_HALF_FLOOR) {
       console.info(`[jonze] push ${track.side === 'left' ? 'L' : 'R'}? edge ${(2 * box.hw).toFixed(2)}x${(2 * box.hh).toFixed(2)}`);
       track.latch = true;
@@ -1777,8 +1801,18 @@ export class RoomStretchSystem extends createSystem({
       if (!uOut && !vOut) break;
       if (uOut) box.hw *= PUSH_SHRINK;
       if (vOut) box.hh *= PUSH_SHRINK;
+      this.centreBox();
     }
     box.fit *= Math.min(box.hw / w0, box.hh / h0);
+  }
+
+  /**
+   * The box's centre: the arming palm's hit, moved toward the gaze's by up to PUSH_BIAS of its
+   * height. Kept that way as it shrinks, so the palm that armed it is always on it.
+   */
+  private centreBox(): void {
+    const box = this.box;
+    box.C.copy(box.hit).addScaledVector(box.V, -Math.min(box.bias, PUSH_BIAS * box.hh));
   }
 
   /** On the wall's detected outline, PUSH_EDGE in from its edge. Any point counts when the wall has none. */
@@ -1821,17 +1855,24 @@ export class RoomStretchSystem extends createSystem({
     }
     if (now < box.retryAt) return;
     box.retryAt = now + PUSH_RETRY;
+    // Every attempt starts from the size laid out on the wall: a failed one leaves nothing behind.
+    box.hw = box.hw0;
+    box.hh = box.hh0;
+    box.fit = box.fit0;
+    this.centreBox();
     const liveOk = now - box.seekAt >= PUSH_LIVE_AFTER;
     const t0 = performance.now();
     let frozen = false;
     for (let i = 0; i < (liveOk ? 1 : PUSH_SCALES.length) && !frozen; i++) {
       const scale = PUSH_SCALES[i];
+      if (scale * Math.min(box.hw0, box.hh0) < PUSH_HALF_FLOOR) break;
       this.writePushFootprint(scale);
       frozen = this.photo.freeze(2, this.pushFootprint, PUSH_FOOTPRINT, true, this.camera, now, this.handJoints(), this.head, liveOk, Infinity);
       if (frozen && scale < 1) {
         box.hw *= scale;
         box.hh *= scale;
         box.fit *= scale;
+        this.centreBox();
       }
     }
     if (frozen) {
@@ -1851,6 +1892,7 @@ export class RoomStretchSystem extends createSystem({
         box.startAt = now;
         box.ringHead = 0;
         box.ringT.fill(-Infinity);
+        box.retryAt = now + PUSH_SWAP;
         this.startHold(track, now, PUSH_GIVE, '');
         return;
       }
@@ -1864,15 +1906,25 @@ export class RoomStretchSystem extends createSystem({
     }
   }
 
+  /**
+   * A box resting on a live photo has the arming palm cut out of it. Once your hand is down the bank
+   * fills with clean frames again: the first one that covers the box replaces it.
+   */
+  private swapPhoto(now: number): void {
+    const box = this.box;
+    if (!this.photo.slots[2].live || now < box.retryAt) return;
+    box.retryAt = now + PUSH_SWAP;
+    this.writePushFootprint(1);
+    if (this.photo.freeze(2, this.pushFootprint, PUSH_FOOTPRINT, true, this.camera, now, this.handJoints(), this.head, false, Infinity)) {
+      console.info(`[jonze] ${this.photo.pickLine(2)}, swapped in`);
+    }
+  }
+
   /** A palm takes hold of the box: its push is measured from here, adding to `depth0`. */
   private startHold(track: PalmTrack, now: number, depth0: number, note: string): void {
     const box = this.box;
     const hold = track.hold;
-    const toPalm = hold.ray0.copy(track.pose.centre).sub(this.head);
-    hold.reach0 = toPalm.length();
-    toPalm.multiplyScalar(1 / Math.max(hold.reach0, 1e-6));
-    hold.gain = (PUSH_GAIN * box.dist) / Math.max(0.25, hold.reach0);
-    hold.depth0 = depth0;
+    this.rebaseHold(track, depth0);
     hold.curlT = 0;
     hold.turnT = 0;
     hold.lostT = 0;
@@ -1884,7 +1936,19 @@ export class RoomStretchSystem extends createSystem({
     box.side = track.side;
     box.depthTo = depth0;
     this.pinched = true;
+    // Taking hold of a box already in: its voice picks up where it stands, no climb to get there.
+    if (note === 'rearm') this.sound.resume(2, box.spring.value / Math.max(0.5, box.dist), box.C.x, box.C.y, box.C.z);
     if (note) console.info(`[jonze] push ${track.side === 'left' ? 'L' : 'R'} ${note} ${short(depth0)}m`);
+  }
+
+  /** A holding palm's push measured afresh from here (its line of sight, its reach), adding to `depth0`. */
+  private rebaseHold(track: PalmTrack, depth0: number): void {
+    const hold = track.hold;
+    const toPalm = hold.ray0.copy(track.pose.centre).sub(this.head);
+    hold.reach0 = toPalm.length();
+    toPalm.multiplyScalar(1 / Math.max(hold.reach0, 1e-6));
+    hold.gain = (PUSH_GAIN * this.box.dist) / Math.max(0.25, hold.reach0);
+    hold.depth0 = depth0;
   }
 
   private stepHeld(dt: number, now: number): void {
@@ -1892,6 +1956,7 @@ export class RoomStretchSystem extends createSystem({
     const cap = Math.min(PUSH_MAX, box.dist);
     let depthTo = box.depthTo;
     let lead = -1;
+    let leader = 2;
     for (const side of SIDES) {
       const track = this.palms[side];
       const hold = track.hold;
@@ -1913,6 +1978,10 @@ export class RoomStretchSystem extends createSystem({
       if (why) {
         this.letGo(track, now, why);
         if (box.phase !== 'held') return;
+        // The other palm was re-based at the depth this one left: carry on from there.
+        depthTo = box.depthTo;
+        lead = -1;
+        leader = 2;
         continue;
       }
       if (!track.valid) continue;
@@ -1923,11 +1992,13 @@ export class RoomStretchSystem extends createSystem({
       if (lean > lead) {
         lead = lean;
         depthTo = d;
+        leader = side === 'left' ? 0 : 1;
       }
     }
     box.depthTo = depthTo;
     box.ringT[box.ringHead] = now;
     box.ringD[box.ringHead] = depthTo;
+    box.ringL[box.ringHead] = leader;
     box.ringHead = (box.ringHead + 1) % PUSH_RING;
     const depth = box.spring.step(depthTo, dt, PUSH_STIFF, PUSH_DAMP);
     if (depth > box.peak) box.peak = depth;
@@ -1943,19 +2014,31 @@ export class RoomStretchSystem extends createSystem({
     const hold = track.hold;
     hold.on = false;
     track.latch = true;
+    const other = this.palms[track.side === 'left' ? 'right' : 'left'];
+    const alone = !other.hold.on;
+    const me = track.side === 'left' ? 0 : 1;
+    // What this palm did just before letting go began: a lowered or curling hand drifts first, so
+    // the box keeps where it was taking it. Deepest when it was pushing in, shallowest pulling out.
     const from = (hold.onset >= 0 ? hold.onset : now) - PUSH_LOOKBACK;
-    let target = 0;
-    let seen = false;
+    let deepest = -Infinity;
+    let shallowest = Infinity;
+    let first = Infinity;
+    let start = 0;
     for (let i = 0; i < PUSH_RING; i++) {
-      if (box.ringT[i] >= from) {
-        target = Math.max(target, box.ringD[i]);
-        seen = true;
+      if (box.ringT[i] < from || (!alone && box.ringL[i] !== me)) continue;
+      deepest = Math.max(deepest, box.ringD[i]);
+      shallowest = Math.min(shallowest, box.ringD[i]);
+      if (box.ringT[i] < first) {
+        first = box.ringT[i];
+        start = box.ringD[i];
       }
     }
-    if (!seen) target = box.depthTo;
-    const other = this.palms[track.side === 'left' ? 'right' : 'left'];
-    if (other.hold.on) {
-      // The other palm carries on from the depth this one left.
+    const seen = first < Infinity;
+    const outward = seen && start < hold.depth0 - 1e-3;
+    let target = !seen ? box.depthTo : outward ? shallowest : deepest;
+    if (!alone) {
+      // The other palm carries on from where it holds the box, unless this one had just taken it further.
+      target = !seen ? box.depthTo : outward ? Math.min(box.depthTo, target) : Math.max(box.depthTo, target);
       box.depthTo = target;
       this.startHold(other, now, target, '');
       return;
@@ -2042,12 +2125,11 @@ export class RoomStretchSystem extends createSystem({
     const box = this.box;
     if (box.phase !== 'held' && box.phase !== 'rest') return false;
     if (!this.boxHit(this.head, this.pinch, 0)) return false;
-    const toBox = this.boxT;
     if (this.raycast(this.head, this.pinch) && this.hitMesh) {
       this.hitMesh.updateWorldMatrix(true, false);
       const hit = this.tmpA.copy(this.localHit).applyMatrix4(this.hitMesh.matrixWorld);
-      // Something stands in front of the box: pinch that instead.
-      if (hit.distanceTo(this.head) < toBox - PUSH_UNDO_NEARER) return false;
+      // Something stands in front of the box (the room draws it there, past BOX_SKIN): pinch that instead.
+      if (hit.sub(box.C).dot(box.N) >= BOX_SKIN) return false;
     }
     this.pinched = true;
     this.startOut(performance.now() / 1000, `pinch ${grab.side === 'left' ? 'L' : 'R'}`, this.look.stiffness, this.look.damping);
@@ -2063,7 +2145,8 @@ export class RoomStretchSystem extends createSystem({
     }
     this.pushBox.place(box.C, box.U, box.hw, box.V, box.hh, box.N, box.spring.value);
     const slot = this.photo.slots[2];
-    box.fade = slot.has && slot.ready ? Math.min(1, box.fade + dt / FADE_IN) : 0;
+    // A swapped-in photo uploads while the box stays up: it never blinks out for it.
+    box.fade = !slot.has ? 0 : slot.ready ? Math.min(1, box.fade + dt / FADE_IN) : box.fade;
     this.pushBox.writePhoto(slot, box.fade);
   }
 
@@ -2114,6 +2197,11 @@ export class RoomStretchSystem extends createSystem({
       box.N.set(0, 0, 1);
       box.hw = 0.28;
       box.hh = 0.22;
+      box.hw0 = box.hw;
+      box.hh0 = box.hh;
+      box.fit0 = 1;
+      box.hit.copy(box.C);
+      box.bias = 0;
       box.dist = box.C.distanceTo(this.head);
       box.fit = 1;
       box.plane = -1;

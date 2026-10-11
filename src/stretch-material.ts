@@ -143,11 +143,13 @@ float taffyBehind(float t, float ramp) {
 /**
  * A pushed-in box: the room over its opening is not drawn, so the box shows through it, from this far
  * in front of the wall to this far behind the box's back. A picture frame goes in with the wall; a
- * shelf, or anyone in front of it, stays and hides the box behind.
+ * shelf, or anyone in front of it, stays and hides the box behind (and a pinch there grabs it).
  */
+export const BOX_SKIN = 0.06;
+
 const BOX_HOLE = /* glsl */ `
 #ifdef BOX_HOLE
-const float BOX_SKIN = 0.06;
+const float BOX_SKIN = ${BOX_SKIN.toFixed(3)};
 // The opening stops this far short of the box's rim, so the room overlaps it: a pixel the rim's edge
 // only grazes is still the wall, never a crack.
 const float BOX_LIP = 0.004;
@@ -567,15 +569,17 @@ float realDepth() {
  * tracked hand, and only where the real surface is at that hand's depth: a mug or a lamp beside
  * the hand is in front of the room too, but it is not the hand.
  */
-float handOcclusion(vec3 world, out float gate) {
+// \`viewZ\` is where the surface sits for the in-front test: the drawn point for the room, but the
+// wall itself for a pushed-in box, which is drawn behind the real wall everywhere.
+float handOcclusion(vec3 world, float viewZ, out float gate) {
   float handZ;
   float band;
   gate = handGate(world, handZ, band);
   if (gate <= 0.0 || uDepthOn < 0.5) return 0.0;
   float real = realDepth();
   float atHand = 1.0 - smoothstep(band, band + 0.02, abs(real - handZ));
-  float margin = 0.01 + 0.02 * vViewZ;
-  return gate * atHand * smoothstep(margin, margin + 0.02, vViewZ - real);
+  float margin = 0.01 + 0.02 * viewZ;
+  return gate * atHand * smoothstep(margin, margin + 0.02, viewZ - real);
 }
 
 /**
@@ -664,7 +668,8 @@ void main() {
   vec3 nr = cross(dFdx(vRest), dFdy(vRest));
 #ifdef BOX_HOLE
   // Only in its own program: a discard anywhere in a shader costs every pinch its early depth test.
-  if (inBoxOpening(vRest)) discard;
+  // Cloth pinched out of the opening draws where it went; what is still there leaves it to the box.
+  if (inBoxOpening(vRest) && inBoxOpening(vWorld)) discard;
 #endif
 #endif
 
@@ -677,7 +682,16 @@ void main() {
     bool inside = lc.w > 1e-4 && luv.x >= 0.0 && luv.y >= 0.0 && luv.x <= 1.0 && luv.y <= 1.0;
     float stripe = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / LENS_STRIPE));
     // Discarded, not drawn clear: a clear stripe would still write depth and cut what is behind it.
-    if (!inside || stripe < 0.5) discard;
+    // With a box pushed in that depth is wanted: it keeps the box's outside hidden behind the wall.
+    if (!inside || stripe < 0.5) {
+#ifdef BOX_HOLE
+      if (uBoxOn > 0.5) {
+        gl_FragColor = vec4(0.0);
+        return;
+      }
+#endif
+      discard;
+    }
     writeColor(sRGBTransferEOTF(texture(uLive, luv)).rgb, 1.0);
     return;
   }
@@ -763,10 +777,15 @@ void main() {
 #ifdef ENV_DEPTH
   float gate = 0.0;
   float occ = 0.0;
+#ifdef BOX
+  float refZ = -(viewMatrix * vec4(vRest, 1.0)).z;
+#else
+  float refZ = vViewZ;
+#endif
   vec4 dbg = vec4(0.0);
   // Developer views draw wherever the room is, moved or not. Otherwise only moved points are tested.
   if (uOccDebug > 0.5) {
-    occ = handOcclusion(vWorld, gate);
+    occ = handOcclusion(vWorld, refZ, gate);
     dbg = occDebug(vWorld, occ, gate);
     if (alpha < 0.002 && dbg.a > 0.002) {
       writeColor(dbg.rgb, dbg.a);
@@ -795,7 +814,7 @@ void main() {
 #ifdef ENV_DEPTH
   // Debug views paint the cut instead of cutting.
   if (uOccDebug < 0.5) {
-    occ = handOcclusion(vWorld, gate);
+    occ = handOcclusion(vWorld, refZ, gate);
     alpha *= 1.0 - occ;
   }
 #endif
