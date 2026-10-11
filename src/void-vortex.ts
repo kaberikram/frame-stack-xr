@@ -100,8 +100,8 @@ function buildVortex(): BufferGeometry {
   };
   for (let i = 0; i <= RING_SEG; i++) {
     const angle = ((i % RING_SEG) / RING_SEG) * Math.PI * 2;
-    ring(0.034, angle);
-    ring(0.045, angle);
+    ring(0.038, angle);
+    ring(0.044, angle);
   }
   for (let i = 0; i < RING_SEG; i++) {
     const a = i * 2;

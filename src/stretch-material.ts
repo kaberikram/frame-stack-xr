@@ -1186,13 +1186,13 @@ void main() {
     vec3 fromHead = q - uHead;
     float headGap = length(fromHead);
     if (headGap < HEAD_CLEAR) q = uHead + (headGap > 1.0e-4 ? fromHead / headGap : -uAim) * HEAD_CLEAR;
-    vec3 toGo = uHole - q;
-    float left = length(toGo);
-    vec3 heading = left > 1.0e-4 ? toGo / left : uAim;
-    float size = smoothstep(0.0, 0.15, left);
+    float left = length(uHole - q);
+    float span0 = max(length(from), 0.25);
+    // Smaller the closer it is. The last half-metre is only a scrap, so it slips into the fist.
+    float approach = clamp(left / span0, 0.0, 1.0);
+    float size = pow(approach, 1.45) * smoothstep(0.02, 0.5, left);
     vec3 axis = normalize(fract(sin(vec3(seed * 91.3, seed * 47.7, seed * 13.1) + 1.0) * 43758.5453) - 0.5 + 1.0e-3);
     off = turn(position - c, axis, trip * 1.2);
-    off += heading * dot(off, heading) * (0.35 * smoothstep(0.72, 1.0, trip));
     off *= size;
   }
   world = q + off;
@@ -1390,8 +1390,8 @@ ${DEPTH_CUT}
 ${PHOTO}
 
 void main() {
-  float alpha = uSuck * 0.9;
-  vec3 col = vec3(0.62, 0.86, 1.0) * (0.35 + 0.65 * uSuck);
+  float alpha = uSuck * 0.22;
+  vec3 col = vec3(0.55, 0.72, 0.82) * 0.45;
 #ifdef ENV_DEPTH
   float gate = 0.0;
   float occ = handOcclusion(vRest, vViewZ, gate);
