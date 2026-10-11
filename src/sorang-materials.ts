@@ -238,7 +238,8 @@ export function tileMaterial(u: SorangUniforms): ShaderMaterial {
         float reveal = uPhotoOn * clamp((aTile.z - uScan + 4.0 * rnd(id, 16u)) / 6.0, 0.0, 1.0);
         float sheetShade = mix(1.0, mix(0.72, 1.0, sN), uFan * (1.0 - b));
         float gain = uShow * mix(1.0, uDim, w) * sheetShade * fogAt(P) * energy * energy;
-        float glow = uScanGain * exp(-pow((aTile.z - uScan) / 2.5, 2.0)) * (1.0 - b);
+        float scanD = (aTile.z - uScan) / 2.5; // squared by hand: pow() of a negative base is undefined
+        float glow = uScanGain * exp(-scanD * scanD) * (1.0 - b);
         vLook = vec3(reveal, gain, glow * gain);
 
         gl_Position = projectionMatrix * modelViewMatrix * vec4(corner, 1.0);

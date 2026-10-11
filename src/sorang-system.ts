@@ -37,7 +37,7 @@ import {
 } from './sorang-build.js';
 import { SorangLook } from './sorang-component.js';
 import { blankPhotos, createSorangUniforms, dustMaterial, linkMaterial, tileMaterial, voidMaterial, type SorangUniforms } from './sorang-materials.js';
-import { HOLD_AT, SLICES, SorangTimeline, createClocks, type SorangStage } from './sorang-timeline.js';
+import { HOLD_AT, SLICES, SorangTimeline, createClocks, type SorangGates, type SorangStage } from './sorang-timeline.js';
 
 const LOOK_KEYS = ['size', 'tiles', 'dust', 'relief', 'radial', 'fan', 'mosaic', 'parallax', 'pace', 'reformSpeed'] as const;
 type Look = Record<(typeof LOOK_KEYS)[number], number>;
@@ -108,10 +108,12 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
   private blank!: Texture;
   private readonly timeline = new SorangTimeline();
   private readonly clocks = createClocks();
+  private readonly gates: SorangGates = { ready: false };
   private readonly look: Look = { size: 1.83, tiles: 64, dust: 256, relief: 0.35, radial: 0.5, fan: 0.6, mosaic: 0.9, parallax: 0.15, pace: 1, reformSpeed: 3 };
   private readonly frozenAt = frozenFromUrl();
   private anchor: Entity | null = null;
   private onFallback = false;
+  private fallback: Entity | null = null;
   private active = false;
   private started = false;
   private atlasStarted = false;
@@ -131,6 +133,8 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
   private framesSinceBuild = 0;
   /** Bumped per image, so a slower load can't replace a newer picture. */
   private gen = 0;
+  /** Bumped per Load image pick, for the decode race only. */
+  private pick = 0;
   private depthTimer = 0;
   private atlasTimer = 0;
   private statusNow: SorangStatus = { text: 'Opening the painting', busy: true };
@@ -249,23 +253,26 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
 
   /** Swap in a picture the viewer picked; depth comes from the in-browser model. */
   async useImage(file: File): Promise<void> {
-    const gen = ++this.gen;
-    this.started = true;
-    this.startAtlas();
-    cancelDepth('sorang');
-    window.clearTimeout(this.depthTimer);
+    // Decode first: a file that won't decode must leave the current picture and its depth alone.
+    const pick = ++this.pick;
+    const before = this.statusNow;
     this.setStatus(`Opening ${file.name}`, true);
     let picked: Painting;
     try {
       picked = await decodeImageFile(file);
     } catch (err) {
-      if (gen !== this.gen) return;
+      if (pick !== this.pick) return;
       console.warn('[sorang] image decode failed', err);
       this.message(`Couldn’t decode ${file.name}. JPEG, PNG and WebP work in most browsers.`);
-      this.setStatus(this.builtText(), false);
+      this.setStatus(before.text, before.busy);
       return;
     }
-    if (gen !== this.gen) return;
+    if (pick !== this.pick) return;
+    const gen = ++this.gen;
+    this.started = true;
+    this.startAtlas();
+    cancelDepth('sorang');
+    window.clearTimeout(this.depthTimer);
     this.setPainting(picked);
     this.depth = null;
     this.pendingDepth = null;
@@ -306,8 +313,8 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     this.pauseWanted = false;
 
     const reduced = reduceMotion.matches;
-    const ready = this.gate.painting && this.gate.depth && this.gate.atlas && this.built;
-    this.timeline.update(dt, { ready }, this.look.pace, this.look.reformSpeed, reduced ? 0.2 : 1, this.clocks);
+    this.gates.ready = this.gate.painting && this.gate.depth && this.gate.atlas && this.built;
+    this.timeline.update(dt, this.gates, this.look.pace, this.look.reformSpeed, reduced ? 0.2 : 1, this.clocks);
     this.swayClock += dt;
     this.placeView(dt, reduced);
     this.syncUniforms(reduced);
@@ -326,8 +333,11 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     this.active = true;
     if (!this.anchor && !this.onFallback) {
       console.warn('[sorang] no SorangLook node in the scene; hanging the painting at the default spot');
-      this.root.position.copy(FALLBACK_POS);
-      this.scene.add(this.root);
+      const holder = new Group();
+      holder.add(this.root);
+      this.fallback = this.world.createTransformEntity(holder);
+      // After creation, so the position goes through the entity's Transform.
+      this.fallback.object3D?.position.copy(FALLBACK_POS);
       this.onFallback = true;
     }
     this.parallax.set(0, 0);
@@ -338,6 +348,8 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
 
   private leave(): void {
     this.active = false;
+    // Back to black now, so the launcher never sees a stale drift stage on re-entry.
+    this.restart();
     this.toggleWanted = false;
     this.pauseWanted = false;
     this.downId = -1;
@@ -355,6 +367,7 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
       if (gen !== this.gen || this.gate.depth) return;
       console.warn('[sorang] depth is slow; playing with shading for depth until it lands');
       this.gate.depth = true;
+      if (this.built) this.setStatus(this.builtText(), false);
     }, GATE_TIMEOUT_MS);
     const painting = loadPainting();
     painting.then(
@@ -374,6 +387,7 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
       .catch(async (err: unknown) => {
         console.warn('[sorang] baked depth unavailable, estimating instead', err);
         const p = await painting;
+        if (gen !== this.gen) throw new Error('cancelled'); // a picked image owns the 'sorang' estimate now
         const field = await estimateDepth(p.depth, 'sorang');
         this.offerDepth(field, gen, 'model');
       })
@@ -381,6 +395,7 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
         if (gen !== this.gen || (err instanceof Error && err.message === 'cancelled')) return;
         console.warn('[sorang] depth unavailable; shading stands in for depth', err);
         this.gate.depth = true;
+        if (this.built) this.setStatus(this.builtText(), false);
       });
   }
 
@@ -561,6 +576,8 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     const t = Math.tan((cam.fov * Math.PI) / 360);
     this.restD = Math.max(halfH / (FRAMING * t), halfW / (FRAMING * t * cam.aspect));
     U.uOrbitL.value.set(0, 0, this.restD - 1);
+    // Fog only for pieces beyond the painting: a narrow window or a big painting sits further back.
+    U.uFogStart.value = Math.max(2.5, this.restD + 0.1);
     this.root.updateWorldMatrix(true, false);
 
     if (this.renderer.xr.isPresenting) {
@@ -665,6 +682,10 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     this.anchor = entity;
     this.root.position.set(0, 0, 0);
     entity.object3D?.add(this.root);
+    if (this.fallback) {
+      this.fallback.dispose();
+      this.fallback = null;
+    }
     this.onFallback = false;
   }
 

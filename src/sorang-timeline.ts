@@ -98,7 +98,8 @@ export class SorangTimeline {
 
   /** Click or R: send the pieces out, or bring them back. Ignored before the painting has played. */
   toggle(): boolean {
-    if (this.frozen !== null || this.T < HOLD_AT || this.holding) return false;
+    // T sits exactly at HOLD_AT only while holding for the gates (paused or not) or resting.
+    if (this.frozen !== null || this.T < HOLD_AT || this.holding || (this.T === HOLD_AT && !this.resting)) return false;
     this.paused = false;
     if (this.resting) {
       this.resting = false;
@@ -137,8 +138,9 @@ export class SorangTimeline {
       const t = this.frozen;
       return clocksAt(Math.min(t, END), Math.max(0, t - SCHEDULE.drift[0]) % ORBIT_WRAP, out);
     }
-    this.holding = false;
     if (!this.paused && !this.resting) {
+      // Re-evaluated only while time moves, so a paused hold still reads as a hold.
+      this.holding = false;
       if (this.dir > 0) {
         const next = this.T + dt * pace;
         if (!gates.ready && this.T <= HOLD_AT && next > HOLD_AT) {
