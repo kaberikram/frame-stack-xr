@@ -166,9 +166,10 @@ const PUSH_FOOTPRINT = 25;
  * Pushing: hand travel along your line of sight through the palm, past PUSH_DEAD either way, times
  * PUSH_GAIN of the wall's distance over the palm's reach (so a box looks as deep for the same push at
  * any distance), plus PUSH_GIVE when it arms. At most PUSH_MAX, or the wall's own distance.
+ * At 2.4, about 20 cm of push takes the box about 2.4 m in, where 0.8 took it 0.8 m.
  */
 const PUSH_DEAD = 0.015;
-const PUSH_GAIN = 0.8;
+const PUSH_GAIN = 2.4;
 const PUSH_GIVE = 0.02;
 const PUSH_MAX = 2.5;
 const PUSH_STIFF = 320;
@@ -1770,7 +1771,7 @@ export class RoomStretchSystem extends createSystem({
 
   /**
    * Every presenting frame: a drag follows your fingers along the wall's plane, and is set when you let
-   * go. The frame shows while you drag and while the area waits to be pushed.
+   * go. The frame shows only while you drag. Once the area is set it goes, and comes back on the next drag.
    */
   private stepMap(): void {
     const map = this.map;
@@ -1791,8 +1792,7 @@ export class RoomStretchSystem extends createSystem({
       this.mapFrame.place(map.C, map.U, 0.5 * Math.abs(map.u), map.V, 0.5 * Math.abs(map.v), map.N);
       if (map.release) this.setMap();
     }
-    const box = this.box.phase;
-    this.mapFrame.setVisible(map.phase === 'drag' || (map.phase === 'set' && (box === 'none' || box === 'seek')));
+    this.mapFrame.setVisible(map.phase === 'drag');
   }
 
   /** Let go of a drag: big enough, it is the area to push for the rest of the session. */

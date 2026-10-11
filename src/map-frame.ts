@@ -5,8 +5,8 @@ const STRIP = 0.015;
 const LIFT = 0.01;
 
 /**
- * The area mapped for a palm push: a thin white frame on the wall, drawn while you drag it out and
- * while it waits to be pushed. Depth-tested, so your hands stay in front of it.
+ * The area mapped for a palm push: a thin white frame on the wall, drawn while you drag it out.
+ * Depth-tested, so your hands stay in front of it.
  */
 export class MapFrame {
   private readonly mesh: Mesh;
