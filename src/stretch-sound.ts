@@ -64,12 +64,18 @@ const TINK_VEL = 0.12;
 const HUM_VEL = 0.1;
 const MISS_VEL = 0.12;
 
+const C3 = 130.81;
 const C4 = 261.63;
 const C5 = 523.25;
 const C6 = 1046.5;
-/** Left hand roots at C4 and starts its run two notes up (E4), right roots at C5: pulled together they move in open fifths. */
-const ROOTS = [C4, C5] as const;
-const OFFSETS = [2, 0] as const;
+/**
+ * Left hand roots at C4 and starts its run two notes up (E4), right roots at C5: pulled together they
+ * move in open fifths. A pushed-in box is the third voice, an octave under the left hand.
+ */
+const ROOTS = [C4, C5, C3] as const;
+const OFFSETS = [2, 0, 0] as const;
+/** 0 left hand, 1 right hand, 2 a pushed-in box. */
+export type SoundSlot = 0 | 1 | 2;
 const PENTATONIC = [0, 2, 4, 7, 9];
 /** Semitones above the hand's root. */
 const GRAB_CHORD = [0, 7, 14]; // C G D: open, waiting
@@ -121,7 +127,7 @@ export class StretchSound {
   private input: GainNode | null = null;
   private wave: PeriodicWave | null = null;
   private busy = false;
-  private readonly hands: [Hand, Hand] = [makeHand(ROOTS[0], OFFSETS[0]), makeHand(ROOTS[1], OFFSETS[1])];
+  private readonly hands: readonly Hand[] = ROOTS.map((root, i) => makeHand(root, OFFSETS[i]));
   private readonly voices: Voice[] = Array.from({ length: MAX_VOICES }, makeVoice);
   private readonly tones = new Int32Array(8);
 
@@ -140,7 +146,7 @@ export class StretchSound {
    * One hand, every frame. `pull` is radians of visual pull, negative while the spring overshoots
    * past rest; `streak` is how far the stretch has turned to streaks (0–1); x/y/z is the grab point.
    */
-  track(slot: 0 | 1, holding: boolean, pull: number, streak: number, x: number, y: number, z: number): void {
+  track(slot: SoundSlot, holding: boolean, pull: number, streak: number, x: number, y: number, z: number): void {
     const h = this.hands[slot];
     if (!holding && h.phase === 'idle') return;
     const ctx = this.running();
@@ -160,8 +166,62 @@ export class StretchSound {
     }
   }
 
+  /**
+   * A held voice let go where it stands (a pushed-in box staying in): the home chord, no falling run.
+   * `track` with the pull past where it stays then rings the wobble.
+   */
+  settle(slot: SoundSlot, x: number, y: number, z: number): void {
+    const ctx = this.running();
+    const h = this.hands[slot];
+    if (!ctx || !h.out || h.phase !== 'held') return;
+    const now = ctx.currentTime;
+    this.place(h, now, x, y, z);
+    this.cancelPending(slot, now);
+    this.endHum(h, now, 0.3);
+    h.releasedAt = now;
+    this.land(h, slot, now);
+  }
+
+  /**
+   * A still voice let go from `pull` (a box sprung back out from rest): the fall a release plays,
+   * then `track` lands and bounces it as usual.
+   */
+  fall(slot: SoundSlot, pull: number, x: number, y: number, z: number): void {
+    const ctx = this.running();
+    const h = this.hands[slot];
+    if (!ctx || !h.out || h.phase === 'held') return;
+    const now = ctx.currentTime;
+    this.place(h, now, x, y, z);
+    let step = 0;
+    while (step < TOP && pull >= (step + 1) * STEP + BAND) step++;
+    h.step = step;
+    h.pull = pull;
+    this.release(h, slot, now);
+  }
+
+  /**
+   * Takes hold of a still voice at `pull` (a box taken in hand again where it rests): the hum at the
+   * step it stands on, without the strum or a climb to get there.
+   */
+  resume(slot: SoundSlot, pull: number, x: number, y: number, z: number): void {
+    const ctx = this.running();
+    const h = this.hands[slot];
+    if (!ctx || !h.out || h.phase === 'held') return;
+    const now = ctx.currentTime;
+    this.place(h, now, x, y, z);
+    this.cancelPending(slot, now);
+    let step = 0;
+    while (step < TOP && pull >= (step + 1) * STEP + BAND) step++;
+    h.phase = 'held';
+    h.step = step;
+    h.pull = pull;
+    h.lastNote = now;
+    h.glint = false;
+    this.startHum(h, now);
+  }
+
   /** A pinch that found nothing to grab. */
-  miss(slot: 0 | 1, x: number, y: number, z: number): void {
+  miss(slot: SoundSlot, x: number, y: number, z: number): void {
     const ctx = this.running();
     const h = this.hands[slot];
     if (!ctx || !h.out) return;
@@ -212,7 +272,7 @@ export class StretchSound {
 
   // ---------------------------------------------------------------- phrases
 
-  private grab(h: Hand, slot: 0 | 1, now: number): void {
+  private grab(h: Hand, slot: SoundSlot, now: number): void {
     this.cancelPending(slot, now);
     const fresh = now - h.releasedAt > GRAB_GAP;
     h.phase = 'held';
@@ -222,14 +282,16 @@ export class StretchSound {
     h.glint = false;
     this.startHum(h, now);
     if (!fresh) return;
-    // A second hand joins with root and fifth only, so the two never crowd.
-    const count = this.hands[1 - slot].phase === 'held' ? 2 : GRAB_CHORD.length;
+    // A second voice joins with root and fifth only, so the two never crowd.
+    let others = false;
+    for (let i = 0; i < this.hands.length; i++) if (i !== slot && this.hands[i].phase === 'held') others = true;
+    const count = others ? 2 : GRAB_CHORD.length;
     for (let i = 0; i < count; i++) {
       this.note(slot, pitch(h.root, GRAB_CHORD[i]), now + LEAD + i * 0.012, GRAB_VEL * (1 - i * 0.15), 1.6, true);
     }
   }
 
-  private hold(h: Hand, slot: 0 | 1, now: number, pull: number, streak: number): void {
+  private hold(h: Hand, slot: SoundSlot, now: number, pull: number, streak: number): void {
     h.pull = pull;
     let want = h.step;
     while (want < TOP && pull >= (want + 1) * STEP + BAND) want++;
@@ -259,7 +321,7 @@ export class StretchSound {
   }
 
   /** Falls down the home triad from the note now sounding toward the root, at most four notes. */
-  private release(h: Hand, slot: 0 | 1, now: number): void {
+  private release(h: Hand, slot: SoundSlot, now: number): void {
     this.endHum(h, now, 0.3);
     h.releasedAt = now;
     if (h.pull < QUIET_PULL) {
@@ -279,7 +341,7 @@ export class StretchSound {
   }
 
   /** The spring passes rest: a soft major chord, louder after a longer pull. */
-  private land(h: Hand, slot: 0 | 1, now: number): void {
+  private land(h: Hand, slot: SoundSlot, now: number): void {
     h.phase = 'bouncing';
     h.landedAt = now;
     h.low = 0;
@@ -292,7 +354,7 @@ export class StretchSound {
   }
 
   /** Overshoot past rest dips to the sixth below; coming back rings the octave. Depth sets loudness. */
-  private bounce(h: Hand, slot: 0 | 1, now: number, pull: number): void {
+  private bounce(h: Hand, slot: SoundSlot, now: number, pull: number): void {
     if (pull < h.low) h.low = pull;
     const depth = -h.low;
     const loud = Math.min(1, depth / STEP);

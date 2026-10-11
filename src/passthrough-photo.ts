@@ -82,6 +82,9 @@ const MASK_WRIST = 0.02;
 const CLEAN_RING = 0.08;
 /** Most footprint points a freeze is given (the grab point and its ring). */
 const FOOTPRINT_MAX = 32;
+/** One photo slot per hand, and a third for a pushed-in box, which stays while both hands pinch on. */
+const SLOTS = 3;
+export type SlotIndex = 0 | 1 | 2;
 /** Hand or arm cover below this counts as a clean frame. */
 const CLEANER = 0.02;
 /** Hand and arm cover is measured over nearly the whole frame, on a coarse grid of sample points. */
@@ -273,7 +276,7 @@ export class PassthroughPhoto {
   /** World-space points into the live camera's clip space, at the latency-corrected pose. */
   readonly worldToClip = new Matrix4();
   readonly liveCam = new Vector3();
-  readonly slots: [PhotoSlot, PhotoSlot];
+  readonly slots: readonly PhotoSlot[];
   /** Why the last freeze() returned false. */
   lastMiss: PhotoMiss = 'none';
   private readonly pickNote: PickNote = { source: 'none', age: 0, base: 0, margin: 0, tier: 0, seen: 0, old: 0, edge: 0, hand: 0 };
@@ -292,10 +295,10 @@ export class PassthroughPhoto {
   history: JointHistory | null = null;
 
   private readonly bank: BankEntry[] = [];
-  private readonly stores: [SlotStore, SlotStore];
-  private readonly fillStores: [SlotStore, SlotStore];
+  private readonly stores: readonly SlotStore[];
+  private readonly fillStores: readonly SlotStore[];
   /** Bank entries a freeze chose as fills, copied in at the start of the next frame. */
-  private readonly pendingFill: [BankEntry | null, BankEntry | null] = [null, null];
+  private readonly pendingFill: (BankEntry | null)[] = Array.from({ length: SLOTS }, () => null);
   private readonly inner = new Float32Array(FOOTPRINT_MAX * 3);
   private measuredAt = -Infinity;
   private readonly probe: HTMLCanvasElement;
@@ -359,9 +362,9 @@ export class PassthroughPhoto {
         masked: false,
       });
     }
-    this.stores = [makeStore(), makeStore()];
-    this.fillStores = [makeStore(), makeStore()];
-    this.slots = [makeSlot(), makeSlot()];
+    this.stores = Array.from({ length: SLOTS }, makeStore);
+    this.fillStores = Array.from({ length: SLOTS }, makeStore);
+    this.slots = Array.from({ length: SLOTS }, makeSlot);
     this.probe = document.createElement('canvas');
     this.probe.width = PROBE_W;
     this.probe.height = PROBE_H;
@@ -577,7 +580,7 @@ export class PassthroughPhoto {
    * a fill for whatever the first is missing. False when nothing usable exists.
    */
   freeze(
-    k: 0 | 1,
+    k: SlotIndex,
     footprint: Float32Array,
     count: number,
     presenting: boolean,
@@ -586,6 +589,7 @@ export class PassthroughPhoto {
     joints: HandJoints | null,
     eye: Vector3,
     liveOk = true,
+    clean = CLEAN_RING,
   ): boolean {
     const note = this.pickNote;
     note.source = 'none';
@@ -593,7 +597,7 @@ export class PassthroughPhoto {
     note.old = 0;
     note.edge = 0;
     note.hand = 0;
-    const inner = this.innerRing(footprint, count);
+    const inner = this.innerRing(footprint, count, clean);
     let best: BankEntry | null = null;
     let bestScore = -Infinity;
     let bestMargin = 0;
@@ -693,9 +697,9 @@ export class PassthroughPhoto {
   }
 
   /** One line on the last freeze for slot `k`: where its photo came from, or why there was none. */
-  pickLine(k: 0 | 1): string {
+  pickLine(k: SlotIndex): string {
     const n = this.pickNote;
-    const side = k === 0 ? 'L' : 'R';
+    const side = k === 0 ? 'L' : k === 1 ? 'R' : 'B';
     const bank = `${n.seen}/${BANK} o${n.old} e${n.edge} h${n.hand}`;
     const st = this.stats;
     const health = `a${st.admitted} d${st.dark} u${st.unsteady} x${st.dirtier}`;
@@ -712,7 +716,7 @@ export class PassthroughPhoto {
   }
 
   /** True when `point` lands inside slot `k`'s photo with `margin` to spare. */
-  slotContains(k: 0 | 1, point: Vector3, margin: number): boolean {
+  slotContains(k: SlotIndex, point: Vector3, margin: number): boolean {
     const slot = this.slots[k];
     if (!slot.has) return true;
     return uvMargin(slot.toClip, point.x, point.y, point.z) >= margin;
@@ -720,10 +724,10 @@ export class PassthroughPhoto {
 
   /** Re-derives each slot's colour from the current exposure, warmth and tint. */
   updateGains(): void {
-    for (let k = 0; k < 2; k++) this.writeGain(this.slots[k].gain);
+    for (let k = 0; k < SLOTS; k++) this.writeGain(this.slots[k].gain);
   }
 
-  drop(k: 0 | 1): void {
+  drop(k: SlotIndex): void {
     this.slots[k].has = false;
     this.slots[k].fill.has = false;
     this.pendingFill[k] = null;
@@ -732,8 +736,7 @@ export class PassthroughPhoto {
   /** Forget every frame: a new session, a recentred space, or a restarted camera. */
   clear(): void {
     for (let i = 0; i < this.bank.length; i++) this.bank[i].used = false;
-    this.drop(0);
-    this.drop(1);
+    for (let k = 0; k < SLOTS; k++) this.drop(k as SlotIndex);
     this.measuredAt = -Infinity;
     this.poseCount = 0;
     this.poseHead = -1;
@@ -751,7 +754,7 @@ export class PassthroughPhoto {
   dispose(): void {
     if (this.video && this.rvfcHandle >= 0) this.video.cancelVideoFrameCallback?.(this.rvfcHandle);
     this.video = null;
-    for (let k = 0; k < 2; k++) {
+    for (let k = 0; k < SLOTS; k++) {
       this.slots[k].texture?.dispose();
       this.slots[k].texture = null;
       this.slots[k].fill.texture?.dispose();
@@ -815,7 +818,7 @@ export class PassthroughPhoto {
    * start, so the first pinch neither allocates nor uploads into fresh storage.
    */
   private prepare(w: number, h: number): void {
-    for (let k = 0; k < 2; k++) {
+    for (let k = 0; k < SLOTS; k++) {
       const slot = this.slots[k];
       if (sizeStore(this.stores[k], w, h) || !slot.texture) {
         slot.texture?.dispose();
@@ -832,7 +835,7 @@ export class PassthroughPhoto {
   }
 
   /** Copies a source into slot `k`'s own canvas, rebuilding its texture when the size changes. */
-  private fill(k: 0 | 1, source: CanvasImageSource, w: number, h: number, rgb: MeanRgb): void {
+  private fill(k: SlotIndex, source: CanvasImageSource, w: number, h: number, rgb: MeanRgb): void {
     const store = this.stores[k];
     const slot = this.slots[k];
     if (store.w !== w || store.h !== h || !slot.texture) this.prepare(w, h);
@@ -1061,7 +1064,7 @@ export class PassthroughPhoto {
    * photo (`except` null) is cut out at the grab spot itself, and its streaks read exactly there, so
    * its fill must be clear of hands there.
    */
-  private chooseFill(k: 0 | 1, footprint: Float32Array, count: number, except: BankEntry | null, now: number, eye: Vector3): void {
+  private chooseFill(k: SlotIndex, footprint: Float32Array, count: number, except: BankEntry | null, now: number, eye: Vector3): void {
     this.slots[k].fill.has = false;
     this.pendingFill[k] = null;
     let best: BankEntry | null = null;
@@ -1087,7 +1090,7 @@ export class PassthroughPhoto {
 
   /** Copies the fills chosen last frame into their slots. */
   private flushFills(): void {
-    for (let k = 0; k < 2; k++) {
+    for (let k = 0; k < SLOTS; k++) {
       const entry = this.pendingFill[k];
       if (!entry) continue;
       this.pendingFill[k] = null;
@@ -1111,8 +1114,11 @@ export class PassthroughPhoto {
     return null;
   }
 
-  /** The footprint shrunk to CLEAN_RING around its grab point, in a scratch buffer. */
-  private innerRing(footprint: Float32Array, count: number): Float32Array {
+  /**
+   * The footprint shrunk to `clean` around its grab point, in a scratch buffer: only that much of it
+   * must be free of hands. Infinity keeps the whole footprint (a pushed-in box shows all of it).
+   */
+  private innerRing(footprint: Float32Array, count: number, clean: number): Float32Array {
     const out = this.inner;
     const cx = footprint[0];
     const cy = footprint[1];
@@ -1124,7 +1130,7 @@ export class PassthroughPhoto {
       const dx = footprint[i * 3] - cx;
       const dy = footprint[i * 3 + 1] - cy;
       const dz = footprint[i * 3 + 2] - cz;
-      const k = CLEAN_RING / Math.max(1e-6, Math.hypot(dx, dy, dz));
+      const k = clean === Infinity ? 1 : clean / Math.max(1e-6, Math.hypot(dx, dy, dz));
       out[i * 3] = cx + dx * k;
       out[i * 3 + 1] = cy + dy * k;
       out[i * 3 + 2] = cz + dz * k;
