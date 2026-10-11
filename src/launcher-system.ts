@@ -1,4 +1,4 @@
-import { CameraUtils, Quaternion, Vector3, VisibilityState, createSystem } from '@iwsdk/core';
+import { CameraUtils, Quaternion, SessionMode, Vector3, VisibilityState, createSystem } from '@iwsdk/core';
 import { prepareDepthModel } from './depth-model.js';
 import { PREVIEW_FORCED, getMode, isMode, launchSession, setMode, type ExperienceMode } from './experience.js';
 import {
@@ -25,8 +25,13 @@ const STRETCH_HINT = 'Round 7b. Hold an open palm up to a wall, then push.';
 const STRETCH_CAMERA = 'Camera on. Push a palm into a wall, or pinch and pull.';
 const STRETCH_ASKING = 'Allow the camera so the pull can show your room.';
 const STRETCH_BLOCKED = 'Camera blocked. Allow it for this site so the pull can show your room.';
-const SORANG_HINT = 'Click the view to look around. WASD walks. Shift is faster.';
+const SORANG_HINT = 'Click the view to start the music and look around. WASD walks. Or enter VR and stand in front of it.';
+const SORANG_NO_VR = 'Click the view to start the music and look around. WASD walks. Open this page in the Meta Quest browser for VR.';
+const SORANG_TIP = 'Click to look around. WASD walks. R starts the song again.';
+const SORANG_CLICK = 'Click to start the music.';
 const SORANG_TIP_MS = 4000;
+const ENTER_PASSTHROUGH = 'Enter passthrough';
+const ENTER_VR = 'Enter VR';
 
 const TITLES: Record<ExperienceMode, string> = { stack: 'Frame stack', stretch: 'Jonze stretch', sorang: 'Sorang' };
 
@@ -49,6 +54,8 @@ export class LauncherSystem extends createSystem({}) {
   private readonly uiOff = typeof location !== 'undefined' && new URLSearchParams(location.search).get('ui') === '0';
   private tipShown = false;
   private tipTimer = 0;
+  /** The tip is asking for the click that lets the music play. */
+  private clickTip = false;
 
   init(): void {
     const stack = this.world.getSystem(FrameStackSystem)!;
@@ -93,13 +100,14 @@ export class LauncherSystem extends createSystem({}) {
     const placeHint = hint.textContent ?? '';
     let xrKnown = false;
     let xrOk = false;
+    let vrOk = false;
     let depthRequested = false;
     let depthReady = false;
     let depthNote = DEPTH_WAIT;
     const syncEnter = () => {
       if (getMode() === 'sorang') {
-        enter.disabled = true;
-        hint.textContent = SORANG_HINT;
+        enter.disabled = !vrOk;
+        hint.textContent = vrOk || !xrKnown ? SORANG_HINT : SORANG_NO_VR;
         return;
       }
       const stackMode = getMode() === 'stack';
@@ -125,9 +133,23 @@ export class LauncherSystem extends createSystem({}) {
     };
     const renderSorang = () => {
       if (sorangSource) sorangSource.textContent = sorang.status().text;
+      if (!tip || this.uiOff || getMode() !== 'sorang' || this.immersive) return;
+      if (sorang.needsClick) {
+        // Browsers start sound only after a click or a key; ask for one while the painting waits.
+        clearTimeout(this.tipTimer);
+        this.clickTip = true;
+        tip.textContent = SORANG_CLICK;
+        tip.hidden = false;
+        return;
+      }
+      if (this.clickTip) {
+        this.clickTip = false;
+        tip.hidden = true;
+      }
       const drifting = sorang.stage === 'drift' || sorang.stage === 'orbit';
-      if (!tip || this.tipShown || this.uiOff || getMode() !== 'sorang' || !drifting) return;
+      if (this.tipShown || !drifting) return;
       this.tipShown = true;
+      tip.textContent = SORANG_TIP;
       tip.hidden = false;
       clearTimeout(this.tipTimer);
       this.tipTimer = window.setTimeout(() => {
@@ -151,7 +173,7 @@ export class LauncherSystem extends createSystem({}) {
       load.hidden = mode !== 'stack';
       if (imageBtn) imageBtn.hidden = mode !== 'sorang';
       if (playBtn) playBtn.hidden = mode !== 'sorang';
-      enter.hidden = mode === 'sorang';
+      enter.textContent = mode === 'sorang' ? ENTER_VR : ENTER_PASSTHROUGH;
       for (const [m, tab] of tabs) tab?.setAttribute('aria-selected', m === mode ? 'true' : 'false');
       this.applyPreview(mode);
       if (mode === 'stretch') this.armStretchCamera(stretch, syncEnter);
@@ -165,6 +187,7 @@ export class LauncherSystem extends createSystem({}) {
         this.cardOpen = false;
       } else {
         this.cardOpen = true;
+        this.clickTip = false;
         if (tip) tip.hidden = true;
       }
       syncCard();
@@ -210,7 +233,16 @@ export class LauncherSystem extends createSystem({}) {
       if (f) void this.open(f, stack, rate, source);
     };
     const onEnter = () => {
-      if (getMode() === 'sorang') return; // desktop only for now
+      if (getMode() === 'sorang') {
+        // This click is the gesture that lets the song play in the headset. Start from the top there.
+        sorang.unlockAudio();
+        sorang.restart();
+        this.world.launchXR({
+          sessionMode: SessionMode.ImmersiveVR,
+          features: { handTracking: true, anchors: false, planeDetection: false, meshDetection: false, depthSensing: false },
+        });
+        return;
+      }
       touch.unlockAudio(); // this click is the gesture that lets scrub ticks play in the headset
       const stretchMode = getMode() === 'stretch';
       if (stretchMode) {
@@ -221,7 +253,11 @@ export class LauncherSystem extends createSystem({}) {
     };
     const onStack = () => applyMode('stack');
     const onStretch = () => applyMode('stretch');
-    const onSorang = () => applyMode('sorang');
+    const onSorang = () => {
+      // The tab click is a gesture: the music may start as soon as the painting is ready.
+      sorang.unlockAudio();
+      applyMode('sorang');
+    };
     const onImage = () => {
       // Start the model download while the picker is open; a loaded picture needs it.
       prepareDepthModel().catch(() => {});
@@ -238,6 +274,7 @@ export class LauncherSystem extends createSystem({}) {
       void sorang.useImage(f);
     };
     const onPlay = () => {
+      sorang.unlockAudio();
       sorang.restart();
       this.cardOpen = false;
       syncCard();
@@ -277,13 +314,20 @@ export class LauncherSystem extends createSystem({}) {
     else if (lensOn || handsOn || consoleOn || pushDemo) applyMode('stretch');
 
     if (this.world.xrEnabled && navigator.xr) {
-      navigator.xr.isSessionSupported('immersive-ar').then(
-        (ok) => {
+      const xr = navigator.xr;
+      const vr = xr.isSessionSupported('immersive-vr').then(
+        (ok) => ok,
+        () => false,
+      );
+      xr.isSessionSupported('immersive-ar').then(
+        async (ok) => {
+          vrOk = await vr;
           xrKnown = true;
           xrOk = ok;
           syncEnter();
         },
-        () => {
+        async () => {
+          vrOk = await vr;
           xrKnown = true;
           syncEnter();
         },
@@ -306,8 +350,12 @@ export class LauncherSystem extends createSystem({}) {
         syncCard();
       }),
       this.visibilityState.subscribe((state) => {
+        const was = this.immersive;
         this.immersive = state !== VisibilityState.NonImmersive;
+        // However the session began (Enter VR, or the browser's own offer), Sorang starts from the top in it.
+        if (this.immersive && !was && getMode() === 'sorang') sorang.restart();
         syncCard();
+        renderSorang();
       }),
       () => {
         rate.removeEventListener('change', onRate);

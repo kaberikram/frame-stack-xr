@@ -14,6 +14,7 @@ import {
   SRGBColorSpace,
   Vector2,
   Vector3,
+  InputComponent,
   createSystem,
   type Entity,
   type Material,
@@ -22,7 +23,17 @@ import {
 import { loadBakedDepth } from './baked-depth.js';
 import { cancelDepth, estimateDepth, type DepthField } from './depth-model.js';
 import { getMode } from './experience.js';
-import { PAINTING_DEPTH, decodeImageFile, loadPainting, loadPhotoAtlas, type Painting, type PhotoAtlas } from './sorang-assets.js';
+import {
+  MUSIC_URL,
+  PAINTING_DEPTH,
+  decodeImageFile,
+  loadMusicCues,
+  loadPainting,
+  loadPhotoAtlas,
+  type Painting,
+  type PhotoAtlas,
+} from './sorang-assets.js';
+import { SorangBloom } from './sorang-bloom.js';
 import {
   LINK_PAIRS,
   buildDust,
@@ -39,9 +50,11 @@ import {
 } from './sorang-build.js';
 import { SorangLook } from './sorang-component.js';
 import { blankPhotos, createSorangUniforms, dustMaterial, linkMaterial, tileMaterial, voidMaterial, type SorangUniforms } from './sorang-materials.js';
-import { HOLD_AT, SLICES, SorangTimeline, createClocks, type SorangGates, type SorangStage } from './sorang-timeline.js';
+import { SorangMusic } from './sorang-music.js';
+import { createFeel, feelAt, type MusicCues, type SongFeel } from './sorang-song.js';
+import { HOLD_AT, SLICES, SorangTimeline, createClocks, type SorangPhase, type SorangStage } from './sorang-timeline.js';
 
-const LOOK_KEYS = ['size', 'tiles', 'dust', 'relief', 'radial', 'fan', 'mosaic', 'parallax', 'pace', 'reformSpeed'] as const;
+const LOOK_KEYS = ['size', 'tiles', 'dust', 'relief', 'radial', 'fan', 'mosaic', 'parallax', 'bloom', 'bloomThreshold', 'volume'] as const;
 type Look = Record<(typeof LOOK_KEYS)[number], number>;
 
 /** The painting fills this share of the view, leaving room for the relief's outward push. */
@@ -50,8 +63,24 @@ const FRAMING = 0.78;
 const ARC_YAW = (20 * Math.PI) / 180;
 /** The default painting's depth and photos get this long before it plays without them. */
 const GATE_TIMEOUT_MS = 8000;
-/** Burst reach, metres. */
+/**
+ * The look was tuned on a painting this size, in metres. Distances that belong to the painting
+ * (burst reach, orbit shell, dust size, fog) scale by size / REF_SIZE, so a giant painting
+ * bursts into a giant cloud.
+ */
+const REF_SIZE = 1.83;
+/** Burst reach at REF_SIZE, metres. */
 const REACH = 2.2;
+/** How far a full kick spurs a flying piece outward, and a drop throws it, at REF_SIZE, metres. */
+const SPUR = 0.12;
+const SHOCK_REACH = 1.1;
+/** How much the relief swells on a hit, and the fan on a kick, before the burst. */
+const RELIEF_PULSE = 0.12;
+const FAN_PULSE = 0.06;
+/** The scripted desktop eye stands at this height, metres: a person looking up at the painting. */
+const EYE_HEIGHT = 1.6;
+/** How quickly the orbits recentre on the viewer, seconds. */
+const ORBIT_FOLLOW = 5;
 /** A click on the canvas moves less than this, in CSS pixels. */
 const CLICK_SLOP = 5;
 /** Desktop walk, once the view is clicked: metres per second, and the faster rate while Shift is held. */
@@ -61,13 +90,17 @@ const WALK_FAST = 4.2;
 const LOOK_SENS = 0.0022;
 const PITCH_LIMIT = 1.45;
 /** Where the painting hangs if the scene has no Sorang node. */
-const FALLBACK_POS = new Vector3(0, 1.6, -2.5);
+const FALLBACK_POS = new Vector3(0, 2.3, -4.5);
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
+const PARAMS = typeof location === 'undefined' ? new URLSearchParams() : new URLSearchParams(location.search);
+/** `?music=0` plays on a silent clock: no audio, no gesture to wait for, and `ecs_step` advances it exactly. */
+const MUSIC_OFF = PARAMS.get('music') === '0';
+/** `?bloom=0` turns the glow off, for comparisons and frame-time checks. */
+const BLOOM_OFF = PARAMS.get('bloom') === '0';
 
-/** `?sorangT=<seconds>` freezes the timeline there, for deterministic captures. */
+/** `?sorangT=<song seconds>` freezes the piece there, for deterministic captures. */
 function frozenFromUrl(): number | null {
-  if (typeof location === 'undefined') return null;
-  const raw = new URLSearchParams(location.search).get('sorangT');
+  const raw = PARAMS.get('sorangT');
   if (raw === null) return null;
   const t = Number(raw);
   return Number.isFinite(t) && t >= 0 ? t : null;
@@ -78,27 +111,34 @@ export interface SorangStatus {
   busy: boolean;
 }
 
-/** The window.__sorang test hook. */
+/** The window.__sorang test hook. Times are song seconds. */
 export interface SorangHook {
   readonly ready: boolean;
   readonly T: number;
+  readonly song: number;
   readonly stage: SorangStage;
-  seek(t: number): void;
-  freeze(t: number | null): void;
+  readonly phase: SorangPhase;
+  /** Play from song second `s`, with the music if it is unlocked. */
+  seek(s: number): void;
+  freeze(s: number | null): void;
   pause(): void;
   play(): void;
-  reform(): boolean;
+  /** R: run the pieces home and start the song again. */
+  rewind(): void;
   setPhotos(on: boolean): void;
   setView(on: boolean): void;
+  setBloom(on: boolean): void;
+  feel(): SongFeel;
   paintingRect(): { x0: number; y0: number; x1: number; y1: number } | null;
-  stats(): Record<string, number>;
+  stats(): Record<string, number | string>;
 }
 
 /**
- * Sorang: a painting hangs in the dark, as tall as you. It takes on depth, splits into 100
- * depth slices of stock-photo tiles, and bursts into particles that orbit the viewer.
- * Click or R brings them back. Everything moves on the GPU from one timeline; this system
- * only loads, builds, and writes uniforms.
+ * Sorang: a giant painting hangs in the dark. In time with its song it takes on depth, splits
+ * into 100 depth slices of stock-photo tiles, and bursts into particles that orbit the viewer;
+ * the riser pulls them back, the second drop throws them out again, and the outro brings them
+ * home. Everything moves on the GPU from one timeline driven by the song; this system loads,
+ * builds, writes uniforms, and draws the bloom.
  */
 export class SorangSystem extends createSystem({ anchors: { required: [SorangLook] } }) {
   private U!: SorangUniforms;
@@ -116,8 +156,33 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
   private blank!: Texture;
   private readonly timeline = new SorangTimeline();
   private readonly clocks = createClocks();
-  private readonly gates: SorangGates = { ready: false };
-  private readonly look: Look = { size: 1.83, tiles: 64, dust: 256, relief: 0.35, radial: 0.5, fan: 0.6, mosaic: 0.9, parallax: 0.15, pace: 1, reformSpeed: 3 };
+  private readonly look: Look = {
+    size: 4,
+    tiles: 96,
+    dust: 256,
+    relief: 0.19,
+    radial: 0.5,
+    fan: 0.33,
+    mosaic: 0.9,
+    parallax: 0.15,
+    bloom: 1.2,
+    bloomThreshold: 0.3,
+    volume: 0.9,
+  };
+  private music!: SorangMusic;
+  private cues: MusicCues | null = null;
+  private cuesStarted = false;
+  private readonly feel = createFeel();
+  private bloom!: SorangBloom;
+  private bloomOn = !BLOOM_OFF;
+  /** Objects drawn in the main pass but kept out of the glow. */
+  private bloomHidden: Mesh[] = [];
+  /** Where the orbits centre, painting-local: the viewer, followed slowly. */
+  private readonly orbitCentre = new Vector3();
+  private orbitPlaced = false;
+  /** Head distance from the painting's centre, metres. */
+  private viewD = 2.5;
+  private lastNeedsClick = false;
   private readonly frozenAt = frozenFromUrl();
   private anchor: Entity | null = null;
   private onFallback = false;
@@ -152,8 +217,9 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
   private photosOn = true;
   private viewOn = true;
 
-  private toggleWanted = false;
+  private rewindWanted = false;
   private pauseWanted = false;
+  private muteWanted = false;
   private readonly pointer = new Vector2();
   private readonly parallax = new Vector2();
   private downId = -1;
@@ -216,6 +282,14 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
       object.raycast = () => {};
       this.root.add(object);
     }
+    this.bloom = new SorangBloom(this.renderer);
+    this.root.add(this.bloom.composite);
+    this.bloomHidden = [this.voidMesh];
+    this.music = new SorangMusic(MUSIC_URL, MUSIC_OFF);
+    this.music.onFail = (stage) => {
+      this.message(stage === 'context' ? 'This browser won’t play the music. Sorang plays on in silence.' : 'Couldn’t load the music. Sorang plays on in silence.');
+      this.notify();
+    };
 
     const canvas = this.renderer.domElement;
     canvas.addEventListener('pointerdown', this.onPointerDown);
@@ -267,17 +341,23 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     return () => this.messageListeners.delete(listener);
   }
 
-  /** Play again from black. */
+  /** Play again from black: the painting fades in, then the song starts from the top. */
   restart(): void {
     this.timeline.restart();
+    this.music?.stop();
     if (this.frozenAt !== null) this.timeline.freeze(this.frozenAt);
     this.lastStage = null;
     this.notify();
   }
 
-  /** Send the pieces out, or bring them back. */
-  toggle(): boolean {
-    return this.timeline.toggle();
+  /** From a user gesture (a click, a key, Enter VR): the browser lets the music start after one. */
+  unlockAudio(): void {
+    this.music.unlock();
+  }
+
+  /** The painting is waiting for a click before the song can play. */
+  get needsClick(): boolean {
+    return this.active && this.timeline.waiting && this.music.needsGesture;
   }
 
   /** Swap in a picture the viewer picked; depth comes from the in-browser model. */
@@ -336,21 +416,41 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     this.readLook();
     this.applyPending();
     if (this.mapDirty || this.tilesDirty) this.rebuild();
-    if (this.toggleWanted) this.timeline.toggle();
-    if (this.pauseWanted) this.timeline.togglePause();
-    this.toggleWanted = false;
+    this.readXRButtons();
+    if (this.rewindWanted) this.rewind();
+    if (this.pauseWanted) this.togglePause();
+    if (this.muteWanted) this.music.setMuted(!this.music.isMuted);
+    this.rewindWanted = false;
     this.pauseWanted = false;
+    this.muteWanted = false;
 
     const reduced = reduceMotion.matches;
-    this.gates.ready = this.gate.painting && this.gate.depth && this.gate.atlas && this.built;
-    this.timeline.update(dt, this.gates, this.look.pace, this.look.reformSpeed, reduced ? 0.2 : 1, this.clocks);
+    this.music.setVolume(this.look.volume);
+    const song = this.music.tick(dt);
+    if (this.timeline.phase === 'playing' && this.music.ended) this.timeline.finish();
+    const ready = this.gate.painting && this.gate.depth && this.gate.atlas && this.built;
+    if (this.timeline.waiting && ready && this.music.ready) {
+      this.timeline.start();
+      this.music.play(0);
+      console.info(`[sorang] song starts${this.music.isSilent ? ' (silent clock)' : ''}`);
+    }
+    this.timeline.update(dt, song, reduced ? 0.2 : 1, this.clocks);
+    const frozen = this.timeline.frozen;
+    if (frozen !== null || this.timeline.phase === 'playing') feelAt(this.cues, frozen ?? this.timeline.song, this.feel);
+    else feelAt(null, -1, this.feel);
     this.swayClock += dt;
     this.placeView(dt, reduced);
     this.syncUniforms(reduced);
+    this.drawBloom();
     const stage = this.timeline.stage;
     if (stage !== this.lastStage) {
       this.lastStage = stage;
-      console.info(`[sorang] stage=${stage} T=${(this.timeline.frozen ?? this.timeline.T).toFixed(2)}`);
+      console.info(`[sorang] stage=${stage} T=${this.timeline.shownT.toFixed(2)} song=${(frozen ?? this.timeline.song).toFixed(2)}`);
+      this.notify();
+    }
+    const needsClick = this.needsClick;
+    if (needsClick !== this.lastNeedsClick) {
+      this.lastNeedsClick = needsClick;
       this.notify();
     }
     if (this.built) this.framesSinceBuild++;
@@ -370,7 +470,9 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
       this.onFallback = true;
     }
     this.parallax.set(0, 0);
+    this.orbitPlaced = false;
     this.restart();
+    this.startMusic();
     if (!this.started) this.startDefault();
     else this.applyPending();
   }
@@ -379,13 +481,46 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     this.active = false;
     // Back to black now, so the launcher never sees a stale drift stage on re-entry.
     this.restart();
-    this.toggleWanted = false;
+    this.bloom.hide();
+    this.rewindWanted = false;
     this.pauseWanted = false;
+    this.muteWanted = false;
     this.downId = -1;
     this.dropWalk();
   }
 
+  /** R, or a click once the song has ended: run the pieces home, then the song starts again. */
+  private rewind(): void {
+    this.timeline.rewind();
+    this.music.stop();
+  }
+
+  private togglePause(): void {
+    this.timeline.togglePause();
+    if (this.timeline.phase !== 'playing') return;
+    if (this.timeline.paused) this.music.pause();
+    else this.music.resume();
+  }
+
   // ---------------------------------------------------------------- loading
+
+  private startMusic(): void {
+    this.music.prefetch();
+    if (this.cuesStarted) return;
+    this.cuesStarted = true;
+    loadMusicCues().then(
+      (cues) => {
+        this.cues = cues;
+        // The song's own length once decoded; until then, the cues know it.
+        if (this.music.isSilent || !this.music.ready) this.music.duration = cues.duration;
+        console.info(`[sorang] music cues ${cues.duration.toFixed(1)} s, ${cues.kickT.length} kicks, ${cues.hitT.length} hits`);
+      },
+      (err: unknown) => {
+        // Without cues the choreography still follows the song; only the beat pulses are lost.
+        console.warn('[sorang] music cues unavailable', err);
+      },
+    );
+  }
 
   private startDefault(): void {
     this.started = true;
@@ -605,9 +740,6 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     const cam = this.camera;
     const t = Math.tan((cam.fov * Math.PI) / 360);
     this.restD = Math.max(halfH / (FRAMING * t), halfW / (FRAMING * t * cam.aspect));
-    U.uOrbitL.value.set(0, 0, this.restD - 1);
-    // Fog only for pieces beyond the painting: a narrow window or a big painting sits further back.
-    U.uFogStart.value = Math.max(2.5, this.restD + 0.1);
     this.root.updateWorldMatrix(true, false);
 
     if (this.renderer.xr.isPresenting) {
@@ -629,12 +761,10 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
       const yaw = reduced ? 0 : this.clocks.arc * ARC_YAW;
       const sway = still || reduced ? 0 : this.clocks.sway * 0.04;
       const s = this.swayClock;
-      this.eye.set(
-        Math.sin(yaw) * this.restD + this.parallax.x + sway * Math.sin(2 * Math.PI * 0.11 * s),
-        this.parallax.y + sway * Math.sin(2 * Math.PI * 0.07 * s + 1),
-        Math.cos(yaw) * this.restD,
-      );
+      this.eye.set(Math.sin(yaw) * this.restD + this.parallax.x + sway * Math.sin(2 * Math.PI * 0.11 * s), 0, Math.cos(yaw) * this.restD);
       this.root.localToWorld(this.eye);
+      // A person's eye height, looking up at the painting, so it reads as giant.
+      this.eye.y = EYE_HEIGHT + this.parallax.y + sway * Math.sin(2 * Math.PI * 0.07 * s + 1);
       this.centre.set(0, 0, 0);
       this.root.localToWorld(this.centre);
       this.tmp.copy(this.eye);
@@ -647,24 +777,56 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
       cam.updateMatrixWorld();
       this.head.copy(this.eye);
     }
-    this.root.worldToLocal(U.uHeadL.value.copy(this.head));
+    const headL = U.uHeadL.value;
+    this.root.worldToLocal(headL.copy(this.head));
+    this.viewD = Math.max(0.5, headL.length());
+
+    // The orbits circle the viewer, recentring slowly as they walk. A frozen moment snaps, so
+    // the same `?sorangT` always renders the same picture.
+    if (!this.orbitPlaced || this.timeline.frozen !== null) {
+      this.orbitCentre.copy(headL);
+      this.orbitPlaced = true;
+    } else {
+      this.orbitCentre.lerp(headL, 1 - Math.exp(-dt / ORBIT_FOLLOW));
+    }
+    U.uOrbitL.value.copy(this.orbitCentre);
+    const k = this.look.size / REF_SIZE;
+    // Fog only for pieces beyond the painting.
+    U.uFogStart.value = Math.max(2.5 * k, this.viewD + 0.1);
+    U.uFog.value = 0.25 / k;
   }
 
   private syncUniforms(reduced: boolean): void {
     const U = this.U;
     const c = this.clocks;
+    const f = this.feel;
+    const size = this.look.size;
+    const k = size / REF_SIZE;
+    // Before the burst the music swells the relief on its hits and breathes the fan on its kicks.
+    const still = 1 - c.burst;
     U.uShow.value = c.show;
-    U.uRelief.value = c.relief * this.look.relief;
+    U.uRelief.value = c.relief * this.look.relief * size * (1 + RELIEF_PULSE * f.hit * still);
     U.uQuant.value = c.quant;
     U.uFan.value = c.fan;
-    U.uSpan.value = Math.min(this.look.fan, 0.3 * this.restD);
-    U.uRadial.value = this.look.radial;
+    U.uSpan.value = Math.min(this.look.fan * size, 0.3 * this.viewD) * (1 + FAN_PULSE * f.kick * still);
+    // The radial push multiplies a depth in metres; divide it back so the shape keeps its proportions.
+    U.uRadial.value = this.look.radial / k;
     U.uScan.value = c.scan;
+    U.uScanGain.value = 0.6 * (1 + 0.8 * f.hit);
     U.uBurst.value = c.burst;
     U.uDrift.value = c.drift;
     U.uDim.value = c.dim;
     U.uT.value = c.orbit;
-    U.uReach.value = REACH * (reduced ? 0.4 : 1);
+    U.uReach.value = REACH * k * (reduced ? 0.4 : 1);
+    U.uFocusBack.value = 1.5 * k;
+    U.uShell.value.set(0.5 * k, 2.8 * k);
+    U.uShellH.value = 1.2 * k;
+    U.uDustSize.value = 0.0035 * k;
+    U.uKick.value = f.kick;
+    U.uHigh.value = f.high;
+    U.uShock.value = f.shock;
+    U.uSpur.value = SPUR * k * (reduced ? 0.3 : 1);
+    U.uShockReach.value = SHOCK_REACH * k * (reduced ? 0.3 : 1);
     U.uContrast.value = this.look.mosaic;
     U.uPhotoOn.value = this.atlas && this.photosOn ? 1 : 0;
     if (this.renderer.xr.isPresenting) {
@@ -676,17 +838,38 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     }
   }
 
+  /** The glow for this frame, after the uniforms are final and before IWSDK renders. */
+  private drawBloom(): void {
+    // In a VR session the clear is already black; the void only has to cover passthrough.
+    const session = this.renderer.xr.isPresenting ? this.renderer.xr.getSession() : null;
+    this.voidMesh.visible = !session || session.environmentBlendMode !== 'opaque';
+    if (!this.bloomOn || this.look.bloom <= 0) {
+      this.bloom.hide();
+      return;
+    }
+    const f = this.feel;
+    // The glow belongs to the pieces in flight: on the whole painting it would wash out the photos.
+    const burst = this.clocks.burst;
+    const flying = burst * burst * (3 - 2 * burst);
+    const strength = this.look.bloom * (0.3 + 0.7 * flying) * (0.75 + 0.35 * f.bass + 0.7 * f.kick + 1.2 * f.shock);
+    this.bloom.render(this.root, this.camera, this.bloomHidden, this.U.uViewportH, strength, this.look.bloomThreshold);
+  }
+
   // ---------------------------------------------------------------- input
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
+    // Any key is a gesture the browser accepts for starting the music.
+    if (getMode() === 'sorang') this.music.unlock();
     if (this.takeMoveKey(e)) return;
     if (getMode() !== 'sorang' || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
     if (this.typing(e)) return;
     if (e.code === 'KeyR') {
-      this.toggleWanted = true;
+      this.rewindWanted = true;
     } else if (e.code === 'Space') {
       e.preventDefault();
       this.pauseWanted = true;
+    } else if (e.code === 'KeyM') {
+      this.muteWanted = true;
     }
   };
 
@@ -704,6 +887,7 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
 
   private readonly onPointerDown = (e: PointerEvent): void => {
     if (e.button !== 0 || getMode() !== 'sorang') return;
+    this.music.unlock();
     const canvas = this.renderer.domElement;
     if (!this.renderer.xr.isPresenting && document.pointerLockElement !== canvas) {
       canvas.requestPointerLock();
@@ -722,7 +906,8 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     if (e.pointerId !== this.downId) return;
     this.downId = -1;
     if (getMode() !== 'sorang') return;
-    if (Math.hypot(e.clientX - this.down.x, e.clientY - this.down.y) < CLICK_SLOP) this.toggleWanted = true;
+    // Once the song has ended, a click plays it again.
+    if (Math.hypot(e.clientX - this.down.x, e.clientY - this.down.y) < CLICK_SLOP && this.timeline.phase === 'ended') this.rewindWanted = true;
   };
 
   private readonly onPointerMove = (e: PointerEvent): void => {
@@ -740,6 +925,17 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     if (this.pitch < -PITCH_LIMIT) this.pitch = -PITCH_LIMIT;
     this.armWalk();
   };
+
+  /** In the headset: a trigger or pinch plays the song again once it has ended; A or X restarts it. */
+  private readXRButtons(): void {
+    if (!this.renderer.xr.isPresenting) return;
+    const pads = this.input.xr.gamepads;
+    const left = pads.left;
+    const right = pads.right;
+    const select = (left?.getButtonDown(InputComponent.Trigger) ?? false) || (right?.getButtonDown(InputComponent.Trigger) ?? false);
+    const restart = (left?.getButtonDown(InputComponent.X_Button) ?? false) || (right?.getButtonDown(InputComponent.A_Button) ?? false);
+    if (restart || (select && this.timeline.phase === 'ended')) this.rewindWanted = true;
+  }
 
   /** WASD and arrows walk. Shift is faster. Returns true when the key belongs to the walk. */
   private takeMoveKey(e: KeyboardEvent): boolean {
@@ -885,26 +1081,40 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
         return sys.isReady();
       },
       get T() {
-        return timeline.frozen ?? timeline.T;
+        return timeline.shownT;
+      },
+      get song() {
+        return timeline.frozen ?? timeline.song;
       },
       get stage() {
         return timeline.stage;
       },
-      seek: (t) => timeline.seek(t),
-      freeze: (t) => timeline.freeze(t),
+      get phase() {
+        return timeline.phase;
+      },
+      seek: (s) => {
+        timeline.freeze(null);
+        timeline.start();
+        this.music.play(s);
+      },
+      freeze: (s) => timeline.freeze(s),
       pause: () => {
-        timeline.paused = true;
+        if (!timeline.paused) this.togglePause();
       },
       play: () => {
-        timeline.paused = false;
+        if (timeline.paused) this.togglePause();
       },
-      reform: () => timeline.toggle(),
+      rewind: () => this.rewind(),
       setPhotos: (on) => {
         this.photosOn = on;
       },
       setView: (on) => {
         this.viewOn = on;
       },
+      setBloom: (on) => {
+        this.bloomOn = on;
+      },
+      feel: () => ({ ...this.feel }),
       paintingRect: () => this.paintingRect(),
       stats: () => this.stats(),
     };
@@ -940,9 +1150,13 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     return { x0, y0, x1, y1 };
   }
 
-  private stats(): Record<string, number> {
+  private stats(): Record<string, number | string> {
     const info = this.renderer.info;
+    const src = this.bloom.sourceSize;
     return {
+      bloom: this.bloom.mode ?? 'off',
+      bloomSize: `${src.w}x${src.h}`,
+      music: this.music.isSilent ? 'silent' : this.music.isPlaying ? 'playing' : this.music.needsGesture ? 'locked' : 'idle',
       calls: info.render.calls,
       triangles: info.render.triangles,
       points: info.render.points,
@@ -976,5 +1190,7 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     this.atlas?.texture.dispose();
     this.pendingAtlas?.texture.dispose();
     this.blank.dispose();
+    this.bloom.dispose();
+    this.music.dispose();
   }
 }

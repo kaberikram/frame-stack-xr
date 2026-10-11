@@ -91,7 +91,7 @@ const PARAM = typeof location === 'undefined' ? null : new URLSearchParams(locat
 /** Browser hints about choices made on purpose: shown, but as plain lines, not warnings. */
 const BENIGN = /willReadFrequently/;
 /** One-shot session lines that must stay on the panel however much else is logged after them. */
-const PINNED = /^(build|session|depth|camera pick|camera frames|lens f=|xr multiview)\b/;
+const PINNED = /^(build|session|depth|camera pick|camera frames|lens f=|xr multiview|sorang bloom)\b/;
 
 /** The last ROWS lines, oldest first, in arrays allocated once. */
 class ConsoleLines {

@@ -1,32 +1,42 @@
 /**
- * Sorang's clock. One timeline value `T` (seconds at pace 1) drives every stage, so any
- * moment can be rendered directly, and reform is the same timeline played backwards.
+ * Sorang's clock. One timeline value `T` drives every stage, so any moment can be rendered
+ * directly, and running T backwards replays the picture in reverse. The song drives T through
+ * `SONG_MAP` in `sorang-song.ts`; before it starts, a short pre-roll fades the painting in.
  * No three.js here: the system turns these plain numbers into uniforms.
  */
+import { ORBIT_FROM, songDirection, songT } from './sorang-song.js';
 
-/** Seconds. Each stage ramps a 0..1 clock across its window; the shader staggers within it. */
+/**
+ * Stage windows in T units. Each stage ramps a 0..1 clock across its window; the shader
+ * staggers within it. They follow one another so the song map can give each its own section.
+ */
 export const SCHEDULE = {
   show: [0, 1],
-  relief: [3, 5.5],
-  quant: [5.5, 6],
-  fan: [5.5, 10],
-  scan: [6, 10],
-  arcIn: [5.5, 9],
-  arcOut: [9, 12],
-  burst: [9.5, 12.5],
-  drift: [11.5, 15],
+  relief: [3, 6],
+  quant: [6, 6.5],
+  scan: [6.5, 11],
+  fan: [11, 15],
+  arcIn: [11, 14],
+  arcOut: [15, 17],
+  burst: [15, 18],
+  drift: [17, 21],
 } as const;
 
-/** The timeline waits here until the painting, depth and photos have each landed or given up. */
+/** The pre-roll waits here, on the clean painting, until everything has landed and the song can start. */
 export const HOLD_AT = 3;
-/** Past this the pieces only orbit: T stops and the orbit clock runs on. */
-export const END = 15;
+/** Past this the pieces only orbit. */
+export const END = 21;
 /** The orbit clock wraps here; every orbit frequency is a whole number of turns per wrap. */
 export const ORBIT_WRAP = 600;
 /** The 100 depth slices. */
 export const SLICES = 100;
+/** T units per second while R rewinds the pieces into the painting before the song restarts. */
+const REWIND_RATE = 12;
 
 export type SorangStage = 'fade' | 'hold' | 'rest' | 'relief' | 'fan' | 'burst' | 'drift' | 'orbit' | 'reform';
+
+/** `preroll` fades in and holds, `playing` follows the song, `rewind` runs home for a restart, `ended` rests. */
+export type SorangPhase = 'preroll' | 'playing' | 'rewind' | 'ended';
 
 export interface SorangClocks {
   show: number;
@@ -44,11 +54,6 @@ export interface SorangClocks {
   sway: number;
   /** Orbit clock, seconds, wrapped. */
   orbit: number;
-}
-
-export interface SorangGates {
-  /** All of painting, depth and photos have landed or given up. */
-  ready: boolean;
 }
 
 export function createClocks(): SorangClocks {
@@ -75,102 +80,109 @@ export function clocksAt(t: number, orbit: number, out: SorangClocks): SorangClo
   return out;
 }
 
+/** The orbit clock at song second `s`: deterministic, so a frozen moment always orbits the same. */
+export function orbitAt(s: number, rate: number): number {
+  return (Math.max(0, s - ORBIT_FROM) * rate) % ORBIT_WRAP;
+}
+
 export class SorangTimeline {
   T = 0;
-  /** 1 plays forward, -1 reforms. */
-  dir: 1 | -1 = 1;
+  /** Song seconds the picture is showing. */
+  song = 0;
+  phase: SorangPhase = 'preroll';
   paused = false;
-  /** Reformed and waiting on the clean painting for the next click. */
-  resting = false;
-  orbit = 0;
-  /** A frozen timeline (`?sorangT=`) ignores pace, gates and input. */
+  /** A frozen timeline (`?sorangT=`, in song seconds) ignores the music, gates and input. */
   frozen: number | null = null;
-  private holding = false;
 
+  /** Back to black: fade in, then hold for the song. */
   restart(): void {
     this.T = 0;
-    this.dir = 1;
+    this.song = 0;
+    this.phase = 'preroll';
     this.paused = false;
-    this.resting = false;
-    this.orbit = 0;
-    this.holding = false;
   }
 
-  /** Click or R: send the pieces out, or bring them back. Ignored before the painting has played. */
-  toggle(): boolean {
-    // T sits exactly at HOLD_AT only while holding for the gates (paused or not) or resting.
-    if (this.frozen !== null || this.T < HOLD_AT || this.holding || (this.T === HOLD_AT && !this.resting)) return false;
+  /** Run the pieces home, then start the song again from the top. Ignored before anything has moved. */
+  rewind(): void {
+    if (this.frozen !== null) return;
     this.paused = false;
-    if (this.resting) {
-      this.resting = false;
-      this.dir = 1;
-      return true;
-    }
-    this.dir = this.dir > 0 ? -1 : 1;
-    return true;
+    if (this.phase === 'preroll') return;
+    // The orbit clock keeps its song time through the rewind, so orbiting pieces don't jump.
+    this.phase = this.T > HOLD_AT ? 'rewind' : 'preroll';
+    if (this.phase === 'preroll') this.song = 0;
+  }
+
+  /** The T on screen: the frozen moment's, or the running one. */
+  get shownT(): number {
+    return this.frozen !== null ? songT(this.frozen) : this.T;
+  }
+
+  /** The pre-roll has reached the clean painting and waits for the song. */
+  get waiting(): boolean {
+    return this.frozen === null && this.phase === 'preroll' && this.T >= HOLD_AT;
+  }
+
+  /** The song has started; T follows it from the held painting. */
+  start(): void {
+    this.phase = 'playing';
+    this.paused = false;
+    this.song = 0;
+    this.T = songT(0);
+  }
+
+  /** The song has finished: rest on the painting until asked again. */
+  finish(): void {
+    if (this.phase !== 'playing') return;
+    this.phase = 'ended';
+    this.T = HOLD_AT;
   }
 
   togglePause(): void {
     if (this.frozen === null) this.paused = !this.paused;
   }
 
-  freeze(t: number | null): void {
-    this.frozen = t === null ? null : Math.max(0, Math.min(t, END + ORBIT_WRAP));
-  }
-
-  /** Jump to `t` and keep playing forward from there. */
-  seek(t: number): void {
-    this.frozen = null;
-    this.T = Math.max(0, Math.min(t, END + ORBIT_WRAP));
-    this.orbit = Math.max(0, this.T - SCHEDULE.drift[0]) % ORBIT_WRAP;
-    this.T = Math.min(this.T, END);
-    this.dir = 1;
-    this.resting = false;
-    this.paused = false;
+  freeze(s: number | null): void {
+    this.frozen = s === null ? null : Math.max(0, s);
   }
 
   /**
-   * `dt` is the ECS frame delta, so `ecs_step` advances it exactly. `orbitRate` slows
-   * the orbits under reduced motion.
+   * `dt` is the ECS frame delta, so `ecs_step` advances the pre-roll and the rewind exactly.
+   * `song` is the song's playback time, read by the system from the music. `orbitRate` slows the
+   * orbits under reduced motion.
    */
-  update(dt: number, gates: SorangGates, pace: number, reformSpeed: number, orbitRate: number, out: SorangClocks): SorangClocks {
+  update(dt: number, song: number, orbitRate: number, out: SorangClocks): SorangClocks {
     if (this.frozen !== null) {
-      const t = this.frozen;
-      return clocksAt(Math.min(t, END), Math.max(0, t - SCHEDULE.drift[0]) % ORBIT_WRAP, out);
+      const s = this.frozen;
+      return clocksAt(songT(s), orbitAt(s, orbitRate), out);
     }
-    if (!this.paused && !this.resting) {
-      // Re-evaluated only while time moves, so a paused hold still reads as a hold.
-      this.holding = false;
-      if (this.dir > 0) {
-        const next = this.T + dt * pace;
-        if (!gates.ready && this.T <= HOLD_AT && next > HOLD_AT) {
-          this.T = HOLD_AT;
-          this.holding = true;
-        } else {
-          this.T = Math.min(END, next);
-        }
-      } else {
-        this.T -= dt * pace * reformSpeed;
+    if (!this.paused) {
+      if (this.phase === 'preroll') {
+        this.T = Math.min(HOLD_AT, this.T + dt);
+      } else if (this.phase === 'rewind') {
+        this.T -= dt * REWIND_RATE;
         if (this.T <= HOLD_AT) {
           this.T = HOLD_AT;
-          this.dir = 1;
-          this.resting = true;
+          this.song = 0;
+          this.phase = 'preroll';
         }
+      } else if (this.phase === 'playing') {
+        this.song = song;
+        this.T = songT(song);
       }
-      if (this.T >= SCHEDULE.drift[0]) this.orbit = (this.orbit + dt * orbitRate) % ORBIT_WRAP;
     }
-    return clocksAt(this.T, this.orbit, out);
+    return clocksAt(this.T, orbitAt(this.song, orbitRate), out);
   }
 
   get stage(): SorangStage {
     if (this.frozen === null) {
-      if (this.resting) return 'rest';
-      if (this.dir < 0) return 'reform';
+      if (this.phase === 'ended') return 'rest';
+      if (this.phase === 'rewind') return 'reform';
+      if (this.phase === 'preroll') return this.T < SCHEDULE.show[1] ? 'fade' : 'hold';
     }
-    const t = this.frozen ?? this.T;
-    if (t < SCHEDULE.show[1]) return 'fade';
-    if (t < HOLD_AT) return 'hold';
-    if (t <= HOLD_AT && this.holding) return 'hold';
+    const s = this.frozen ?? this.song;
+    if (songDirection(s) < 0) return 'reform';
+    const t = this.frozen !== null ? songT(s) : this.T;
+    if (t <= HOLD_AT) return 'hold';
     if (t < SCHEDULE.fan[0]) return 'relief';
     if (t < SCHEDULE.burst[0]) return 'fan';
     if (t < SCHEDULE.drift[0]) return 'burst';

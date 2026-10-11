@@ -1,5 +1,6 @@
-/** Sorang's files: the default painting, its baked depth, and the stock-photo atlas. */
+/** Sorang's files: the default painting, its baked depth, the stock-photo atlas, and the song. */
 import { DataArrayTexture, LinearFilter, LinearMipmapLinearFilter, SRGBColorSpace } from '@iwsdk/core';
+import { parseCues, type MusicCues } from './sorang-song.js';
 
 const BASE = import.meta.env.BASE_URL;
 export const PAINTING_URL = `${BASE}sorang/painting.jpg`;
@@ -9,6 +10,9 @@ export const PAINTING_DEPTH = `${BASE}depth/sorang-painting`;
 /** Built by `scripts/sorang/build_atlas.py`: 100 Lorem Picsum photos, darkest first. */
 export const PHOTOS_URL = `${BASE}sorang/photos.jpg`;
 export const PHOTOS_META_URL = `${BASE}sorang/photos.json`;
+/** The soundtrack, and its cues baked by `scripts/sorang/bake_music.py`; re-run it if the song changes. */
+export const MUSIC_URL = `${BASE}sorang/music.mp3`;
+export const MUSIC_CUES_URL = `${BASE}sorang/music-cues.json`;
 
 const DISPLAY_LONG = 1024;
 const DEPTH_LONG = 768;
@@ -159,4 +163,10 @@ export async function loadPhotoAtlas(): Promise<PhotoAtlas> {
   texture.generateMipmaps = true;
   texture.needsUpdate = true;
   return { texture, means };
+}
+
+export async function loadMusicCues(): Promise<MusicCues> {
+  const res = await fetch(MUSIC_CUES_URL);
+  if (!res.ok) throw new Error(`music cues ${res.status}`);
+  return parseCues(await res.json());
 }
