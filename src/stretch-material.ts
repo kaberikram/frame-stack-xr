@@ -98,15 +98,25 @@ export function createRubberUniforms() {
     uHov1: { value: new Vector4() },
     uHovT1: { value: new Vector3() },
     uHovN1: { value: new Vector3(0, 1, 0) },
-    // A wall section pushed in by a palm (push-box.ts): the opening's centre, its axes along the wall
-    // with their half sizes in w, the wall's normal toward you, and how deep it went. The room leaves
-    // the opening undrawn while uBoxOn is set; the box draws into it.
+    // A wall pushed in by a palm: its rectangle's centre, its axes along the wall with their half sizes
+    // in w, the wall's normal toward you, and how deep it went. Everything in its slab slides back.
     uBoxOn: { value: 0 },
     uBoxC: { value: new Vector3() },
     uBoxU: { value: new Vector4(1, 0, 0, 0) },
     uBoxV: { value: new Vector4(0, 1, 0, 0) },
     uBoxN: { value: new Vector3(0, 0, 1) },
     uBoxDepth: { value: 0 },
+    // The pushed wall's own photo (its own slot, so both hands keep pinching through theirs).
+    uPhoto2: { value: null as Texture | null },
+    uWorldToClip2: { value: new Matrix4() },
+    uCamPos2: { value: new Vector3() },
+    uGain2: { value: new Vector3(1, 1, 1) },
+    uHasPhoto2: { value: 0 },
+    uFill2: { value: null as Texture | null },
+    uFillToClip2: { value: new Matrix4() },
+    uFillCam2: { value: new Vector3() },
+    uHasFill2: { value: 0 },
+    uFade2: { value: 0 },
   };
 }
 
@@ -141,27 +151,14 @@ float taffyBehind(float t, float ramp) {
 `;
 
 /**
- * A pushed-in box: the room over its opening is not drawn, so the box shows through it, from this far
- * in front of the wall to this far behind the box's back. A picture frame goes in with the wall; a
- * shelf, or anyone in front of it, stays and hides the box behind (and a pinch there grabs it).
+ * A pushed wall's slab: everything from SLAB_BACK behind the wall to SLAB_FRONT in front of it, over
+ * its rectangle and SLAB_EDGE past it (into the room's corners), slides back with the wall. Past
+ * those edges it fades out over SLAB_RAMP, so the floor, ceiling and side walls stretch after it.
  */
-export const BOX_SKIN = 0.06;
-
-const BOX_HOLE = /* glsl */ `
-#ifdef BOX_HOLE
-const float BOX_SKIN = ${BOX_SKIN.toFixed(3)};
-// The opening stops this far short of the box's rim, so the room overlaps it: a pixel the rim's edge
-// only grazes is still the wall, never a crack.
-const float BOX_LIP = 0.004;
-bool inBoxOpening(vec3 rest) {
-  if (uBoxOn < 0.5) return false;
-  vec3 q = rest - uBoxC;
-  float dn = dot(q, uBoxN);
-  return dn < BOX_SKIN && dn > -max(uBoxDepth, 0.0) - BOX_SKIN &&
-    abs(dot(q, uBoxU.xyz)) < uBoxU.w - BOX_LIP && abs(dot(q, uBoxV.xyz)) < uBoxV.w - BOX_LIP;
-}
-#endif
-`;
+export const SLAB_FRONT = 0.9;
+const SLAB_BACK = 0.1;
+const SLAB_EDGE = 0.05;
+const SLAB_RAMP = 0.1;
 
 const VERTEX = /* glsl */ `
 uniform vec3 uG0; uniform vec3 uD0; uniform vec3 uAxis0; uniform vec3 uN0; uniform vec3 uLift0;
@@ -194,6 +191,26 @@ varying float vViewZ; // metres in front of this eye, after the stretch
 // of its tip, and the surface's normal there.
 uniform vec4 uHov0; uniform vec3 uHovT0; uniform vec3 uHovN0;
 uniform vec4 uHov1; uniform vec3 uHovT1; uniform vec3 uHovN1;
+
+uniform float uBoxOn; uniform vec3 uBoxC; uniform vec4 uBoxU; uniform vec4 uBoxV; uniform vec3 uBoxN; uniform float uBoxDepth;
+varying float vW2; // how much a pushed wall's slab carries this point (it reads that wall's photo)
+const float SLAB_FRONT = ${SLAB_FRONT.toFixed(3)};
+const float SLAB_BACK = ${SLAB_BACK.toFixed(3)};
+const float SLAB_EDGE = ${SLAB_EDGE.toFixed(3)};
+const float SLAB_RAMP = ${SLAB_RAMP.toFixed(3)};
+
+/** 1 where a pushed wall's slab carries this rest point, fading to 0 past its front and edges. */
+float pushSlab(vec3 rest) {
+  if (uBoxOn < 0.5) return 0.0;
+  vec3 q = rest - uBoxC;
+  float dn = dot(q, uBoxN);
+  if (dn < -SLAB_BACK) return 0.0;
+  float u = abs(dot(q, uBoxU.xyz)) - uBoxU.w - SLAB_EDGE;
+  float v = abs(dot(q, uBoxV.xyz)) - uBoxV.w - SLAB_EDGE;
+  return (1.0 - smoothstep(SLAB_FRONT - SLAB_RAMP, SLAB_FRONT, dn))
+    * (1.0 - smoothstep(0.0, SLAB_RAMP, u))
+    * (1.0 - smoothstep(0.0, SLAB_RAMP, v));
+}
 
 const float SQUASH = 2.0;       // squeezed zones are 2 m long per metre pulled; slope stays above -0.75
 const float FOLDS = 5.0;        // radial creases in a cone
@@ -312,33 +329,6 @@ vec3 hover(vec3 p, vec4 hov, vec3 tip, vec3 n) {
   return (tip * pow(f, 2.5) + pull) * (1.0 - smoothstep(0.03, 0.06, abs(dn)));
 }
 
-#ifdef BOX
-uniform float uBoxOn; uniform vec3 uBoxC; uniform vec4 uBoxU; uniform vec4 uBoxV; uniform vec3 uBoxN; uniform float uBoxDepth;
-attribute float aShade;
-varying float vShade;
-const float BOX_DIM = 0.25;       // the far end of a box is this much darker
-const float BOX_DIM_DEPTH = 1.2;  // reached this far in, metres
-
-void main() {
-  // position: x and y across the opening (-1..1); z 0 at the wall, 1 at the back. Every point reads
-  // the photo where it sat on the wall, so the back is the wall itself and each side is the rim's
-  // colours drawn out along the depth.
-  vec3 rest = uBoxC + uBoxU.xyz * (uBoxU.w * position.x) + uBoxV.xyz * (uBoxV.w * position.y);
-  vec3 p = rest - uBoxN * (uBoxDepth * position.z);
-  vMid = rest;
-  vRest = rest;
-  vWorld = p;
-  vMask = vec2(1.0, 0.0);
-  vW = vec2(1.0, 0.0);
-  vTent = vec2(0.0);
-  vFold = vec2(0.0);
-  vShade = aShade * (1.0 - BOX_DIM * smoothstep(0.0, BOX_DIM_DEPTH, max(uBoxDepth, 0.0) * position.z));
-  vec4 viewPos = viewMatrix * vec4(p, 1.0);
-  vViewZ = -viewPos.z;
-  // Off: every vertex outside clip space. The program stays compiled, nothing rasterises.
-  gl_Position = uBoxOn > 0.5 ? projectionMatrix * viewPos : vec4(2.0, 2.0, 2.0, 1.0);
-}
-#else
 void main() {
   vec3 rest = (modelMatrix * vec4(position, 1.0)).xyz;
   vec3 p = rest;
@@ -364,6 +354,11 @@ void main() {
   own0 += length(h0);
   own1 += length(h1);
   seen += length(h0) + length(h1);
+  // A wall pushed in by a palm takes what stands against it back too; the room past it stretches after.
+  float slab = pushSlab(rest);
+  p -= uBoxN * (uBoxDepth * slab);
+  seen += slab * abs(uBoxDepth);
+  vW2 = slab;
   vMid = base1;
   vRest = rest;
   vWorld = p;
@@ -375,7 +370,6 @@ void main() {
   vViewZ = -viewPos.z;
   gl_Position = projectionMatrix * viewPos;
 }
-#endif
 `;
 
 const FRAGMENT = /* glsl */ `
@@ -399,6 +393,21 @@ uniform float uHasFill0;
 uniform float uHasFill1;
 uniform float uFade0;
 uniform float uFade1;
+uniform sampler2D uPhoto2;
+uniform mat4 uWorldToClip2;
+uniform vec3 uCamPos2;
+uniform vec3 uGain2;
+uniform float uHasPhoto2;
+uniform sampler2D uFill2;
+uniform mat4 uFillToClip2;
+uniform vec3 uFillCam2;
+uniform float uHasFill2;
+uniform float uFade2;
+uniform float uBoxDepth;
+varying float vW2;
+// A pushed wall's slab is this much darker by this far in, so a flat photo still reads as deep.
+const float SLAB_DIM = 0.25;
+const float SLAB_DIM_DEPTH = 1.2;
 uniform float uAnyPhoto;
 uniform float uFeather;
 uniform float uLinear;
@@ -445,16 +454,6 @@ varying float vViewZ;
 /** How much each grab's cone carries the pinched spot's colours up into it, 0 to 1. */
 uniform float uTentBloom0;
 uniform float uTentBloom1;
-uniform float uBoxOn;
-uniform vec3 uBoxC;
-uniform vec4 uBoxU;
-uniform vec4 uBoxV;
-uniform vec3 uBoxN;
-uniform float uBoxDepth;
-#ifdef BOX
-varying float vShade;
-#endif
-${BOX_HOLE}
 
 ${SHARED}
 
@@ -569,8 +568,8 @@ float realDepth() {
  * tracked hand, and only where the real surface is at that hand's depth: a mug or a lamp beside
  * the hand is in front of the room too, but it is not the hand.
  */
-// \`viewZ\` is where the surface sits for the in-front test: the drawn point for the room, but the
-// wall itself for a pushed-in box, which is drawn behind the real wall everywhere.
+// viewZ is where the surface sits for the in-front test: the nearer of where it is drawn and where
+// it really is, so a surface pushed in behind the real wall is not cut where a hand nears that wall.
 float handOcclusion(vec3 world, float viewZ, out float gate) {
   float handZ;
   float band;
@@ -659,19 +658,8 @@ void writeColor(vec3 lin, float alpha) {
 }
 
 void main() {
-#ifdef BOX
-  // A box's sides keep their rest point on the rim as they run back, so the rest position spans no
-  // area there: the wall's own normal stands in for the facing test.
-  vec3 nr = uBoxN;
-#else
   // Derivatives first: they are undefined after a non-uniform early return.
   vec3 nr = cross(dFdx(vRest), dFdy(vRest));
-#ifdef BOX_HOLE
-  // Only in its own program: a discard anywhere in a shader costs every pinch its early depth test.
-  // Cloth pinched out of the opening draws where it went; what is still there leaves it to the box.
-  if (inBoxOpening(vRest) && inBoxOpening(vWorld)) discard;
-#endif
-#endif
 
 #ifdef LENS_OVERLAY
   // Alignment check: every other diagonal stripe is the live camera, projected where the surface is.
@@ -682,16 +670,7 @@ void main() {
     bool inside = lc.w > 1e-4 && luv.x >= 0.0 && luv.y >= 0.0 && luv.x <= 1.0 && luv.y <= 1.0;
     float stripe = step(0.5, fract((gl_FragCoord.x + gl_FragCoord.y) / LENS_STRIPE));
     // Discarded, not drawn clear: a clear stripe would still write depth and cut what is behind it.
-    // With a box pushed in that depth is wanted: it keeps the box's outside hidden behind the wall.
-    if (!inside || stripe < 0.5) {
-#ifdef BOX_HOLE
-      if (uBoxOn > 0.5) {
-        gl_FragColor = vec4(0.0);
-        return;
-      }
-#endif
-      discard;
-    }
+    if (!inside || stripe < 0.5) discard;
     writeColor(sRGBTransferEOTF(texture(uLive, luv)).rgb, 1.0);
     return;
   }
@@ -702,11 +681,6 @@ void main() {
   // Where two grabs' streaks overlap, their pulls on the lookup are averaged, each weighted by its own
   // size, not added: added, they ran past each other into a mirrored strip. Weighted by size, each
   // fades out exactly where its pull does, so the blend has no seam at either pinch.
-#ifdef BOX
-  // A box only ever reads the wall where its points sat.
-  vec3 s = vRest;
-  float st = 0.0;
-#else
   float st0 = 0.0;
   float st1 = 0.0;
   vec4 o0 = uOn0 > 0.5 && uBloom0 > 0.0 && vW.x > 0.0 ? streakOffset(vRest, uG0, uD0, uAxis0, uN0, uBloom0, uRamp0, st0) : vec4(0.0);
@@ -720,7 +694,6 @@ void main() {
   if (uOn0 > 0.5 && uTentBloom0 > 0.0) s = mix(s, uG0, uTentBloom0 * pow(vTent.x, 0.7) * smoothstep(0.02, 0.1, vW.x));
   if (uOn1 > 0.5 && uTentBloom1 > 0.0) s = mix(s, uG1, uTentBloom1 * pow(vTent.y, 0.7) * smoothstep(0.02, 0.1, vW.y));
   float st = max(st0, st1);
-#endif
   // A squeezed zone reads the photo where it is drawn, which is what passthrough shows there,
   // so it fades into the real room without a seam.
   s = mix(s, vWorld, vMask.y);
@@ -729,10 +702,10 @@ void main() {
   // Where the surface barely moved, read the photo where it now sits too: the fade then crossfades
   // one picture with passthrough instead of two offset ones.
   vec3 sr = mix(vWorld, s, shown);
-  float own = max(smoothstep(0.0, 0.01, vW.x), smoothstep(0.0, 0.01, vW.y));
+  float own = max(max(smoothstep(0.0, 0.01, vW.x), smoothstep(0.0, 0.01, vW.y)), smoothstep(0.0, 0.01, vW2));
 #if defined(ENV_DEPTH) && !defined(LENS_OVERLAY)
   // Unmoved and unowned: nothing can show here (the alpha below is at most shown * own), so skip the
-  // four projections. Most of the room is this, every frame the room is drawn.
+  // projections. Most of the room is this, every frame the room is drawn.
   if (uOccDebug < 0.5 && shown * own < 0.002) {
     gl_FragColor = vec4(0.0);
     return;
@@ -754,6 +727,16 @@ void main() {
   // Coverage before masks bounds the alpha, so unmoved surfaces leave before any texture is read.
   float k0 = max(c0, cf0) * uFade0;
   float k1 = max(c1, cf1) * uFade1;
+  // A pushed wall's slab reads its own photo, where it sat.
+  float c2 = 0.0;
+  float cf2 = 0.0;
+  vec2 uv2 = vec2(0.0);
+  vec2 fuv2 = vec2(0.0);
+  if (vW2 > 0.0) {
+    c2 = photoCover(uWorldToClip2, uCamPos2, uHasPhoto2, sr, nr, streaked, uv2);
+    cf2 = photoCover(uFillToClip2, uFillCam2, uHasFill2, sr, nr, streaked, fuv2);
+  }
+  float k2 = max(c2, cf2) * uFade2;
 #ifdef PREVIEW
   // Desk without a webcam: a faint frost keeps the demo visible.
   float frost = (1.0 - uAnyPhoto) * 0.25;
@@ -761,7 +744,7 @@ void main() {
   // Headset: no photo, nothing drawn. Passthrough stays.
   const float frost = 0.0;
 #endif
-  float alpha = shown * max(own * max(k0, k1), frost);
+  float alpha = shown * max(own * max(max(k0, k1), k2), frost);
 
 #ifdef PREVIEW
   vec3 back = vec3(0.16) * (0.65 + 0.35 * abs(normalize(nr).y));
@@ -776,12 +759,8 @@ void main() {
 #else
 #ifdef ENV_DEPTH
   float gate = 0.0;
+  float refZ = min(vViewZ, -(viewMatrix * vec4(vRest, 1.0)).z);
   float occ = 0.0;
-#ifdef BOX
-  float refZ = -(viewMatrix * vec4(vRest, 1.0)).z;
-#else
-  float refZ = vViewZ;
-#endif
   vec4 dbg = vec4(0.0);
   // Developer views draw wherever the room is, moved or not. Otherwise only moved points are tested.
   if (uOccDebug > 0.5) {
@@ -805,12 +784,15 @@ void main() {
   vec4 p1 = k1 > 0.0 ? slotPicture(uPhoto1, uv1, c1, uFill1, fuv1, cf1, uGain1) : vec4(0.0);
   float w0 = uFade0 * (max(vW.x, 0.0) + OTHER_PHOTO);
   float w1 = uFade1 * (max(vW.y, 0.0) + OTHER_PHOTO);
-  float cover = p0.a * w0 + p1.a * w1;
-  vec3 col = (p0.rgb * w0 + p1.rgb * w1) / max(cover, 1e-7);
-  alpha = shown * max(own * max(p0.a * uFade0, p1.a * uFade1), frost);
+  vec4 p2 = k2 > 0.0 ? slotPicture(uPhoto2, uv2, c2, uFill2, fuv2, cf2, uGain2) : vec4(0.0);
+  float w2 = uFade2 * max(vW2, 0.0);
+  float cover = p0.a * w0 + p1.a * w1 + p2.a * w2;
+  vec3 col = (p0.rgb * w0 + p1.rgb * w1 + p2.rgb * w2) / max(cover, 1e-7);
+  alpha = shown * max(own * max(max(p0.a * uFade0, p1.a * uFade1), p2.a * uFade2), frost);
   // A cone's folds read as cloth even in a flat photo: valleys a little darker, ridges a little lighter.
   float creases = clamp((uOn0 > 0.5 ? vFold.x : 0.0) + (uOn1 > 0.5 ? vFold.y : 0.0), -1.0, 1.0);
   col *= 1.0 + 0.05 * max(creases, 0.0) - 0.18 * max(-creases, 0.0);
+  col *= 1.0 - SLAB_DIM * smoothstep(0.0, SLAB_DIM_DEPTH, max(uBoxDepth, 0.0) * vW2);
 #ifdef ENV_DEPTH
   // Debug views paint the cut instead of cutting.
   if (uOccDebug < 0.5) {
@@ -820,17 +802,10 @@ void main() {
 #endif
 #ifdef PREVIEW
   col = cover > 1e-7 ? col : vec3(0.92);
-#ifdef BOX
-  col *= vShade;
-#endif
   col = mix(back, col, alpha);
   gl_FragColor = vec4(col, 1.0);
   #include <colorspace_fragment>
 #else
-#ifdef BOX
-  // Each face its own light, deeper darker: a flat photo still reads as a box.
-  col *= vShade;
-#endif
 #ifdef ENV_DEPTH
   if (dbg.a > 0.0) {
     // Over the stretch, premultiplied: a debug colour over a masked hole stays its own colour.
@@ -844,70 +819,21 @@ void main() {
 }
 `;
 
-const DEPTH_VERTEX = /* glsl */ `
-varying vec3 vRest;
-void main() {
-  vRest = (modelMatrix * vec4(position, 1.0)).xyz;
-  gl_Position = projectionMatrix * viewMatrix * vec4(vRest, 1.0);
-}
-`;
-
-const DEPTH_FRAGMENT = /* glsl */ `
-uniform float uBoxOn;
-uniform vec3 uBoxC;
-uniform vec4 uBoxU;
-uniform vec4 uBoxV;
-uniform vec3 uBoxN;
-uniform float uBoxDepth;
-varying vec3 vRest;
-${BOX_HOLE}
-void main() {
-  if (inBoxOpening(vRest)) discard;
-  gl_FragColor = vec4(0.0);
-}
-`;
-
-/**
- * The room while a pushed-in box is all there is to draw: nothing moves and nothing shows, so it
- * only writes depth, for the box's rim and for whatever stands in front of it. A fraction of the
- * full program's cost, for a box that may stay in for minutes.
- */
-export function roomDepthMaterial(uniforms: RubberUniformSet): ShaderMaterial {
-  return new ShaderMaterial({
-    uniforms,
-    vertexShader: DEPTH_VERTEX,
-    fragmentShader: DEPTH_FRAGMENT,
-    name: 'jonze-room-depth',
-    defines: { BOX_HOLE: '' },
-    transparent: false,
-    depthTest: true,
-    depthWrite: true,
-    side: DoubleSide,
-    toneMapped: false,
-  });
-}
-
-/** `hole` cuts a pushed-in box's opening out of the room; `box` is the box itself (push-box.ts). */
-export type RubberVariant = 'room' | 'hole' | 'box';
-
 /**
  * The scanned room, deformed in world space. Opaque on purpose: it writes premultiplied colour and
  * depth with blending off, so the nearest surface wins and alpha 0 shows passthrough.
  * `preview` adds the webcam backdrop for the desk stand-in; the headset program never samples video.
  */
-export function rubberMaterial(uniforms: RubberUniformSet, preview = false, lensOverlay = false, variant: RubberVariant = 'room'): ShaderMaterial {
+export function rubberMaterial(uniforms: RubberUniformSet, preview = false, lensOverlay = false): ShaderMaterial {
   const defines: Record<string, string> = {};
   if (preview) defines.PREVIEW = '';
   else defines.ENV_DEPTH = '';
   if (lensOverlay) defines.LENS_OVERLAY = '';
-  if (variant === 'hole') defines.BOX_HOLE = '';
-  if (variant === 'box') defines.BOX = '';
-  const name = variant === 'box' ? 'jonze-push-box' : variant === 'hole' ? 'jonze-stretch-hole' : 'jonze-stretch';
   return new ShaderMaterial({
     uniforms,
     vertexShader: VERTEX,
     fragmentShader: FRAGMENT,
-    name: preview ? `${name}-preview` : name,
+    name: preview ? 'jonze-stretch-preview' : 'jonze-stretch',
     defines,
     transparent: false,
     depthTest: true,
