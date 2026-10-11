@@ -2,6 +2,7 @@ import {
   BufferAttribute,
   BufferGeometry,
   CanvasTexture,
+  Euler,
   Group,
   InstancedBufferAttribute,
   InstancedBufferGeometry,
@@ -9,6 +10,7 @@ import {
   Mesh,
   PlaneGeometry,
   Points,
+  Quaternion,
   SRGBColorSpace,
   Vector2,
   Vector3,
@@ -52,6 +54,12 @@ const GATE_TIMEOUT_MS = 8000;
 const REACH = 2.2;
 /** A click on the canvas moves less than this, in CSS pixels. */
 const CLICK_SLOP = 5;
+/** Desktop walk, once the view is clicked: metres per second, and the faster rate while Shift is held. */
+const WALK = 1.8;
+const WALK_FAST = 4.2;
+/** Radians per pixel of mouse look, and the pitch limit so the view can't flip. */
+const LOOK_SENS = 0.0022;
+const PITCH_LIMIT = 1.45;
 /** Where the painting hangs if the scene has no Sorang node. */
 const FALLBACK_POS = new Vector3(0, 1.6, -2.5);
 const reduceMotion = matchMedia('(prefers-reduced-motion: reduce)');
@@ -152,6 +160,20 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
   private readonly down = new Vector2();
   private swayClock = 0;
   private restD = 2.5;
+  /** Desktop: the viewer has taken the camera. The scripted swing stays until the first look or step. */
+  private walking = false;
+  private yaw = 0;
+  private pitch = 0;
+  /** Set when the click only asked for the mouse, so it does not also reform the painting. */
+  private lookGrab = false;
+  private readonly move = { forward: 0, back: 0, left: 0, right: 0, fast: 0 };
+  private readonly feet = new Vector3();
+  private readonly worldQuat = new Quaternion();
+  private readonly parentQuat = new Quaternion();
+  private readonly localQuat = new Quaternion();
+  private readonly euler = new Euler(0, 0, 0, 'YXZ');
+  private readonly flatForward = new Vector3(0, 0, -1);
+  private readonly flatRight = new Vector3(1, 0, 0);
 
   private readonly eye = new Vector3();
   private readonly centre = new Vector3();
@@ -199,7 +221,10 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     canvas.addEventListener('pointerdown', this.onPointerDown);
     canvas.addEventListener('pointerup', this.onPointerUp);
     window.addEventListener('pointermove', this.onPointerMove);
+    window.addEventListener('mousemove', this.onMouseLook);
     window.addEventListener('keydown', this.onKeyDown);
+    window.addEventListener('keyup', this.onKeyUp);
+    window.addEventListener('blur', this.onBlur);
     this.installHook();
 
     this.cleanupFuncs.push(
@@ -209,7 +234,11 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
         canvas.removeEventListener('pointerdown', this.onPointerDown);
         canvas.removeEventListener('pointerup', this.onPointerUp);
         window.removeEventListener('pointermove', this.onPointerMove);
+        window.removeEventListener('mousemove', this.onMouseLook);
         window.removeEventListener('keydown', this.onKeyDown);
+        window.removeEventListener('keyup', this.onKeyUp);
+        window.removeEventListener('blur', this.onBlur);
+        if (document.pointerLockElement === canvas) document.exitPointerLock();
         const w = window as unknown as { __sorang?: SorangHook };
         delete w.__sorang;
         this.dispose();
@@ -353,6 +382,7 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     this.toggleWanted = false;
     this.pauseWanted = false;
     this.downId = -1;
+    this.dropWalk();
   }
 
   // ---------------------------------------------------------------- loading
@@ -582,6 +612,10 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
 
     if (this.renderer.xr.isPresenting) {
       this.player.head.getWorldPosition(this.head);
+    } else if (this.walking) {
+      this.stepWalk(dt);
+      this.writeWalk(cam);
+      cam.getWorldPosition(this.head);
     } else {
       const still = this.timeline.frozen !== null || !this.viewOn;
       const reach = still ? 0 : this.look.parallax * (reduced ? 0.5 : 1);
@@ -645,9 +679,9 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
   // ---------------------------------------------------------------- input
 
   private readonly onKeyDown = (e: KeyboardEvent): void => {
+    if (this.takeMoveKey(e)) return;
     if (getMode() !== 'sorang' || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
-    const tag = (e.target as HTMLElement | null)?.tagName ?? '';
-    if (tag === 'BUTTON' || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || tag === 'A') return;
+    if (this.typing(e)) return;
     if (e.code === 'KeyR') {
       this.toggleWanted = true;
     } else if (e.code === 'Space') {
@@ -656,13 +690,35 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     }
   };
 
+  private readonly onKeyUp = (e: KeyboardEvent): void => {
+    this.releaseMoveKey(e.code);
+  };
+
+  private readonly onBlur = (): void => {
+    this.move.forward = 0;
+    this.move.back = 0;
+    this.move.left = 0;
+    this.move.right = 0;
+    this.move.fast = 0;
+  };
+
   private readonly onPointerDown = (e: PointerEvent): void => {
     if (e.button !== 0 || getMode() !== 'sorang') return;
+    const canvas = this.renderer.domElement;
+    if (!this.renderer.xr.isPresenting && document.pointerLockElement !== canvas) {
+      canvas.requestPointerLock();
+      this.lookGrab = true;
+      return;
+    }
     this.downId = e.pointerId;
     this.down.set(e.clientX, e.clientY);
   };
 
   private readonly onPointerUp = (e: PointerEvent): void => {
+    if (this.lookGrab) {
+      this.lookGrab = false;
+      return;
+    }
     if (e.pointerId !== this.downId) return;
     this.downId = -1;
     if (getMode() !== 'sorang') return;
@@ -674,6 +730,118 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     const h = Math.max(1, window.innerHeight);
     this.pointer.set((e.clientX / w) * 2 - 1, -((e.clientY / h) * 2 - 1));
   };
+
+  private readonly onMouseLook = (e: MouseEvent): void => {
+    if (getMode() !== 'sorang' || document.pointerLockElement !== this.renderer.domElement) return;
+    this.armWalk();
+    this.yaw -= e.movementX * LOOK_SENS;
+    this.pitch -= e.movementY * LOOK_SENS;
+    if (this.pitch > PITCH_LIMIT) this.pitch = PITCH_LIMIT;
+    if (this.pitch < -PITCH_LIMIT) this.pitch = -PITCH_LIMIT;
+    this.armWalk();
+  };
+
+  /** WASD and arrows walk. Shift is faster. Returns true when the key belongs to the walk. */
+  private takeMoveKey(e: KeyboardEvent): boolean {
+    const move = this.moveKey(e.code);
+    if (!move) return false;
+    if (getMode() !== 'sorang' || this.renderer.xr.isPresenting || this.typing(e)) return true;
+    e.preventDefault();
+    if (move === 'fast') this.move.fast = 1;
+    else {
+      this.move[move] = 1;
+      this.armWalk();
+    }
+    return true;
+  }
+
+  private releaseMoveKey(code: string): void {
+    const move = this.moveKey(code);
+    if (!move) return;
+    if (move === 'fast') this.move.fast = 0;
+    else this.move[move] = 0;
+  }
+
+  private moveKey(code: string): 'forward' | 'back' | 'left' | 'right' | 'fast' | null {
+    switch (code) {
+      case 'KeyW':
+      case 'ArrowUp':
+        return 'forward';
+      case 'KeyS':
+      case 'ArrowDown':
+        return 'back';
+      case 'KeyA':
+      case 'ArrowLeft':
+        return 'left';
+      case 'KeyD':
+      case 'ArrowRight':
+        return 'right';
+      case 'ShiftLeft':
+      case 'ShiftRight':
+        return 'fast';
+      default:
+        return null;
+    }
+  }
+
+  private typing(e: KeyboardEvent): boolean {
+    const tag = (e.target as HTMLElement | null)?.tagName ?? '';
+    return tag === 'BUTTON' || tag === 'INPUT' || tag === 'SELECT' || tag === 'TEXTAREA' || tag === 'A';
+  }
+
+  /** Keep the pose the scripted view had, then stop driving it. */
+  private armWalk(): void {
+    if (this.walking || this.renderer.xr.isPresenting || getMode() !== 'sorang') return;
+    const cam = this.camera;
+    cam.getWorldPosition(this.feet);
+    cam.getWorldQuaternion(this.worldQuat);
+    this.euler.setFromQuaternion(this.worldQuat, 'YXZ');
+    this.yaw = this.euler.y;
+    this.pitch = this.euler.x;
+    this.walking = true;
+  }
+
+  private dropWalk(): void {
+    this.walking = false;
+    this.lookGrab = false;
+    this.onBlur();
+    if (document.pointerLockElement === this.renderer.domElement) document.exitPointerLock();
+  }
+
+  private stepWalk(dt: number): void {
+    this.euler.set(this.pitch, this.yaw, 0, 'YXZ');
+    this.worldQuat.setFromEuler(this.euler);
+    this.tmp.set(0, 0, -1).applyQuaternion(this.worldQuat);
+    this.tmp.y = 0;
+    if (this.tmp.lengthSq() > 0.04) {
+      this.tmp.normalize();
+      this.flatForward.copy(this.tmp);
+      this.tmp.set(1, 0, 0).applyQuaternion(this.worldQuat);
+      this.tmp.y = 0;
+      if (this.tmp.lengthSq() > 1e-6) this.flatRight.copy(this.tmp.normalize());
+    }
+    const speed = (this.move.fast ? WALK_FAST : WALK) * dt;
+    const ahead = this.move.forward - this.move.back;
+    const side = this.move.right - this.move.left;
+    if (ahead !== 0) this.feet.addScaledVector(this.flatForward, ahead * speed);
+    if (side !== 0) this.feet.addScaledVector(this.flatRight, side * speed);
+  }
+
+  private writeWalk(cam: typeof this.camera): void {
+    this.tmp.copy(this.feet);
+    const parent = cam.parent;
+    if (parent) {
+      parent.updateWorldMatrix(true, false);
+      parent.worldToLocal(this.tmp);
+      parent.getWorldQuaternion(this.parentQuat);
+      this.localQuat.copy(this.parentQuat).invert().multiply(this.worldQuat);
+      cam.quaternion.copy(this.localQuat);
+    } else {
+      cam.quaternion.copy(this.worldQuat);
+    }
+    cam.position.copy(this.tmp);
+    cam.updateMatrixWorld();
+  }
 
   // ---------------------------------------------------------------- rig + helpers
 

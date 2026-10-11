@@ -169,9 +169,9 @@
         <p class="source" id="sorangSource">Opening the painting</p>
         <p>A painting hangs in the dark, as tall as you. It takes on depth, splits into 100 slices by depth, and turns out to be a mosaic of 100 photos. Then the pieces fly out around you.</p>
         <ol>
-          <li>Click, or press R, to bring the pieces back. Again sends them out.</li>
-          <li>Move the mouse to look around the edges. Space pauses.</li>
-          <li>Esc shows or hides this card.</li>
+          <li>Click the view, then look with the mouse. WASD walks, Shift is faster. Esc releases the mouse.</li>
+          <li>Click again, or press R, to bring the pieces back. Space pauses.</li>
+          <li>Esc shows or hides this card once the mouse is free.</li>
         </ol>
         <p class="note">Load image plays any picture instead. Its depth comes from a model that downloads the first time.</p>
         <p class="credit">Tile photos from <a href="https://picsum.photos" target="_blank" rel="noopener">Lorem Picsum</a>, by Unsplash photographers.</p>
@@ -187,7 +187,7 @@
       <input id="imageFile" type="file" accept="image/*" hidden />
     </section>
     <button class="chip" id="cardBtn" type="button" hidden>Show card</button>
-    <p class="tip" id="sorangTip" role="status" hidden>Click or press R to bring them back.</p>
+    <p class="tip" id="sorangTip" role="status" hidden>Click to look around. WASD walks. R brings them back.</p>
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
     <script type="module" src="/src/index.ts"></script>
   </body>

@@ -25,7 +25,7 @@ const STRETCH_HINT = 'Round 7. Hold an open palm up to a wall, then push.';
 const STRETCH_CAMERA = 'Camera on. Push a palm into a wall, or pinch and pull.';
 const STRETCH_ASKING = 'Allow the camera so the pull can show your room.';
 const STRETCH_BLOCKED = 'Camera blocked. Allow it for this site so the pull can show your room.';
-const SORANG_HINT = 'Desktop preview. Headset support comes later.';
+const SORANG_HINT = 'Click the view to look around. WASD walks. Shift is faster.';
 const SORANG_TIP_MS = 4000;
 
 const TITLES: Record<ExperienceMode, string> = { stack: 'Frame stack', stretch: 'Jonze stretch', sorang: 'Sorang' };
@@ -248,6 +248,8 @@ export class LauncherSystem extends createSystem({}) {
     };
     const onKey = (e: KeyboardEvent) => {
       if (e.code !== 'Escape' || e.repeat || getMode() !== 'sorang') return;
+      // The first Esc releases the mouse. The card toggles once the view is free.
+      if (document.pointerLockElement) return;
       this.cardOpen = !this.cardOpen;
       syncCard();
     };
