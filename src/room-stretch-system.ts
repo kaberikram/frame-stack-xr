@@ -24,6 +24,7 @@ import {
 import { EnvDepth } from './env-depth.js';
 import { PREVIEW_FORCED, getMode } from './experience.js';
 import { HandOccluder, SEGMENTS } from './hand-occluder.js';
+import { MapFrame } from './map-frame.js';
 import { countStraight, makePalmPose, readPalm, type PalmPose } from './palm-pose.js';
 import { drawHint, makeCanvas, type Canvas2D } from './labels.js';
 import { cameraMount, PassthroughPhoto, type CameraMount, type CameraSideSetting, type HandJoints } from './passthrough-photo.js';
@@ -33,7 +34,7 @@ import { RoomPlanes, type PlaneHit, type PlaneMiss } from './room-planes.js';
 import { StretchLook } from './stretch-component.js';
 import { Spring, averageNormal, buildTriGrid, rayTriGrid, triangleNormal, type RayHit, type TriGrid } from './stretch-math.js';
 import { Stillness } from './touch-logic.js';
-import { BOX_SKIN, type RubberUniformSet } from './stretch-material.js';
+import { BOX_FRONT, type RubberUniformSet } from './stretch-material.js';
 import { StretchSound } from './stretch-sound.js';
 
 type Side = 'left' | 'right';
@@ -125,11 +126,11 @@ const SPIKE_LIVE_AFTER = 0.5;
 /** The spike's foot glides after the fingertip with this time constant (s). */
 const SPIKE_GLIDE = 0.04;
 /**
- * Palm push: an open palm held up to a wall, facing it, in front of your eyes and still for a moment,
- * captures that section of the wall; pushing the palm on sinks it in as a box, and it stays in.
+ * Palm push: an open palm held up to the mapped area, facing it, in front of your eyes and still for a
+ * moment, takes hold of it; pushing the palm on sinks it in as a box, and it stays in.
  * To arm, PALM_FINGERS fingers at least PALM_STRAIGHT straight, thumb off the index, the palm facing
- * away from you within PALM_CONE of your gaze, facing the wall, and clear of it. Held, it lets go
- * when the fingers curl, the palm turns off the wall, tracking drops, or the hand leaves the box.
+ * away from you within PALM_CONE of your gaze, and facing the wall. Held, it lets go when the fingers
+ * curl, the palm turns off the wall, tracking drops, or the hand leaves the box.
  */
 const PALM_STRAIGHT = 0.88;
 const PALM_FINGERS = 3;
@@ -141,26 +142,21 @@ const PALM_CONE = Math.cos((30 * Math.PI) / 180);
 const PALM_REACH_MIN = 0.2;
 const PALM_FACE = 0.6;
 const PALM_KEEP_FACE = Math.cos((70 * Math.PI) / 180);
-const PALM_OFF_WALL = 0.12;
 const PALM_STILL_RADIUS = 0.035;
 const PALM_STILL_HOLD = 0.25;
 /** An open palm that has not armed for this long says why, once. */
 const PALM_WHY_AFTER = 0.5;
-/** A wall: |n.y| under PUSH_WALL_UP, this near to this far. */
+/** A wall to map, or for an open palm near it to stand a vacuum spike down: |n.y| under PUSH_WALL_UP. */
 const PUSH_WALL_UP = 0.5;
-const PUSH_WALL_MIN = 0.4;
-const PUSH_WALL_MAX = 5;
 /**
- * The box is PUSH_WIDTH across, centred on where your palm's line of sight meets the wall, and floor
- * to ceiling: the detected wall's own height, PUSH_EDGE in, or PUSH_HEIGHT up from the floor. Past a
- * room corner the side wall hides the rest. Never under PUSH_HALF_FLOOR either way.
+ * The box is the area you mapped: a pinch on a wall dragged to the opposite corner, at least MAP_MIN
+ * each way. Never under PUSH_HALF_FLOOR either way.
  */
-const PUSH_WIDTH = 4;
-const PUSH_HEIGHT = 2.4;
-const PUSH_EDGE = 0.02;
+const MAP_MIN = 0.3;
 const PUSH_HALF_FLOOR = 0.12;
-/** With no detected floor below, the floor is taken this far under your head. */
-const PUSH_FLOOR_BELOW = 1.6;
+/** The desk demo's box: the stand-in wall, 2 cm in from its edges. */
+const DEMO_HALF_W = 1.98;
+const DEMO_HALF_H = 1.18;
 /** A photo is tried at most every PUSH_RETRY, the live frame from PUSH_LIVE_AFTER, and given up at PUSH_GIVE_UP. */
 const PUSH_RETRY = 0.3;
 const PUSH_LIVE_AFTER = 0.6;
@@ -189,9 +185,6 @@ const PUSH_RING = 64;
 /** Let go shallower than this and the box springs back out; deeper, it stays, with an inward nudge. */
 const PUSH_KEEP_MIN = 0.05;
 const PUSH_KICK = 0.15;
-/** A box replaced by a palm elsewhere springs out on this faster spring. */
-const PUSH_OUT_STIFF = 250;
-const PUSH_OUT_DAMP = 16;
 const PUSH_COOL = 0.4;
 /** A box resting on a live photo (the palm cut out of it) looks for a clean bank photo this often. */
 const PUSH_SWAP = 0.5;
@@ -404,11 +397,6 @@ interface PalmTrack {
   /** How long it has not been an open palm: the latch lets go only after a moment of it. */
   closedT: number;
   coolUntil: number;
-  /** The wall under it, for arming. */
-  readonly hit: Vector3;
-  readonly n: Vector3;
-  dist: number;
-  plane: number;
   why: string;
   openSince: number;
   whyLogged: boolean;
@@ -419,7 +407,7 @@ function makePalmTrack(side: Side): PalmTrack {
   return {
     side, pose: makePalmPose(), valid: false, open: false, keep: false,
     still: new Stillness(PALM_STILL_RADIUS, PALM_STILL_HOLD), latch: false, closedT: 0, coolUntil: 0,
-    hit: new Vector3(), n: new Vector3(0, 0, 1), dist: 0, plane: -1, why: '', openSince: -1, whyLogged: false,
+    why: '', openSince: -1, whyLogged: false,
     hold: { on: false, ray0: new Vector3(), reach0: 0.4, depth0: 0, gain: 1, curlT: 0, turnT: 0, lostT: 0, leaveT: 0, onset: -1 },
   };
 }
@@ -470,6 +458,7 @@ interface BoxState {
 
 const enum Card {
   None,
+  Map,
   Pinch,
   Scan,
   Spatial,
@@ -477,7 +466,8 @@ const enum Card {
 }
 const COPY: Record<Card, { title: string; body: string }> = {
   [Card.None]: { title: '', body: '' },
-  [Card.Pinch]: { title: 'Pinch anything and pull', body: 'Or hold a palm up to a wall and push.' },
+  [Card.Map]: { title: 'Map the wall to push', body: 'Pinch a corner, drag to the opposite one.' },
+  [Card.Pinch]: { title: 'Pinch anything and pull', body: 'Or hold a palm up to the box and push.' },
   [Card.Scan]: { title: 'No room mesh yet', body: 'Finish Space Setup, then enter again.' },
   [Card.Spatial]: { title: 'Room scan is off', body: 'Allow spatial data, then enter again.' },
   [Card.Camera]: { title: 'Camera is off', body: 'Allow the camera, then enter again.' },
@@ -755,14 +745,29 @@ export class RoomStretchSystem extends createSystem({
   private readonly boxQ = new Vector3();
   /** Distance from the head to where the last boxHit() crossed the box's wall. */
   private boxT = 0;
-  /** The wall's height at the palm, from wallSpan(): offsets along the box's V. */
-  private spanLo = 0;
-  private spanHi = 0;
+  /**
+   * The area to push, mapped once a session: `mapping` until a pinch starts on a wall, `drag` while it
+   * is dragged out (corner A on the wall's plane, the other corner at u, v along U, V), `set` once let go.
+   */
+  private mapFrame!: MapFrame;
+  private readonly map = {
+    phase: 'mapping' as 'mapping' | 'drag' | 'set',
+    side: 'right' as Side,
+    A: new Vector3(),
+    N: new Vector3(0, 0, 1),
+    U: new Vector3(1, 0, 0),
+    V: new Vector3(0, 1, 0),
+    C: new Vector3(),
+    u: 0,
+    v: 0,
+    release: false,
+  };
 
   init(): void {
     this.overlay = new RoomMeshOverlay(this.scene, LENS_OVERLAY);
     if (LENS_OVERLAY) console.info('[jonze] lens overlay: live camera in stripes over the room at rest; hold still to read it');
     this.hands = new HandOccluder(this.scene, OCC_DEBUG);
+    this.mapFrame = new MapFrame(this.scene);
     this.pushBox = new PushBox(this.scene, this.overlay.uniforms);
     this.photo.history = this.hands;
     this.joints.points = this.hands.points;
@@ -847,6 +852,7 @@ export class RoomStretchSystem extends createSystem({
       this.room.visible = false;
       this.overlay.hide(true);
       this.pushBox.setVisible(false, false);
+      this.mapFrame.setVisible(false);
       this.hands.setActive(false);
       this.stopCamera();
       this.clearGrabs();
@@ -885,6 +891,7 @@ export class RoomStretchSystem extends createSystem({
       this.stepPush(dt, now);
       this.resolvePending(this.left, dt, now);
       this.resolvePending(this.right, dt, now);
+      this.stepMap();
       this.stepHand(this.left, dt);
       this.stepHand(this.right, dt);
       this.stepHover(this.left, dt, now);
@@ -920,6 +927,7 @@ export class RoomStretchSystem extends createSystem({
       this.room.visible = false;
       this.overlay.hide(false);
       this.pushBox.setVisible(false, false);
+      this.mapFrame.setVisible(false);
       this.hands.setActive(false);
       this.hud.visible = false;
       this.sound.stop();
@@ -943,6 +951,7 @@ export class RoomStretchSystem extends createSystem({
       this.overlay.setLive(video, live, this.photo.worldToClip);
       this.publish(this.demoL, this.demoR, time, hasVideo);
       this.pushBox.setVisible(true, true);
+      this.mapFrame.setVisible(false);
       this.writePushBox(dt);
     }
     this.hud.visible = true;
@@ -1176,6 +1185,8 @@ export class RoomStretchSystem extends createSystem({
     const grab = side === 'left' ? this.left : this.right;
     grab.pending = false;
     if (grab.holding) this.release(grab);
+    // Events arrive outside the frame: the drag is set from the next update.
+    if (this.map.phase === 'drag' && this.map.side === side) this.map.release = true;
   };
 
   private refreshHands(): void {
@@ -1384,6 +1395,11 @@ export class RoomStretchSystem extends createSystem({
       console.warn(`[jonze] pinch ${tag}: no hand pose`);
       return;
     }
+    if (this.map.phase !== 'set') {
+      // Until the area is mapped, a pinch maps it.
+      if (this.map.phase === 'mapping') this.startMap(grab);
+      return;
+    }
     if (this.pinchUndo(grab)) return;
     if (!this.raycast(this.head, this.pinch)) {
       console.warn(`[jonze] pinch ${tag}: no room mesh under the pinch (${this.scans.length} scans)`);
@@ -1476,7 +1492,8 @@ export class RoomStretchSystem extends createSystem({
    * slot, so then there is no spike.
    */
   private stepHover(grab: Grab, dt: number, now: number): void {
-    const free = !grab.pending && !grab.on && !this.pushOwns(grab.side);
+    const dragging = this.map.phase === 'drag' && this.map.side === grab.side;
+    const free = !grab.pending && !grab.on && !this.pushOwns(grab.side) && !dragging;
     if (!free) {
       // A pinch took over the slot: the spike springs down under the new pull, on its old fade, while
       // the pull's photo uploads and fades in.
@@ -1597,7 +1614,7 @@ export class RoomStretchSystem extends createSystem({
     switch (box.phase) {
       case 'none':
         for (const side of SIDES) {
-          if (this.candidate(this.palms[side], dt, now) === 'wall') {
+          if (this.candidate(this.palms[side], dt, now) === 'box') {
             this.beginSeek(this.palms[side], now);
             break;
           }
@@ -1630,24 +1647,11 @@ export class RoomStretchSystem extends createSystem({
             this.startHold(this.palms[side], now, box.target, 'rearm');
             break;
           }
-          if (kind === 'wall') {
-            // One box at a time: the old one springs out first, then this palm arms the new one.
-            box.next = side;
-            this.startOut(now, 'replace', PUSH_OUT_STIFF, PUSH_OUT_DAMP);
-            break;
-          }
         }
         break;
       case 'out':
         box.spring.step(0, dt, box.outStiff, box.outDamp);
-        if (box.spring.atRest(0, 0.01)) {
-          const next = box.next;
-          this.endBox(now, true);
-          if (next) {
-            const track = this.palms[next];
-            if (track.open && this.palmWall(track)) this.beginSeek(track, now);
-          }
-        }
+        if (box.spring.atRest(0, 0.01)) this.endBox(now, true);
         break;
     }
   }
@@ -1692,16 +1696,18 @@ export class RoomStretchSystem extends createSystem({
    * Whether this palm, held still, would arm: on the box (`box`, to push it again or join), or on a
    * wall elsewhere (`wall`). Says once, after a moment, why an open palm is not arming.
    */
-  private candidate(track: PalmTrack, dt: number, now: number): 'none' | 'box' | 'wall' {
+  private candidate(track: PalmTrack, dt: number, now: number): 'none' | 'box' {
     const grab = track.side === 'left' ? this.left : this.right;
     if (!track.open || track.latch || now < track.coolUntil || grab.pending || grab.on || grab.hovering) {
       if (!track.open) track.still.reset();
       return 'none';
     }
-    const boxed = this.box.phase === 'held' || this.box.phase === 'rest';
-    let kind: 'none' | 'box' | 'wall' = 'none';
-    if (boxed && this.boxHit(this.head, track.pose.centre, 0)) kind = 'box';
-    else if (this.palmWall(track)) kind = 'wall';
+    // Only the mapped area: a palm on it, facing it, takes hold of it.
+    let kind: 'none' | 'box' = 'none';
+    if (this.map.phase !== 'set') track.why = 'no map';
+    else if (!this.boxHit(this.head, track.pose.centre, 0)) track.why = 'off the map';
+    else if (-track.pose.normal.dot(this.box.N) < PALM_FACE) track.why = `face ${(-track.pose.normal.dot(this.box.N)).toFixed(2)}`;
+    else kind = 'box';
     if (kind === 'none') {
       track.still.reset();
       if (!track.whyLogged && now - track.openSince > PALM_WHY_AFTER) {
@@ -1714,58 +1720,17 @@ export class RoomStretchSystem extends createSystem({
     return track.still.update(c.x, c.y, c.z, dt) >= 1 ? kind : 'none';
   }
 
-  /** The wall along your line of sight through the palm, and whether the palm faces it, clear of it. */
-  private palmWall(track: PalmTrack): boolean {
-    const pose = track.pose;
-    this.pinch.copy(pose.centre);
-    if (!this.raycast(this.head, this.pinch) || !this.hitMesh) {
-      track.why = 'no wall';
-      return false;
-    }
-    const snapped = this.preferPlane(false);
-    const mesh = this.hitMesh;
-    mesh.updateWorldMatrix(true, false);
-    const hit = track.hit.copy(this.localHit).applyMatrix4(mesh.matrixWorld);
-    const n = track.n.copy(this.localN).transformDirection(mesh.matrixWorld);
-    track.plane = snapped ? this.planeHit.index : -1;
-    track.dist = hit.distanceTo(this.head);
-    const face = -pose.normal.dot(n);
-    if (Math.abs(n.y) >= PUSH_WALL_UP) track.why = n.y > 0 ? 'floor' : 'ceiling';
-    else if (track.dist < PUSH_WALL_MIN || track.dist > PUSH_WALL_MAX) track.why = `far ${track.dist.toFixed(1)}m`;
-    else if (face < PALM_FACE) track.why = `face ${face.toFixed(2)}`;
-    else if (this.tmpA.copy(pose.centre).sub(hit).dot(n) < PALM_OFF_WALL) track.why = 'touch';
-    else return true;
-    return false;
-  }
-
-  /** Lays the box's rectangle out on the wall under this palm and starts looking for its photo. */
+  /** The mapped area becomes the box: it starts looking for its photo. */
   private beginSeek(track: PalmTrack, now: number): void {
     const box = this.box;
-    const N = box.N.copy(track.n);
-    const C = box.C.copy(track.hit);
-    const U = box.U.set(0, 1, 0).cross(N).normalize();
-    const V = box.V.copy(N).cross(U);
-    box.dist = track.dist;
-    box.plane = track.plane;
-    // 4 m across on your palm, floor to ceiling: the wall's own height, or up from the floor.
-    box.hw = 0.5 * PUSH_WIDTH;
-    if (!this.wallSpan(track.plane, C, V)) {
-      this.spanLo = this.floorBelow() + PUSH_EDGE - C.y;
-      this.spanHi = this.spanLo + PUSH_HEIGHT;
-    }
-    box.hh = 0.5 * (this.spanHi - this.spanLo);
-    C.addScaledVector(V, 0.5 * (this.spanLo + this.spanHi));
+    box.dist = box.C.distanceTo(this.head);
+    box.plane = -1;
     box.fit = 1;
-    box.hit.copy(C);
+    box.hit.copy(box.C);
     box.bias = 0;
     box.hw0 = box.hw;
     box.hh0 = box.hh;
-    box.fit0 = box.fit;
-    if (box.hw < PUSH_HALF_FLOOR || box.hh < PUSH_HALF_FLOOR) {
-      console.info(`[jonze] push ${track.side === 'left' ? 'L' : 'R'}? edge ${(2 * box.hw).toFixed(2)}x${(2 * box.hh).toFixed(2)}`);
-      track.latch = true;
-      return;
-    }
+    box.fit0 = 1;
     box.phase = 'seek';
     box.side = track.side;
     box.seekAt = now;
@@ -1774,35 +1739,85 @@ export class RoomStretchSystem extends createSystem({
     track.still.reset();
   }
 
-  /**
-   * The detected wall's height along V at the palm's hit, PUSH_EDGE in, into spanLo/spanHi (offsets
-   * from `at`). False when the hit is on no detected wall, or its outline doesn't reach it.
-   */
-  private wallSpan(index: number, at: Vector3, V: Vector3): boolean {
-    const plane = index >= 0 ? this.roomPlanes.planes[index] : null;
-    if (!plane || plane.points < 3 || plane.horizontal) return false;
-    let lo = Infinity;
-    let hi = -Infinity;
-    for (let i = 0; i < plane.points; i++) {
-      const v = this.boxP.set(plane.polygon[i * 2], 0, plane.polygon[i * 2 + 1]).applyMatrix4(plane.world).sub(at).dot(V);
-      lo = Math.min(lo, v);
-      hi = Math.max(hi, v);
+  /** A pinch while mapping: its corner on the wall under it, the other corner following your fingers. */
+  private startMap(grab: Grab): void {
+    const tag = grab.side === 'left' ? 'L' : 'R';
+    if (!this.raycast(this.head, this.pinch) || !this.hitMesh) {
+      console.info(`[jonze] map ${tag}? no wall`);
+      this.sound.miss(grab.slot, this.pinch.x, this.pinch.y, this.pinch.z);
+      return;
     }
-    if (!(lo < 0 && hi > 0)) return false;
-    this.spanLo = lo + PUSH_EDGE;
-    this.spanHi = hi - PUSH_EDGE;
-    return true;
+    this.preferPlane(false);
+    const mesh = this.hitMesh;
+    mesh.updateWorldMatrix(true, false);
+    const map = this.map;
+    const n = this.tmpA.copy(this.localN).transformDirection(mesh.matrixWorld);
+    if (Math.abs(n.y) >= PUSH_WALL_UP) {
+      console.info(`[jonze] map ${tag}? ${n.y > 0 ? 'floor' : 'ceiling'}`);
+      this.sound.miss(grab.slot, this.pinch.x, this.pinch.y, this.pinch.z);
+      return;
+    }
+    map.A.copy(this.localHit).applyMatrix4(mesh.matrixWorld);
+    map.N.copy(n);
+    map.U.set(0, 1, 0).cross(map.N).normalize();
+    map.V.copy(map.N).cross(map.U);
+    map.u = 0;
+    map.v = 0;
+    map.side = grab.side;
+    map.release = false;
+    map.phase = 'drag';
   }
 
-  /** The height of the floor under you: the lowest detected floor plane, else PUSH_FLOOR_BELOW under your head. */
-  private floorBelow(): number {
-    let floor = Infinity;
-    for (let i = 0; i < this.roomPlanes.count; i++) {
-      const plane = this.roomPlanes.planes[i];
-      const e = plane.world.elements;
-      if (plane.horizontal && e[5] > 0.9 && e[13] < this.head.y - 0.5) floor = Math.min(floor, e[13]);
+  /**
+   * Every presenting frame: a drag follows your fingers along the wall's plane, and is set when you let
+   * go. The frame shows while you drag and while the area waits to be pushed.
+   */
+  private stepMap(): void {
+    const map = this.map;
+    if (map.phase === 'drag') {
+      if (this.pinchPoint(map.side, this.pinch)) {
+        const dir = this.tmpA.copy(this.pinch).sub(this.head);
+        const across = dir.dot(map.N);
+        if (across < -1e-4) {
+          const t = this.tmpB.copy(map.A).sub(this.head).dot(map.N) / across;
+          if (t > 0) {
+            const q = this.tmpB.copy(this.head).addScaledVector(dir, t).sub(map.A);
+            map.u = q.dot(map.U);
+            map.v = q.dot(map.V);
+          }
+        }
+      }
+      map.C.copy(map.A).addScaledVector(map.U, 0.5 * map.u).addScaledVector(map.V, 0.5 * map.v);
+      this.mapFrame.place(map.C, map.U, 0.5 * Math.abs(map.u), map.V, 0.5 * Math.abs(map.v), map.N);
+      if (map.release) this.setMap();
     }
-    return floor < Infinity ? floor : this.head.y - PUSH_FLOOR_BELOW;
+    const box = this.box.phase;
+    this.mapFrame.setVisible(map.phase === 'drag' || (map.phase === 'set' && (box === 'none' || box === 'seek')));
+  }
+
+  /** Let go of a drag: big enough, it is the area to push for the rest of the session. */
+  private setMap(): void {
+    const map = this.map;
+    const tag = map.side === 'left' ? 'L' : 'R';
+    map.release = false;
+    const w = Math.abs(map.u);
+    const h = Math.abs(map.v);
+    if (w < MAP_MIN || h < MAP_MIN) {
+      console.info(`[jonze] map ${tag}? small ${w.toFixed(2)}x${h.toFixed(2)}`);
+      map.phase = 'mapping';
+      return;
+    }
+    const box = this.box;
+    box.C.copy(map.C);
+    box.U.copy(map.U);
+    box.V.copy(map.V);
+    box.N.copy(map.N);
+    box.hw = 0.5 * w;
+    box.hh = 0.5 * h;
+    box.dist = box.C.distanceTo(this.head);
+    map.phase = 'set';
+    this.mapFrame.place(box.C, box.U, box.hw, box.V, box.hh, box.N);
+    console.info(`[jonze] map ${tag} wall ${box.dist.toFixed(1)}m ${w.toFixed(2)}x${h.toFixed(2)}`);
   }
 
   /** Centre first, then a 5x5 grid over the rectangle: all of it must be in the photo and clear of hands. */
@@ -2091,8 +2106,8 @@ export class RoomStretchSystem extends createSystem({
     if (this.raycast(this.head, this.pinch) && this.hitMesh) {
       this.hitMesh.updateWorldMatrix(true, false);
       const hit = this.tmpA.copy(this.localHit).applyMatrix4(this.hitMesh.matrixWorld);
-      // Something stands in front of the box (the room draws it there, past BOX_SKIN): pinch that instead.
-      if (hit.sub(box.C).dot(box.N) >= BOX_SKIN) return false;
+      // Something stands further out than the box takes in (a coffee table): pinch that instead.
+      if (hit.sub(box.C).dot(box.N) >= BOX_FRONT) return false;
     }
     this.pinched = true;
     this.startOut(performance.now() / 1000, `pinch ${grab.side === 'left' ? 'L' : 'R'}`, this.look.stiffness, this.look.damping);
@@ -2159,8 +2174,8 @@ export class RoomStretchSystem extends createSystem({
       box.U.set(1, 0, 0);
       box.V.set(0, 1, 0);
       box.N.set(0, 0, 1);
-      box.hw = 0.5 * PUSH_WIDTH - PUSH_EDGE;
-      box.hh = 1.2 - PUSH_EDGE;
+      box.hw = DEMO_HALF_W;
+      box.hh = DEMO_HALF_H;
       box.hw0 = box.hw;
       box.hh0 = box.hh;
       box.fit0 = 1;
@@ -2474,6 +2489,10 @@ export class RoomStretchSystem extends createSystem({
     this.photo.drop(0);
     this.photo.drop(1);
     this.clearPush();
+    // A new session, or leaving the mode: the area to push is mapped again.
+    this.map.phase = 'mapping';
+    this.map.release = false;
+    this.mapFrame.setVisible(false);
   }
 
   private resetGrab(grab: Grab): void {
@@ -2657,7 +2676,7 @@ export class RoomStretchSystem extends createSystem({
   private updateHud(dt: number, presenting: boolean, hasVideo: boolean, now: number): void {
     const want = this.cardFor(presenting, hasVideo, now);
     if (want !== Card.None && want !== this.cardShown) this.paintCard(want);
-    const holding = this.left.holding || this.right.holding || this.box.phase === 'held';
+    const holding = this.left.holding || this.right.holding || this.box.phase === 'held' || this.map.phase === 'drag';
     const target = want !== Card.None && !holding ? 1 : 0;
     this.placeCard(dt, target);
   }
@@ -2694,6 +2713,7 @@ export class RoomStretchSystem extends createSystem({
       return features && !features.includes('mesh-detection') ? Card.Spatial : Card.Scan;
     }
     if (!hasVideo && since > 3) return Card.Camera;
+    if (this.map.phase !== 'set' && this.scans.length) return Card.Map;
     if (!this.pinched && this.scans.length) return Card.Pinch;
     return Card.None;
   }
@@ -2845,6 +2865,7 @@ export class RoomStretchSystem extends createSystem({
     this.stopCamera();
     this.overlay.dispose();
     this.pushBox.dispose();
+    this.mapFrame.dispose();
     this.hands.dispose();
     this.photo.dispose();
     this.sound.dispose();
