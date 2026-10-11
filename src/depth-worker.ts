@@ -22,6 +22,8 @@ interface PrepareMsg {
 }
 interface EstimateMsg {
   type: 'estimate';
+  /** Echoed on every reply, so each caller only takes its own result. */
+  id: number;
   width: number;
   height: number;
   data: Uint8ClampedArray;
@@ -134,19 +136,19 @@ async function prepare(): Promise<void> {
   post({ type: 'ready' });
 }
 
-async function estimate(width: number, height: number, data: Uint8ClampedArray): Promise<void> {
+async function estimate(id: number, width: number, height: number, data: Uint8ClampedArray): Promise<void> {
   try {
     if (!pipe || !RawImage) await prepare();
     if (!pipe || !RawImage) throw new Error('depth model failed');
-    post({ type: 'progress', message: 'Reading depth' });
+    post({ type: 'progress', id, message: 'Reading depth' });
     const out = await pipe(new RawImage(data, width, height, 4));
     const depth = out.depth;
     if (!depth) throw new Error('model returned no depth map');
     const channels = depth.channels || 1;
     const gray = stretch(depth.data, channels, depth.width * depth.height);
-    post({ type: 'depth', width: depth.width, height: depth.height, data: gray }, [gray.buffer]);
+    post({ type: 'depth', id, width: depth.width, height: depth.height, data: gray }, [gray.buffer]);
   } catch (err) {
-    post({ type: 'error', message: err instanceof Error ? err.message : 'depth failed' });
+    post({ type: 'error', id, message: err instanceof Error ? err.message : 'depth failed' });
   }
 }
 
@@ -161,7 +163,7 @@ scope.onmessage = (event: MessageEvent<InMsg>) => {
           await prepare();
           return;
         case 'estimate':
-          await estimate(msg.width, msg.height, msg.data);
+          await estimate(msg.id, msg.width, msg.height, msg.data);
           return;
         default: {
           const never: never = msg;

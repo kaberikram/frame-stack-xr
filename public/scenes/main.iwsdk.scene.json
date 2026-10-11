@@ -56,6 +56,29 @@
         "StretchLook": {}
       },
       "children": []
+    },
+    {
+      "id": "sorang",
+      "name": "Sorang painting",
+      "metadata": {
+        "iwsdk.validation": {
+          "allowFloating": true
+        }
+      },
+      "content": {
+        "type": "group"
+      },
+      "transform": {
+        "position": [
+          0,
+          1.6,
+          -2.5
+        ]
+      },
+      "components": {
+        "SorangLook": {}
+      },
+      "children": []
     }
   ]
 }

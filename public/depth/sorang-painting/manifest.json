@@ -1,0 +1,8 @@
+{
+  "fps": 1,
+  "frames": 1,
+  "width": 512,
+  "height": 512,
+  "model": "onnx-community/depth-anything-v2-base",
+  "source": "image"
+}

@@ -94,13 +94,32 @@
         background: var(--surface); font-size: 13px;
       }
       .decoder { position: fixed; left: 0; top: 0; width: 1px; height: 1px; opacity: 0; pointer-events: none; }
+      .chip {
+        position: fixed; z-index: 2;
+        left: max(20px, env(safe-area-inset-left, 0px));
+        bottom: max(20px, env(safe-area-inset-bottom, 0px));
+        height: 32px; padding: 0 12px;
+        border: 1px solid var(--line); border-radius: 9px; background: rgba(20, 24, 34, 0.82);
+        color: var(--muted); font-size: 12.5px; font-weight: 650; cursor: pointer;
+        opacity: 0.6; transition: opacity 160ms ease;
+      }
+      .tip {
+        position: fixed; z-index: 2; left: 50%; transform: translateX(-50%);
+        bottom: max(24px, env(safe-area-inset-bottom, 0px));
+        margin: 0; padding: 8px 14px; border-radius: 9px;
+        background: rgba(20, 24, 34, 0.72); color: var(--muted); font-size: 12.5px;
+        pointer-events: none;
+      }
+      .credit { margin: 10px 0 0; color: var(--muted); font-size: 11.5px; }
+      .credit a { color: inherit; }
       @media (hover: hover) {
         .btn:not(:disabled):hover { background: var(--well); }
         .btn.primary:not(:disabled):hover { background: var(--text); opacity: 0.88; }
         .check:hover { color: var(--text); }
+        .chip:hover { opacity: 1; color: var(--text); }
       }
       @media (prefers-reduced-motion: reduce) {
-        .btn { transition: none; }
+        .btn, .chip { transition: none; }
         .btn:active { transform: none; }
       }
     </style>
@@ -112,6 +131,7 @@
       <div class="modes" role="tablist" aria-label="Experience">
         <button class="mode" id="modeStack" type="button" role="tab" aria-selected="true">Frame stack</button>
         <button class="mode" id="modeStretch" type="button" role="tab" aria-selected="false">Jonze stretch</button>
+        <button class="mode" id="modeSorang" type="button" role="tab" aria-selected="false">Sorang</button>
       </div>
       <div id="stackPanel">
         <p class="source" id="source">Opening the clip</p>
@@ -145,13 +165,29 @@
         </ol>
         <p class="note">At rest the room is untouched. On this screen a webcam stands in for passthrough.</p>
       </div>
+      <div id="sorangPanel" hidden>
+        <p class="source" id="sorangSource">Opening the painting</p>
+        <p>A painting hangs in the dark, as tall as you. It takes on depth, splits into 100 slices by depth, and turns out to be a mosaic of 100 photos. Then the pieces fly out around you.</p>
+        <ol>
+          <li>Click, or press R, to bring the pieces back. Again sends them out.</li>
+          <li>Move the mouse to look around the edges. Space pauses.</li>
+          <li>Esc shows or hides this card.</li>
+        </ol>
+        <p class="note">Load image plays any picture instead. Its depth comes from a model that downloads the first time.</p>
+        <p class="credit">Tile photos from <a href="https://picsum.photos" target="_blank" rel="noopener">Lorem Picsum</a>, by Unsplash photographers.</p>
+      </div>
       <div class="actions">
         <button class="btn" id="loadBtn" type="button">Load video</button>
+        <button class="btn" id="imageBtn" type="button" hidden>Load image</button>
+        <button class="btn primary" id="playBtn" type="button" hidden>Play again</button>
         <button class="btn primary" id="enterBtn" type="button" disabled>Enter passthrough</button>
       </div>
       <p class="hint" id="hint">In the headset, rest a fingertip on a table and hold still. The slider appears under your finger.</p>
       <input id="file" type="file" accept="video/*" hidden />
+      <input id="imageFile" type="file" accept="image/*" hidden />
     </section>
+    <button class="chip" id="cardBtn" type="button" hidden>Show card</button>
+    <p class="tip" id="sorangTip" role="status" hidden>Click or press R to bring them back.</p>
     <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
     <script type="module" src="/src/index.ts"></script>
   </body>

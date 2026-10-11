@@ -6,8 +6,12 @@ export interface DepthField {
   data: Uint8Array;
 }
 
+/** Each mode cancels only its own requests. */
+export type DepthOwner = 'stack' | 'sorang';
+
 interface WorkerMsg {
   type: string;
+  id?: number;
   message?: string;
   width?: number;
   height?: number;
@@ -16,31 +20,52 @@ interface WorkerMsg {
 
 let worker: Worker | null = null;
 let loading: Promise<void> | null = null;
-let serial = 0;
+let ready = false;
+let nextId = 0;
+const serials: Record<DepthOwner, number> = { stack: 0, sorang: 0 };
+/** Rejects every pending prepare and estimate if the worker dies, so nothing waits forever. */
+const failures = new Set<(error: Error) => void>();
 
 function depthWorker(): Worker {
   if (worker) return worker;
-  worker = new Worker(new URL('./depth-worker.ts', import.meta.url), { type: 'module' });
-  worker.addEventListener('error', () => {
+  const thread = new Worker(new URL('./depth-worker.ts', import.meta.url), { type: 'module' });
+  thread.addEventListener('error', () => {
+    if (worker === thread) worker = null;
+    thread.terminate();
     loading = null;
+    ready = false;
+    const pending = [...failures];
+    failures.clear();
+    for (const fail of pending) fail(new Error('depth worker failed'));
   });
-  return worker;
+  worker = thread;
+  return thread;
 }
 
 export function prepareDepthModel(): Promise<void> {
   if (loading) return loading;
   const thread = depthWorker();
   loading = new Promise((resolve, reject) => {
+    const done = () => {
+      thread.removeEventListener('message', onMessage);
+      failures.delete(fail);
+    };
+    const fail = (error: Error) => {
+      done();
+      reject(error);
+    };
     const onMessage = (event: MessageEvent<WorkerMsg>) => {
+      if (event.data.id !== undefined) return; // an estimate's reply
       if (event.data.type === 'ready') {
-        thread.removeEventListener('message', onMessage);
+        done();
+        ready = true;
         resolve();
       } else if (event.data.type === 'error') {
-        thread.removeEventListener('message', onMessage);
         loading = null;
-        reject(new Error(event.data.message ?? 'depth model failed'));
+        fail(new Error(event.data.message ?? 'depth model failed'));
       }
     };
+    failures.add(fail);
     thread.addEventListener('message', onMessage);
     thread.postMessage({ type: 'prepare' });
   });
@@ -48,25 +73,39 @@ export function prepareDepthModel(): Promise<void> {
 }
 
 /** Drops a result that lands after the card was closed. */
-export function cancelDepth(): void {
-  serial += 1;
+export function cancelDepth(owner: DepthOwner = 'stack'): void {
+  serials[owner] += 1;
 }
 
-export function estimateDepth(canvas: HTMLCanvasElement): Promise<DepthField> {
-  const ticket = ++serial;
+export function estimateDepth(
+  canvas: HTMLCanvasElement,
+  owner: DepthOwner = 'stack',
+  onProgress?: (message: string) => void,
+): Promise<DepthField> {
+  const ticket = ++serials[owner];
+  if (!ready) onProgress?.('Loading the depth model');
   return prepareDepthModel().then(async () => {
-    if (ticket !== serial) throw new Error('cancelled');
+    if (ticket !== serials[owner]) throw new Error('cancelled');
     const ctx = canvas.getContext('2d', { willReadFrequently: true });
     if (!ctx) throw new Error('depth failed');
     const pixels = ctx.getImageData(0, 0, canvas.width, canvas.height);
     const data = new Uint8ClampedArray(pixels.data);
     const thread = depthWorker();
-    return new Promise((resolve, reject) => {
+    const id = ++nextId;
+    return new Promise<DepthField>((resolve, reject) => {
+      const done = () => {
+        thread.removeEventListener('message', onMessage);
+        failures.delete(reject);
+      };
       const onMessage = (event: MessageEvent<WorkerMsg>) => {
         const msg = event.data;
-        if (msg.type === 'progress' || msg.type === 'ready') return;
-        thread.removeEventListener('message', onMessage);
-        if (ticket !== serial) {
+        if (msg.id !== id) return;
+        if (msg.type === 'progress') {
+          if (msg.message) onProgress?.(msg.message);
+          return;
+        }
+        done();
+        if (ticket !== serials[owner]) {
           reject(new Error('cancelled'));
           return;
         }
@@ -76,8 +115,9 @@ export function estimateDepth(canvas: HTMLCanvasElement): Promise<DepthField> {
         }
         reject(new Error(msg.message ?? 'depth failed'));
       };
+      failures.add(reject);
       thread.addEventListener('message', onMessage);
-      thread.postMessage({ type: 'estimate', width: canvas.width, height: canvas.height, data }, [data.buffer]);
+      thread.postMessage({ type: 'estimate', id, width: canvas.width, height: canvas.height, data }, [data.buffer]);
     });
   });
 }

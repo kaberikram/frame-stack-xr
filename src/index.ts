@@ -4,6 +4,7 @@ import { DebugConsoleSystem, installDebugConsole } from './debug-console.js';
 import { FrameStackSystem } from './frame-stack-system.js';
 import { LauncherSystem } from './launcher-system.js';
 import { RoomStretchSystem } from './room-stretch-system.js';
+import { SorangSystem } from './sorang-system.js';
 import { TableTouchSystem } from './table-touch-system.js';
 
 // Before World.create, so its own logs, errors and rejections reach the headset panel too.
@@ -15,6 +16,8 @@ World.create(document.getElementById('scene-container') as HTMLDivElement, proje
     .registerSystem(FrameStackSystem, { priority: 1 })
     .registerSystem(TableTouchSystem)
     .registerSystem(RoomStretchSystem)
+    // Before the launcher, which reaches it in init.
+    .registerSystem(SorangSystem)
     .registerSystem(LauncherSystem)
     // Runs last, so a line logged this frame is drawn this frame.
     .registerSystem(DebugConsoleSystem, { priority: 2 });
