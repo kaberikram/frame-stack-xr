@@ -6,8 +6,9 @@ import { AudioContext as SharedAudio } from '@iwsdk/core';
  * lydian glint and a soft glass hum; letting go falls down the home triad and lands on a major
  * chord as the spring passes rest, and its overshoot plays a quiet turn. The left hand plays an
  * octave lower, so two hands pulled together move in open fifths. Each hand's notes come from the
- * spot it grabbed. Runs on three's shared context, which IWSDK's listener already follows.
- * Silent until a user gesture unlocks audio.
+ * spot it grabbed. A fist's black hole rushes like air drawn through a gap, higher and louder as the
+ * tearing speeds up, and shuts with a thunk and the home chord two octaves down. Runs on three's
+ * shared context, which IWSDK's listener already follows. Silent until a user gesture unlocks audio.
  */
 
 const VOLUME = Math.pow(10, -14 / 20); // −14 dB
@@ -50,9 +51,39 @@ const GLINT_GAP = 0.8;
 const GLINT_SPACING = 0.045;
 /** The run holds back while the glint sparkles, so the two don't interleave. */
 const GLINT_HUSH = 0.09;
-const HUM_FADE = 0.06;
-/** The hum fades out by itself unless the next frame renews it, so a stalled XR loop can't leave it droning. */
-const HUM_WATCHDOG = 0.5;
+const SWELL_FADE = 0.06;
+/** The hum and the suction fade out by themselves unless the next frame renews them, so a stalled XR loop can't leave them droning. */
+const SWELL_WATCHDOG = 0.5;
+/** The suction's band: dull as the tearing starts, bright at the front's full speed. */
+const SUCK_LOW = 250;
+const SUCK_HIGH = 1200;
+const SUCK_Q = 1.5;
+/** The band glides to a new centre with this time constant, re-aimed only once that moves 3%. */
+const SUCK_GLIDE = 0.06;
+const SUCK_RETUNE = 0.03;
+/** Silent this long, the suction's source stops; the next breath starts a fresh one. */
+const SUCK_IDLE = 1;
+/** Seconds of looped noise for the suction and the closing click. */
+const NOISE_LENGTH = 2;
+/** The loop's first moments cross-fade from the run past its end over this long, so it has no seam. */
+const NOISE_SEAM = 0.02;
+/**
+ * Hot on purpose: the bandpass keeps about a tenth of pink noise's power, so the band comes out about
+ * as loud as a unit sine and SUCK_VEL reads like a note velocity.
+ */
+const NOISE_RMS = 2.2;
+/** The hole shuts: a sine falling this far over THUNK_DROP, with a quiet triangle an octave above it. */
+const THUNK_FROM = 160;
+const THUNK_TO = 55;
+const THUNK_DROP = 0.18;
+const THUNK_DECAY = 0.5;
+const THUNK_EDGE = 0.3;
+/** With the attack, about 30 ms of noise with its top cut off: the hole's lip closing. */
+const CLICK_DECAY = 0.024;
+const CLICK_TONE = 600;
+/** The home chord rises out of the thunk this much later, and rings a long while. */
+const GONE_TAIL = 0.08;
+const GONE_DECAY = 2.4;
 
 const STEP_VEL = 0.36;
 const GRAB_VEL = 0.26;
@@ -63,19 +94,27 @@ const DIP_VEL = 0.22;
 const TINK_VEL = 0.12;
 const HUM_VEL = 0.1;
 const MISS_VEL = 0.12;
+const SUCK_VEL = 0.08;
+const THUNK_VEL = 0.45;
+const CLICK_VEL = 0.12;
+/** Low notes sound quieter, so the tail isn't eased off toward its top as LAND_CHORD is. */
+const GONE_VEL = 0.2;
 
+const C2 = 65.41;
 const C3 = 130.81;
 const C4 = 261.63;
 const C5 = 523.25;
 const C6 = 1046.5;
 /**
  * Left hand roots at C4 and starts its run two notes up (E4), right roots at C5: pulled together they
- * move in open fifths. A pushed-in box is the third voice, an octave under the left hand.
+ * move in open fifths. A pushed-in box is the third voice, an octave under the left hand; a fist's
+ * black hole the fourth, an octave under that.
  */
-const ROOTS = [C4, C5, C3] as const;
-const OFFSETS = [2, 0, 0] as const;
-/** 0 left hand, 1 right hand, 2 a pushed-in box. */
-export type SoundSlot = 0 | 1 | 2;
+const ROOTS = [C4, C5, C3, C2] as const;
+const OFFSETS = [2, 0, 0, 0] as const;
+/** 0 left hand, 1 right hand, 2 a pushed-in box, 3 a fist's black hole. */
+export type SoundSlot = 0 | 1 | 2 | 3;
+const HOLE: SoundSlot = 3;
 const PENTATONIC = [0, 2, 4, 7, 9];
 /** Semitones above the hand's root. */
 const GRAB_CHORD = [0, 7, 14]; // C G D: open, waiting
@@ -115,7 +154,7 @@ interface Hand {
 }
 
 interface Voice {
-  osc: OscillatorNode | null;
+  source: AudioScheduledSourceNode | null;
   gain: GainNode | null;
   hand: number;
   start: number;
@@ -130,6 +169,15 @@ export class StretchSound {
   private readonly hands: readonly Hand[] = ROOTS.map((root, i) => makeHand(root, OFFSETS[i]));
   private readonly voices: Voice[] = Array.from({ length: MAX_VOICES }, makeVoice);
   private readonly tones = new Int32Array(8);
+  /** The hole's suction: looped pink noise (made once), a fresh source per start, one band and gain kept. */
+  private noise: AudioBuffer | null = null;
+  private suckSource: AudioBufferSourceNode | null = null;
+  private suckBand: BiquadFilterNode | null = null;
+  private suckGain: GainNode | null = null;
+  /** The band's last target. */
+  private suckFreq = 0;
+  /** When the suction last had a level above zero. */
+  private suckAt = 0;
 
   /** Call from a user gesture. Safe to call again; also resumes a context the session suspended. */
   unlock(): void {
@@ -232,6 +280,63 @@ export class StretchSound {
     }
   }
 
+  /**
+   * The hole, every frame while the void tears or drains: a rush of air at x/y/z, brighter and louder
+   * with `level` (0–1, the front's speed). 0 fades it out; it also falls quiet by itself if the
+   * frames stop coming.
+   */
+  suck(level: number, x: number, y: number, z: number): void {
+    if (level < EPS && !this.suckSource) return;
+    const ctx = this.running();
+    const h = this.hands[HOLE];
+    if (!ctx || !h.out) return;
+    const now = ctx.currentTime;
+    if (level < EPS) {
+      if (now - this.suckAt > SUCK_IDLE) this.endSuck(now, SWELL_FADE);
+      else this.swell(this.suckGain?.gain, now, 0);
+      return;
+    }
+    this.suckAt = now;
+    this.place(h, now, x, y, z);
+    if (!this.suckSource) this.startSuck(ctx, h.out, now);
+    const pull = Math.min(1, level);
+    const freq = SUCK_LOW * Math.pow(SUCK_HIGH / SUCK_LOW, pull);
+    if (this.suckBand && Math.abs(freq - this.suckFreq) > this.suckFreq * SUCK_RETUNE) {
+      this.suckFreq = freq;
+      this.suckBand.frequency.setTargetAtTime(freq, now, SUCK_GLIDE);
+    }
+    this.swell(this.suckGain?.gain, now, SUCK_VEL * pull);
+  }
+
+  /** The last shard is in: a thunk at x/y/z, the click of the hole shutting, then the home chord. Ends the suction. */
+  gone(x: number, y: number, z: number): void {
+    const ctx = this.running();
+    const h = this.hands[HOLE];
+    if (!ctx || !h.out) return;
+    const now = ctx.currentTime;
+    this.place(h, now, x, y, z);
+    this.endSuck(now, 0.1);
+    const at = now + LEAD;
+    // A sine for the weight, a triangle an octave up for an edge small speakers can carry.
+    for (let i = 0; i < 2; i++) {
+      const osc = ctx.createOscillator();
+      osc.type = i === 0 ? 'sine' : 'triangle';
+      osc.frequency.setValueAtTime(THUNK_FROM * (i + 1), at);
+      osc.frequency.exponentialRampToValueAtTime(THUNK_TO * (i + 1), at + THUNK_DROP);
+      this.play(HOLE, osc, osc, at, i === 0 ? THUNK_VEL : THUNK_VEL * THUNK_EDGE, THUNK_DECAY);
+    }
+    const click = ctx.createBufferSource();
+    click.buffer = this.noise ??= pinkNoise(ctx);
+    const lip = ctx.createBiquadFilter();
+    lip.type = 'lowpass';
+    lip.frequency.value = CLICK_TONE;
+    click.connect(lip);
+    this.play(HOLE, click, lip, at, CLICK_VEL, CLICK_DECAY);
+    for (let i = 0; i < LAND_CHORD.length; i++) {
+      this.note(HOLE, pitch(h.root, LAND_CHORD[i]), at + GONE_TAIL + i * 0.018, GONE_VEL, GONE_DECAY, true);
+    }
+  }
+
   /** Fades everything out, for leaving the mode or the session. Cheap when already quiet. */
   stop(): void {
     const ctx = this.ctx;
@@ -251,11 +356,19 @@ export class StretchSound {
       h.step = 0;
       h.glint = false;
     }
+    this.endSuck(now, 0.08);
   }
 
   /** Leaves the shared context running for everything else; only this synth's nodes go. */
   dispose(): void {
     this.stop();
+    this.suckSource?.stop();
+    this.suckSource = null;
+    this.suckBand?.disconnect();
+    this.suckGain?.disconnect();
+    this.suckBand = null;
+    this.suckGain = null;
+    this.noise = null;
     for (let i = 0; i < this.hands.length; i++) {
       this.hands[i].out?.disconnect();
       this.hands[i].out = null;
@@ -265,7 +378,7 @@ export class StretchSound {
     this.wave = null;
     this.ctx = null;
     for (let i = 0; i < this.voices.length; i++) {
-      this.voices[i].osc = null;
+      this.voices[i].source = null;
       this.voices[i].gain = null;
     }
   }
@@ -317,7 +430,7 @@ export class StretchSound {
         this.note(slot, pitch(C6, tone), now + LEAD + i * GLINT_SPACING, GLINT_VEL * (1 - i * 0.12), 0.8, false);
       }
     }
-    this.humTo(h, now, HUM_VEL * streak * tilt(h.step));
+    this.swell(h.humGain?.gain, now, HUM_VEL * streak * tilt(h.step));
   }
 
   /** Falls down the home triad from the note now sounding toward the root, at most four notes. */
@@ -387,25 +500,32 @@ export class StretchSound {
 
   private note(slot: number, freq: number, at: number, velocity: number, decay: number, warm: boolean): void {
     const ctx = this.ctx;
-    const out = this.hands[slot]?.out;
-    if (!ctx || !out || velocity < EPS) return;
-    const v = this.claim(ctx.currentTime);
+    if (!ctx || !this.hands[slot]?.out || velocity < EPS) return;
     const osc = ctx.createOscillator();
     if (warm && this.wave) osc.setPeriodicWave(this.wave);
     else osc.type = 'sine';
     osc.frequency.value = freq;
+    this.play(slot, osc, osc, at, velocity, decay);
+  }
+
+  /** `source`, shaped up to `tail`, as a pooled voice: a quick attack, then an exponential decay. */
+  private play(slot: number, source: AudioScheduledSourceNode, tail: AudioNode, at: number, velocity: number, decay: number): void {
+    const ctx = this.ctx;
+    const out = this.hands[slot]?.out;
+    if (!ctx || !out) return;
+    const v = this.claim(ctx.currentTime);
     const gain = ctx.createGain();
     gain.gain.setValueAtTime(EPS, at);
     gain.gain.linearRampToValueAtTime(velocity, at + ATTACK);
     gain.gain.exponentialRampToValueAtTime(EPS, at + ATTACK + decay);
-    osc.connect(gain).connect(out);
-    v.osc = osc;
+    tail.connect(gain).connect(out);
+    v.source = source;
     v.gain = gain;
     v.hand = slot;
     v.start = at;
     v.end = at + ATTACK + decay + 0.02;
-    osc.start(at);
-    osc.stop(v.end);
+    source.start(at);
+    source.stop(v.end);
     this.busy = true;
   }
 
@@ -435,12 +555,12 @@ export class StretchSound {
   }
 
   private fade(v: Voice, now: number, time: number): void {
-    if (!v.gain || !v.osc) return;
+    if (!v.gain || !v.source) return;
     const g = v.gain.gain;
     g.cancelScheduledValues(now);
     g.setValueAtTime(v.start > now ? 0 : g.value, now);
     g.linearRampToValueAtTime(0, now + time);
-    v.osc.stop(now + time + 0.005);
+    v.source.stop(now + time + 0.005);
   }
 
   private startHum(h: Hand, now: number): void {
@@ -465,13 +585,13 @@ export class StretchSound {
     this.busy = true;
   }
 
-  private humTo(h: Hand, now: number, level: number): void {
-    const g = h.humGain?.gain;
+  /** Eases a held level toward `level`, then on to silence unless the next frame asks again. */
+  private swell(g: AudioParam | undefined, now: number, level: number): void {
     if (!g || (level < EPS && g.value < EPS)) return;
     g.cancelScheduledValues(now);
     g.setValueAtTime(g.value, now);
-    g.linearRampToValueAtTime(level, now + HUM_FADE);
-    g.linearRampToValueAtTime(0, now + HUM_WATCHDOG);
+    g.linearRampToValueAtTime(level, now + SWELL_FADE);
+    g.linearRampToValueAtTime(0, now + SWELL_WATCHDOG);
   }
 
   private endHum(h: Hand, now: number, fade: number): void {
@@ -488,11 +608,47 @@ export class StretchSound {
     h.humGain = null;
   }
 
+  /** A fresh noise source into the band and gain, built the first time and kept after. */
+  private startSuck(ctx: AudioContext, out: AudioNode, now: number): void {
+    if (!this.suckBand || !this.suckGain) {
+      const band = ctx.createBiquadFilter();
+      band.type = 'bandpass';
+      band.frequency.value = SUCK_LOW;
+      band.Q.value = SUCK_Q;
+      const gain = ctx.createGain();
+      gain.gain.value = 0;
+      band.connect(gain).connect(out);
+      this.suckBand = band;
+      this.suckGain = gain;
+      this.suckFreq = SUCK_LOW;
+    }
+    const source = ctx.createBufferSource();
+    source.buffer = this.noise ??= pinkNoise(ctx);
+    source.loop = true;
+    source.connect(this.suckBand);
+    // A different spot in the loop each time, so a fresh breath doesn't replay the last one.
+    source.start(now, Math.random() * NOISE_LENGTH);
+    this.suckSource = source;
+    this.busy = true;
+  }
+
+  /** Fades the suction out and lets its source go; the band and gain stay for the next start. */
+  private endSuck(now: number, fade: number): void {
+    const source = this.suckSource;
+    const g = this.suckGain?.gain;
+    if (!source || !g) return;
+    g.cancelScheduledValues(now);
+    g.setValueAtTime(g.value, now);
+    g.linearRampToValueAtTime(0, now + fade);
+    source.stop(now + fade + 0.02);
+    this.suckSource = null;
+  }
+
   private running(): AudioContext | null {
     return this.ctx && this.input && this.ctx.state === 'running' ? this.ctx : null;
   }
 
-  /** Each hand's panner feeds one bus; a long dark room and a soft limiter sit after it. */
+  /** Each slot's panner feeds one bus; a long dark room and a soft limiter sit after it. */
   private ensureBus(ctx: AudioContext): void {
     if (this.input) return;
     const input = ctx.createGain();
@@ -559,7 +715,7 @@ function makeHand(root: number, offset: number): Hand {
 }
 
 function makeVoice(): Voice {
-  return { osc: null, gain: null, hand: 0, start: 0, end: 0 };
+  return { source: null, gain: null, hand: 0, start: 0, end: 0 };
 }
 
 /** Semitones above the root for a pentatonic step. */
@@ -597,5 +753,37 @@ function impulse(ctx: BaseAudioContext): AudioBuffer {
       data[pre + i] = soft * fade * fade * fade;
     }
   }
+  return buffer;
+}
+
+/** Pink noise that loops without a seam: its first moments cross-fade from the run past its end. */
+function pinkNoise(ctx: BaseAudioContext): AudioBuffer {
+  const rate = ctx.sampleRate;
+  const length = Math.floor(rate * NOISE_LENGTH);
+  const seam = Math.floor(rate * NOISE_SEAM);
+  const buffer = ctx.createBuffer(1, length, rate);
+  const data = buffer.getChannelData(0);
+  // Kellet's economy filter: within half a decibel of pink across the audible band.
+  let b0 = 0;
+  let b1 = 0;
+  let b2 = 0;
+  for (let i = 0; i < length + seam; i++) {
+    const white = Math.random() * 2 - 1;
+    b0 = 0.99765 * b0 + white * 0.099046;
+    b1 = 0.963 * b1 + white * 0.2965164;
+    b2 = 0.57 * b2 + white * 1.0526913;
+    const pink = b0 + b1 + b2 + white * 0.1848;
+    if (i < length) {
+      data[i] = pink;
+      continue;
+    }
+    const j = i - length;
+    const k = j / seam;
+    data[j] = data[j] * Math.sqrt(k) + pink * Math.sqrt(1 - k);
+  }
+  let sum = 0;
+  for (let i = 0; i < length; i++) sum += data[i] * data[i];
+  const scale = NOISE_RMS / Math.max(EPS, Math.sqrt(sum / length));
+  for (let i = 0; i < length; i++) data[i] *= scale;
   return buffer;
 }

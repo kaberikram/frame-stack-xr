@@ -10,7 +10,7 @@ import {
   type Material,
   type Object3D,
 } from '@iwsdk/core';
-import { MAX_TRIANGLES, TARGET_EDGE, type SnapPlane } from './mesh-subdivide.js';
+import { MAX_TRIANGLES, TARGET_EDGE, type ShardMesh, type ShardReply, type SnapPlane } from './mesh-subdivide.js';
 import type { RoomPlanes } from './room-planes.js';
 import { createRubberUniforms, roomDepthMaterial, rubberMaterial, type RubberUniformSet } from './stretch-material.js';
 
@@ -67,6 +67,11 @@ export class RoomMeshOverlay {
   readonly depthMaterial: ShaderMaterial;
   triangles = 0;
   ready = false;
+  /** The subdivide request the drawn dense room came from: shards cut from the same one match it. */
+  builtId = -1;
+  /** The latest cut of the room into shards for the fist's void, and the build it was cut from. */
+  shards: ShardMesh | null = null;
+  shardsId = -1;
 
   private worker: Worker | null = null;
   private requestId = 0;
@@ -99,6 +104,8 @@ export class RoomMeshOverlay {
   private current: ShaderMaterial;
   /** One degenerate triangle per extra program, drawn from the start so neither compiles on a push. */
   private readonly warmers: Mesh[] = [];
+  /** The fist's void owns the room: nothing of it draws, and nothing rebuilds or re-snaps under it. */
+  private held = false;
 
   constructor(private readonly parent: Object3D, lensOverlay = false) {
     this.uniforms = createRubberUniforms();
@@ -127,6 +134,12 @@ export class RoomMeshOverlay {
     this.current = variant === 'hole' ? this.holeMaterial : variant === 'depth' ? this.depthMaterial : this.material;
   }
 
+  /** While the void is up: hide the room and hold every rebuild and snap until it is let go. */
+  hold(on: boolean): void {
+    this.held = on;
+    if (on) this.warm = 0;
+  }
+
   /** Draw the room this frame. Off at rest, so nothing renders or uploads. */
   setActive(on: boolean): void {
     this.active = on;
@@ -146,6 +159,11 @@ export class RoomMeshOverlay {
     }
     for (let i = 0; i < drop.length; i++) this.release(drop[i]);
     for (let i = 0; i < sources.length; i++) this.paint(sources[i]);
+    if (this.held) {
+      if (this.dense) setShown(this.dense, false);
+      for (let i = 0; i < sources.length; i++) setShown(sources[i], false);
+      return;
+    }
 
     if (sources.length === 0) {
       if (this.dense) setShown(this.dense, false);
@@ -175,6 +193,7 @@ export class RoomMeshOverlay {
    * room; at most once a second. Tracking jitter below that never re-snaps.
    */
   syncPlanes(planes: RoomPlanes): void {
+    if (this.held) return;
     if (this.planesChanged(planes)) {
       const list: SnapPlane[] = [];
       for (let i = 0; i < planes.count; i++) {
@@ -345,7 +364,11 @@ export class RoomMeshOverlay {
   private thread(): Worker {
     if (this.worker) return this.worker;
     const worker = new Worker(new URL('./mesh-subdivide-worker.ts', import.meta.url), { type: 'module' });
-    worker.addEventListener('message', (event: MessageEvent<WorkerReply>) => this.apply(event.data));
+    worker.addEventListener('message', (event: MessageEvent<WorkerReply | ShardReply>) => {
+      const reply = event.data;
+      if (reply.kind === 'shards') this.takeShards(reply);
+      else this.apply(reply);
+    });
     this.worker = worker;
     return worker;
   }
@@ -384,11 +407,20 @@ export class RoomMeshOverlay {
       this.dense.geometry = geometry;
     }
     this.ready = true;
+    this.builtId = reply.id;
     this.warm = 2;
     this.triangles = reply.triangles;
     const edge = reply.edge >= 0.1 ? reply.edge.toFixed(2) : reply.edge.toFixed(3);
     console.info(`[jonze] dense room: ${reply.triangles} triangles, ${edge} m near edges, ${this.built.length} scans`);
     this.noteSnap(reply, snapped);
+  }
+
+  /** The room cut into shards, a moment after its dense build. A cut of an older build is dropped. */
+  private takeShards(reply: ShardReply): void {
+    if (reply.id !== this.requestId) return;
+    this.shards = reply;
+    this.shardsId = reply.id;
+    console.info(`[jonze] shards: ${reply.count} pieces, ${reply.triangles} triangles`);
   }
 
   /** Logs a snap only when its result changed: re-snaps that land the same push useful lines off the console. */

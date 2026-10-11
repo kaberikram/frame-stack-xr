@@ -107,6 +107,9 @@ export function createRubberUniforms() {
     uBoxV: { value: new Vector4(0, 1, 0, 0) },
     uBoxN: { value: new Vector3(0, 0, 1) },
     uBoxDepth: { value: 0 },
+    // Per hand, a ball round its cut segments (hand-occluder.ts balls). Wide open until written, so the
+    // cut never skips a hand it has not been told about.
+    uHandBall: { value: [new Vector4(0, 0, 0, 1e4), new Vector4(0, 0, 0, 1e4)] },
   };
 }
 
@@ -164,6 +167,190 @@ bool inBoxOpening(vec3 rest) {
     abs(dot(q, uBoxU.xyz)) < uBoxU.w - BOX_LIP && abs(dot(q, uBoxV.xyz)) < uBoxV.w - BOX_LIP;
 }
 #endif
+`;
+
+/**
+ * The real hands' cut, from the headset's depth (ENV_DEPTH only): the room, the void's black and its
+ * backstop all leave passthrough's hands showing through them with it.
+ */
+const DEPTH_CUT = /* glsl */ `
+#ifdef ENV_DEPTH
+uniform highp sampler2DArray uEnvDepth;
+uniform float uDepthOn;
+uniform float uDepthRaw;
+uniform float uDepthNear;
+uniform vec2 uEyeSize;
+uniform mat4 uNormDepth0;
+uniform mat4 uNormDepth1;
+uniform vec4 uSegA[${SEGMENTS}];
+uniform vec4 uSegB[${SEGMENTS}];
+uniform float uOccDebug;
+/** The gate fades out over this much beyond a segment's reach. */
+const float GATE_SOFT = 0.015;
+/** Depth nearer than this is a hole in the depth map, not a hand. */
+const float DEPTH_MIN = 0.12;
+/** Per hand, a ball round its cut segments (centre, radius; 0 off): a line of sight that misses both skips the loop. */
+uniform vec4 uHandBall[2];
+
+/** Closest distance between segments p0-p1 and q0-q1; the closest point on q0-q1 goes to 'onQ'. */
+float segmentClosest(vec3 p0, vec3 p1, vec3 q0, vec3 q1, out vec3 onQ) {
+  vec3 d1 = p1 - p0;
+  vec3 d2 = q1 - q0;
+  vec3 r = p0 - q0;
+  float a = max(dot(d1, d1), 1e-8);
+  float e = max(dot(d2, d2), 1e-8);
+  float b = dot(d1, d2);
+  float c = dot(d1, r);
+  float f = dot(d2, r);
+  float denom = a * e - b * b;
+  float s = denom > 1e-8 ? clamp((b * f - c * e) / denom, 0.0, 1.0) : 0.0;
+  float t = (b * s + f) / e;
+  if (t < 0.0) {
+    t = 0.0;
+    s = clamp(-c / a, 0.0, 1.0);
+  } else if (t > 1.0) {
+    t = 1.0;
+    s = clamp((b - c) / a, 0.0, 1.0);
+  }
+  onQ = q0 + d2 * t;
+  return length(p0 + d1 * s - onQ);
+}
+
+/** This eye's position. Under multiview viewMatrix is per eye; cameraPosition is the pair's midpoint. */
+vec3 eyePosition() {
+  return -(transpose(mat3(viewMatrix)) * viewMatrix[3].xyz);
+}
+
+/** True when the line of sight from the eye to this point passes through either hand's ball. */
+bool nearHand(vec3 eye, vec3 world) {
+  vec3 d = world - eye;
+  float dd = max(dot(d, d), 1e-8);
+  for (int i = 0; i < 2; i++) {
+    vec4 b = uHandBall[i];
+    if (b.w <= 0.0) continue;
+    float t = clamp(dot(b.xyz - eye, d) / dd, 0.0, 1.0);
+    if (length(eye + d * t - b.xyz) < b.w) return true;
+  }
+  return false;
+}
+
+/**
+ * 1 where the line of sight to this point passes through a tracked hand or forearm, 0 well clear.
+ * Also returns how far in front of this eye that hand is there, and how thick it is.
+ */
+float handGate(vec3 world, out float handZ, out float band) {
+  vec3 eye = eyePosition();
+  if (!nearHand(eye, world)) {
+    handZ = 0.0;
+    band = 0.04;
+    return 0.0;
+  }
+  float g = 0.0;
+  float nearest = 1e9;
+  vec3 at = world;
+  band = 0.04;
+  for (int i = 0; i < ${SEGMENTS}; i++) {
+    float kind = uSegA[i].w;
+    if (kind < 0.5) continue;
+    vec3 onSeg;
+    float d = segmentClosest(eye, world, uSegA[i].xyz, uSegB[i].xyz, onSeg);
+    float gi = 1.0 - smoothstep(uSegB[i].w, uSegB[i].w + GATE_SOFT, d);
+    if (gi > g || (gi == g && gi > 0.0 && d < nearest)) {
+      g = gi;
+      nearest = d;
+      at = onSeg;
+      band = kind > 1.5 ? 0.04 : 0.045;
+    }
+  }
+  handZ = -(viewMatrix * vec4(at, 1.0)).z;
+  return g;
+}
+
+float envMeters(vec2 uv, float layer) {
+  float t = textureLod(uEnvDepth, vec3(uv, layer), 0.0).r;
+  float m = uDepthRaw * uDepthNear / max(1.0 - t, 1e-5);
+  return m < DEPTH_MIN ? 1e4 : m;
+}
+
+/** The headset's depth of the real room at this pixel, metres; 1e4 where it has none. */
+float realDepth() {
+#ifdef VIEW_ID
+  float eye = float(VIEW_ID);
+  vec2 fc = gl_FragCoord.xy;
+#else
+  float eye = step(uEyeSize.x, gl_FragCoord.x);
+  vec2 fc = gl_FragCoord.xy - vec2(eye * uEyeSize.x, 0.0);
+#endif
+  vec2 uv = ((eye < 0.5 ? uNormDepth0 : uNormDepth1) * vec4(fc / uEyeSize, 0.0, 1.0)).xy;
+  // The nearest of five taps half a texel apart: covers the hand's edge without dilating it a texel.
+  vec2 texel = 0.5 / vec2(textureSize(uEnvDepth, 0).xy);
+  float real = envMeters(uv, eye);
+  real = min(real, envMeters(uv + vec2(texel.x, 0.0), eye));
+  real = min(real, envMeters(uv - vec2(texel.x, 0.0), eye));
+  real = min(real, envMeters(uv + vec2(0.0, texel.y), eye));
+  real = min(real, envMeters(uv - vec2(0.0, texel.y), eye));
+  return real;
+}
+
+/**
+ * How much a real hand or arm stands in front of this point of the stretch, from the headset's
+ * depth: 1 shows passthrough's real hand, 0 keeps the stretch. Only along the line of sight to a
+ * tracked hand, and only where the real surface is at that hand's depth: a mug or a lamp beside
+ * the hand is in front of the room too, but it is not the hand.
+ */
+// \`viewZ\` is where the surface sits for the in-front test: the drawn point for the room, but the
+// wall itself for a pushed-in box, which is drawn behind the real wall everywhere.
+float handOcclusion(vec3 world, float viewZ, out float gate) {
+  float handZ;
+  float band;
+  gate = handGate(world, handZ, band);
+  if (gate <= 0.0 || uDepthOn < 0.5) return 0.0;
+  float real = realDepth();
+  float atHand = 1.0 - smoothstep(band, band + 0.02, abs(real - handZ));
+  float margin = 0.01 + 0.02 * viewZ;
+  return gate * atHand * smoothstep(margin, margin + 0.02, viewZ - real);
+}
+
+#endif
+`;
+
+/** Reading the frozen photos and writing premultiplied colour. Needs uFeather and uLinear declared above it. */
+const PHOTO = /* glsl */ `
+float frameCover(vec4 clip, out vec2 uv) {
+  uv = clip.xy / max(clip.w, 1e-4) * 0.5 + 0.5;
+  if (clip.w <= 1e-4 || uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return 0.0;
+  float edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+  return smoothstep(0.0, max(uFeather, 1e-4), edge);
+}
+
+/**
+ * A premultiplied photo texel in linear light. The GPU decodes sRGB per channel after premultiplying,
+ * so a half-transparent edge texel of a hand cut-out came back too dark; that is undone here. Opaque
+ * and empty texels need nothing.
+ */
+vec4 photoTexel(sampler2D tex, vec2 uv) {
+  vec4 t = textureLod(tex, uv, 0.0);
+  if (t.a > 0.004 && t.a < 0.996) {
+    vec3 encoded = sRGBTransferOETF(vec4(t.rgb, 1.0)).rgb / t.a;
+    t.rgb = sRGBTransferEOTF(vec4(encoded, 1.0)).rgb * t.a;
+  }
+  return t;
+}
+
+/**
+ * Premultiplied output. The XR compositor reads the layer as sRGB and blends in linear light,
+ * so alpha has to be applied before the encode or every soft edge darkens into a rim.
+ */
+void writeColor(vec3 lin, float alpha) {
+  if (uLinear > 0.5) {
+    gl_FragColor = vec4(lin * alpha, alpha);
+    #include <colorspace_fragment>
+  } else {
+    gl_FragColor = vec4(lin, 1.0);
+    #include <colorspace_fragment>
+    gl_FragColor = vec4(gl_FragColor.rgb * alpha, alpha);
+  }
+}
 `;
 
 const VERTEX = /* glsl */ `
@@ -415,22 +602,6 @@ uniform sampler2D uLive;
 uniform mat4 uLiveToClip;
 uniform float uHasLive;
 #endif
-#ifdef ENV_DEPTH
-uniform highp sampler2DArray uEnvDepth;
-uniform float uDepthOn;
-uniform float uDepthRaw;
-uniform float uDepthNear;
-uniform vec2 uEyeSize;
-uniform mat4 uNormDepth0;
-uniform mat4 uNormDepth1;
-uniform vec4 uSegA[${SEGMENTS}];
-uniform vec4 uSegB[${SEGMENTS}];
-uniform float uOccDebug;
-/** The gate fades out over this much beyond a segment's reach. */
-const float GATE_SOFT = 0.015;
-/** Depth nearer than this is a hole in the depth map, not a hand. */
-const float DEPTH_MIN = 0.12;
-#endif
 #ifdef LENS_OVERLAY
 uniform float uLensOn;
 /** Stripe period in pixels: 48 px of camera, 48 px of passthrough. */
@@ -483,108 +654,9 @@ vec4 streakOffset(vec3 base, vec3 G, vec3 D, vec3 axis, vec3 n, float bloom, flo
   return vec4(-axis * (t * streak), w);
 }
 
+${DEPTH_CUT}
+
 #ifdef ENV_DEPTH
-/** Closest distance between segments p0-p1 and q0-q1; the closest point on q0-q1 goes to 'onQ'. */
-float segmentClosest(vec3 p0, vec3 p1, vec3 q0, vec3 q1, out vec3 onQ) {
-  vec3 d1 = p1 - p0;
-  vec3 d2 = q1 - q0;
-  vec3 r = p0 - q0;
-  float a = max(dot(d1, d1), 1e-8);
-  float e = max(dot(d2, d2), 1e-8);
-  float b = dot(d1, d2);
-  float c = dot(d1, r);
-  float f = dot(d2, r);
-  float denom = a * e - b * b;
-  float s = denom > 1e-8 ? clamp((b * f - c * e) / denom, 0.0, 1.0) : 0.0;
-  float t = (b * s + f) / e;
-  if (t < 0.0) {
-    t = 0.0;
-    s = clamp(-c / a, 0.0, 1.0);
-  } else if (t > 1.0) {
-    t = 1.0;
-    s = clamp((b - c) / a, 0.0, 1.0);
-  }
-  onQ = q0 + d2 * t;
-  return length(p0 + d1 * s - onQ);
-}
-
-/** This eye's position. Under multiview viewMatrix is per eye; cameraPosition is the pair's midpoint. */
-vec3 eyePosition() {
-  return -(transpose(mat3(viewMatrix)) * viewMatrix[3].xyz);
-}
-
-/**
- * 1 where the line of sight to this point passes through a tracked hand or forearm, 0 well clear.
- * Also returns how far in front of this eye that hand is there, and how thick it is.
- */
-float handGate(vec3 world, out float handZ, out float band) {
-  vec3 eye = eyePosition();
-  float g = 0.0;
-  float nearest = 1e9;
-  vec3 at = world;
-  band = 0.04;
-  for (int i = 0; i < ${SEGMENTS}; i++) {
-    float kind = uSegA[i].w;
-    if (kind < 0.5) continue;
-    vec3 onSeg;
-    float d = segmentClosest(eye, world, uSegA[i].xyz, uSegB[i].xyz, onSeg);
-    float gi = 1.0 - smoothstep(uSegB[i].w, uSegB[i].w + GATE_SOFT, d);
-    if (gi > g || (gi == g && gi > 0.0 && d < nearest)) {
-      g = gi;
-      nearest = d;
-      at = onSeg;
-      band = kind > 1.5 ? 0.04 : 0.045;
-    }
-  }
-  handZ = -(viewMatrix * vec4(at, 1.0)).z;
-  return g;
-}
-
-float envMeters(vec2 uv, float layer) {
-  float t = textureLod(uEnvDepth, vec3(uv, layer), 0.0).r;
-  float m = uDepthRaw * uDepthNear / max(1.0 - t, 1e-5);
-  return m < DEPTH_MIN ? 1e4 : m;
-}
-
-/** The headset's depth of the real room at this pixel, metres; 1e4 where it has none. */
-float realDepth() {
-#ifdef VIEW_ID
-  float eye = float(VIEW_ID);
-  vec2 fc = gl_FragCoord.xy;
-#else
-  float eye = step(uEyeSize.x, gl_FragCoord.x);
-  vec2 fc = gl_FragCoord.xy - vec2(eye * uEyeSize.x, 0.0);
-#endif
-  vec2 uv = ((eye < 0.5 ? uNormDepth0 : uNormDepth1) * vec4(fc / uEyeSize, 0.0, 1.0)).xy;
-  // The nearest of five taps half a texel apart: covers the hand's edge without dilating it a texel.
-  vec2 texel = 0.5 / vec2(textureSize(uEnvDepth, 0).xy);
-  float real = envMeters(uv, eye);
-  real = min(real, envMeters(uv + vec2(texel.x, 0.0), eye));
-  real = min(real, envMeters(uv - vec2(texel.x, 0.0), eye));
-  real = min(real, envMeters(uv + vec2(0.0, texel.y), eye));
-  real = min(real, envMeters(uv - vec2(0.0, texel.y), eye));
-  return real;
-}
-
-/**
- * How much a real hand or arm stands in front of this point of the stretch, from the headset's
- * depth: 1 shows passthrough's real hand, 0 keeps the stretch. Only along the line of sight to a
- * tracked hand, and only where the real surface is at that hand's depth: a mug or a lamp beside
- * the hand is in front of the room too, but it is not the hand.
- */
-// \`viewZ\` is where the surface sits for the in-front test: the drawn point for the room, but the
-// wall itself for a pushed-in box, which is drawn behind the real wall everywhere.
-float handOcclusion(vec3 world, float viewZ, out float gate) {
-  float handZ;
-  float band;
-  gate = handGate(world, handZ, band);
-  if (gate <= 0.0 || uDepthOn < 0.5) return 0.0;
-  float real = realDepth();
-  float atHand = 1.0 - smoothstep(band, band + 0.02, abs(real - handZ));
-  float margin = 0.01 + 0.02 * viewZ;
-  return gate * atHand * smoothstep(margin, margin + 0.02, viewZ - real);
-}
-
 /**
  * Developer views, straight colour and alpha. ?occ=debug: the cut magenta, the gate a faint
  * cyan. ?occ=delta: real depth minus the room's, red where the real surface is nearer, blue where
@@ -604,12 +676,7 @@ vec4 occDebug(vec3 world, float occ, float gate) {
 }
 #endif
 
-float frameCover(vec4 clip, out vec2 uv) {
-  uv = clip.xy / max(clip.w, 1e-4) * 0.5 + 0.5;
-  if (clip.w <= 1e-4 || uv.x < 0.0 || uv.y < 0.0 || uv.x > 1.0 || uv.y > 1.0) return 0.0;
-  float edge = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
-  return smoothstep(0.0, max(uFeather, 1e-4), edge);
-}
+${PHOTO}
 
 /**
  * How much of a photo covers this point: inside its frame, and seen from the camera's side of the
@@ -618,20 +685,6 @@ float frameCover(vec4 clip, out vec2 uv) {
 float photoCover(mat4 toClip, vec3 cam, float has, vec3 p, vec3 nr, float streaked, out vec2 uv) {
   float c = has * frameCover(toClip * vec4(p, 1.0), uv);
   return c * max(step(0.0, dot(nr, cam - vRest)), streaked);
-}
-
-/**
- * A premultiplied photo texel in linear light. The GPU decodes sRGB per channel after premultiplying,
- * so a half-transparent edge texel of a hand cut-out came back too dark; that is undone here. Opaque
- * and empty texels need nothing.
- */
-vec4 photoTexel(sampler2D tex, vec2 uv) {
-  vec4 t = textureLod(tex, uv, 0.0);
-  if (t.a > 0.004 && t.a < 0.996) {
-    vec3 encoded = sRGBTransferOETF(vec4(t.rgb, 1.0)).rgb / t.a;
-    t.rgb = sRGBTransferEOTF(vec4(encoded, 1.0)).rgb * t.a;
-  }
-  return t;
 }
 
 /**
@@ -644,21 +697,6 @@ vec4 slotPicture(sampler2D own, vec2 uv, float c, sampler2D fill, vec2 fuv, floa
   vec4 a = c > 0.0 ? photoTexel(own, uv) * c : vec4(0.0);
   if (cf > 0.0 && a.a < 0.999) a += photoTexel(fill, fuv) * (cf * (1.0 - a.a));
   return vec4(a.rgb * gain, a.a);
-}
-
-/**
- * Premultiplied output. The XR compositor reads the layer as sRGB and blends in linear light,
- * so alpha has to be applied before the encode or every soft edge darkens into a rim.
- */
-void writeColor(vec3 lin, float alpha) {
-  if (uLinear > 0.5) {
-    gl_FragColor = vec4(lin * alpha, alpha);
-    #include <colorspace_fragment>
-  } else {
-    gl_FragColor = vec4(lin, 1.0);
-    #include <colorspace_fragment>
-    gl_FragColor = vec4(gl_FragColor.rgb * alpha, alpha);
-  }
 }
 
 void main() {
@@ -930,4 +968,354 @@ export function rubberMaterial(uniforms: RubberUniformSet, preview = false, lens
     side: DoubleSide,
     toneMapped: false,
   });
+}
+
+/** Photos the void's shards can read: the most the bank has room for, picked to cover the room. */
+export const VOID_VIEWS = 6;
+
+/**
+ * The fist's black hole (room-void.ts): where it opened, where the fist is now, the tear front and
+ * its timeline, and the photos the flying shards wear. The hand cut is the room's own, shared.
+ */
+export function createVoidUniforms(room: RubberUniformSet) {
+  return {
+    /** 0 collapses every shard: off, or the two frames that only upload a new set. */
+    uVoidOn: { value: 0 },
+    /** Where the fist first closed: the front's centre. */
+    uVoidO: { value: new Vector3() },
+    /** The hole, inside the fist: where every shard flies to. */
+    uHole: { value: new Vector3() },
+    uHead: { value: new Vector3() },
+    /** The spiral's axis, from the hole toward your head when the fist closed. */
+    uSpin: { value: new Vector3(0, 0, 1) },
+    // The tear front and its timeline (room-stretch-system.ts stepVoid).
+    uRip: { value: 0 },
+    uMark: { value: 0 },
+    uDone: { value: 0 },
+    uDrain: { value: 0 },
+    /** The black past the scan, 0 to 1, once the last shard has gone. */
+    uBackFade: { value: 0 },
+    uView0: { value: null as Texture | null },
+    uView1: { value: null as Texture | null },
+    uView2: { value: null as Texture | null },
+    uView3: { value: null as Texture | null },
+    uView4: { value: null as Texture | null },
+    uView5: { value: null as Texture | null },
+    uViewToClip: { value: Array.from({ length: VOID_VIEWS }, () => new Matrix4()) },
+    /** 1 for a view that is chosen and uploaded. */
+    uViewOn: { value: new Array<number>(VOID_VIEWS).fill(0) },
+    /** Each view's mean colour, linear: what a shard past its frame darkens toward. */
+    uViewMean: { value: Array.from({ length: VOID_VIEWS }, () => new Vector3(0.2, 0.2, 0.2)) },
+    uViewGain: { value: new Vector3(1, 1, 1) },
+    /** `?voidcover=1`: photo red, fallback blue. */
+    uCoverDebug: { value: 0 },
+    uFeather: room.uFeather,
+    uLinear: room.uLinear,
+    uEnvDepth: room.uEnvDepth,
+    uDepthOn: room.uDepthOn,
+    uDepthRaw: room.uDepthRaw,
+    uDepthNear: room.uDepthNear,
+    uEyeSize: room.uEyeSize,
+    uNormDepth0: room.uNormDepth0,
+    uNormDepth1: room.uNormDepth1,
+    uSegA: room.uSegA,
+    uSegB: room.uSegB,
+    uOccDebug: room.uOccDebug,
+    uHandBall: room.uHandBall,
+  };
+}
+
+export type VoidUniformSet = ReturnType<typeof createVoidUniforms>;
+
+/** One photo of the six by index; a sampler can't be picked by a variable, so branch. */
+const VIEW_SAMPLERS = /* glsl */ `
+uniform sampler2D uView0;
+uniform sampler2D uView1;
+uniform sampler2D uView2;
+uniform sampler2D uView3;
+uniform sampler2D uView4;
+uniform sampler2D uView5;
+uniform mat4 uViewToClip[${VOID_VIEWS}];
+uniform float uViewOn[${VOID_VIEWS}];
+uniform vec3 uViewMean[${VOID_VIEWS}];
+uniform vec3 uViewGain;
+vec4 viewLod(int i, vec2 uv) {
+  if (i == 0) return textureLod(uView0, uv, 0.0);
+  if (i == 1) return textureLod(uView1, uv, 0.0);
+  if (i == 2) return textureLod(uView2, uv, 0.0);
+  if (i == 3) return textureLod(uView3, uv, 0.0);
+  if (i == 4) return textureLod(uView4, uv, 0.0);
+  return textureLod(uView5, uv, 0.0);
+}
+`;
+
+const VOID_VERTEX = /* glsl */ `
+attribute vec4 aShard;
+uniform float uVoidOn;
+uniform vec3 uVoidO;
+uniform vec3 uHole;
+uniform vec3 uHead;
+uniform vec3 uSpin;
+uniform float uRip;
+uniform float uMark;
+uniform float uDone;
+uniform float uDrain;
+uniform float uBackFade;
+varying vec3 vRest;
+varying float vViewZ;
+#ifdef VOID_FLY
+${VIEW_SAMPLERS}
+varying vec4 vClipA;
+varying vec4 vClipB;
+/** The best view, the second (-1 for none), and how far along its trip the shard is. */
+varying vec3 vPick;
+/** The shard's own colour, linear: what it fades to as it flies fast and small. */
+varying vec3 vFlat;
+varying float vLight;
+#endif
+
+/** The front is ragged: each shard tears up to this much later than its distance says. */
+const float JAG = 0.5;
+/** Shards stay this far from your eyes: nothing flies through your face. */
+const float HEAD_CLEAR = 0.35;
+
+/**
+ * How far along its trip a shard is: -1 untouched, 0 to 1 flying, 1 gone. Only the shard's centre,
+ * seed and the uniforms go in, so all three corners of every triangle agree.
+ */
+float tripOf(vec4 shard) {
+  float d = distance(shard.xyz, uVoidO) + shard.w * JAG;
+  float span = 0.6 + 0.35 * d;
+  if (d < uDone) return 1.0;
+  if (d < uMark) return clamp((uMark - d) / span + uDrain, 0.0, 1.0);
+  if (d < uRip) return clamp((uRip - d) / span, 0.0, 1.0);
+  return -1.0;
+}
+
+vec3 turn(vec3 v, vec3 axis, float angle) {
+  float c = cos(angle);
+  float s = sin(angle);
+  return v * c + cross(axis, v) * s + axis * dot(axis, v) * (1.0 - c);
+}
+
+void main() {
+#ifdef BACKSTOP
+  // Fullscreen, at the far plane: only where nothing nearer was drawn (scan gaps, windows), and never
+  // over the hands, whose occluders wrote depth first.
+  vec4 clip = vec4(position.xy, 0.9999, 1.0);
+  vec4 far = inverse(projectionMatrix * viewMatrix) * clip;
+  vRest = far.xyz / far.w;
+  vViewZ = -(viewMatrix * vec4(vRest, 1.0)).z;
+  gl_Position = uBackFade > 0.0 ? clip : vec4(2.0, 2.0, 2.0, 1.0);
+#else
+  float trip = uVoidOn > 0.5 ? tripOf(aShard) : -2.0;
+#if defined(VOID_REST)
+#ifdef PREVIEW
+  // The desk's stand-in room draws the untouched part itself.
+  bool on = false;
+#else
+  bool on = trip > -1.5 && trip < 0.0;
+#endif
+#elif defined(VOID_TORN)
+  bool on = trip >= 0.0;
+#else
+  bool on = trip >= 0.0 && trip < 1.0;
+#endif
+  vRest = position;
+  if (!on) {
+    vViewZ = 0.0;
+    gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
+    return;
+  }
+  vec3 world = position;
+#ifdef VOID_FLY
+  vec3 c = aShard.xyz;
+  float seed = aShard.w;
+  vec3 toHole = uHole - c;
+  float span = length(toHole);
+  vec3 dir = span > 1e-4 ? toHole / span : uSpin;
+  // A peel first: it lifts off toward the hole (5 mm at once, so it never fights its own black),
+  // then accelerates in along a spiral round the hole, closing as it goes.
+  float run = clamp((trip - 0.1) / 0.9, 0.0, 1.0);
+  float closing = run * run;
+  vec3 lift = dir * (0.005 + 0.04 * smoothstep(0.0, 0.1, trip));
+  vec3 q = uHole + turn((c + lift - uHole) * (1.0 - closing), uSpin, closing * (2.0 + 3.0 * seed) * 3.14159);
+  vec3 fromHead = q - uHead;
+  float headGap = length(fromHead);
+  if (headGap < HEAD_CLEAR) q = uHead + (headGap > 1e-4 ? fromHead / headGap : -dir) * HEAD_CLEAR;
+  // A shard nearing your head shrinks, so none fills your view; one nearing the hole shrinks into it.
+  float nearer = clamp(length(q - uHead) / max(length(c - uHead), 1e-3), 0.0, 1.0);
+  vec3 toGo = uHole - q;
+  float left = length(toGo);
+  vec3 heading = left > 1e-4 ? toGo / left : dir;
+  float size = smoothstep(0.02, 0.25, left) * pow(nearer, 0.6);
+  // Tumbling once it is clear of the wall, and drawn out along its flight as it speeds up.
+  vec3 axis = normalize(fract(sin(vec3(seed * 91.3, seed * 47.7, seed * 13.1) + 1.0) * 43758.5453) - 0.5 + 1e-3);
+  vec3 off = turn(position - c, axis, smoothstep(0.1, 0.3, trip) * trip * (4.0 + 8.0 * seed));
+  off += heading * dot(off, heading) * (2.0 * trip);
+  world = q + off * size;
+
+  // Which photo it wears: the one whose frame holds the shard's centre deepest, and the runner-up.
+  float best = -1.0;
+  float bestM = -1e9;
+  float second = -1.0;
+  float secondM = -1e9;
+  for (int k = 0; k < ${VOID_VIEWS}; k++) {
+    if (uViewOn[k] < 0.5) continue;
+    vec4 cc = uViewToClip[k] * vec4(c, 1.0);
+    if (cc.w <= 1e-4) continue;
+    vec2 uv = cc.xy / cc.w * 0.5 + 0.5;
+    float m = min(min(uv.x, 1.0 - uv.x), min(uv.y, 1.0 - uv.y));
+    if (m > bestM) {
+      second = best;
+      secondM = bestM;
+      best = float(k);
+      bestM = m;
+    } else if (m > secondM) {
+      second = float(k);
+      secondM = m;
+    }
+  }
+  vPick = vec3(best, second, trip);
+  vClipA = vec4(0.0, 0.0, 0.0, -1.0);
+  vClipB = vec4(0.0, 0.0, 0.0, -1.0);
+  vLight = 0.9 + 0.2 * fract(seed * 7.13);
+  vFlat = vec3(0.2) * (0.85 + 0.3 * fract(seed * 3.7));
+  if (best > -0.5) {
+    int ib = int(best + 0.5);
+    vClipA = uViewToClip[ib] * vec4(position, 1.0);
+    vec4 cc = uViewToClip[ib] * vec4(c, 1.0);
+    vec4 t = viewLod(ib, clamp(cc.xy / cc.w * 0.5 + 0.5, vec2(0.002), vec2(0.998)));
+    vFlat = t.rgb * uViewGain + uViewMean[ib] * 0.7 * (1.0 - t.a);
+  }
+  if (second > -0.5) vClipB = uViewToClip[int(second + 0.5)] * vec4(position, 1.0);
+#endif
+  vec4 viewPos = viewMatrix * vec4(world, 1.0);
+  vViewZ = -viewPos.z;
+  gl_Position = projectionMatrix * viewPos;
+#endif
+}
+`;
+
+const VOID_FRAGMENT = /* glsl */ `
+uniform float uFeather;
+uniform float uLinear;
+uniform float uBackFade;
+uniform float uCoverDebug;
+varying vec3 vRest;
+varying float vViewZ;
+${DEPTH_CUT}
+${PHOTO}
+#ifdef VOID_FLY
+${VIEW_SAMPLERS}
+varying vec4 vClipA;
+varying vec4 vClipB;
+varying vec3 vPick;
+varying vec3 vFlat;
+varying float vLight;
+
+vec4 viewTexel(int i, vec2 uv) {
+  if (i == 0) return photoTexel(uView0, uv);
+  if (i == 1) return photoTexel(uView1, uv);
+  if (i == 2) return photoTexel(uView2, uv);
+  if (i == 3) return photoTexel(uView3, uv);
+  if (i == 4) return photoTexel(uView4, uv);
+  return photoTexel(uView5, uv);
+}
+#endif
+
+void main() {
+#if defined(VOID_REST)
+  // Untouched: passthrough shows, but the depth stays, so a wall not torn yet still hides what flies behind it.
+  gl_FragColor = vec4(0.0);
+#elif defined(VOID_FLY)
+  vec3 col = vFlat;
+  float covered = 0.0;
+  if (vPick.x > -0.5) {
+    int ia = int(vPick.x + 0.5);
+    vec2 uv;
+    float c = frameCover(vClipA, uv);
+    vec4 a = c > 0.0 ? viewTexel(ia, uv) * c : vec4(0.0);
+    if (a.a < 0.999 && vPick.y > -0.5) {
+      vec2 uv2;
+      float c2 = frameCover(vClipB, uv2);
+      if (c2 > 0.0) a += viewTexel(int(vPick.y + 0.5), uv2) * (c2 * (1.0 - a.a));
+    }
+    covered = a.a;
+    // Past every frame, or where a hand was masked out: the nearest photo's edge smeared on, over
+    // its mean colour, so it streaks rather than showing a hole of real room.
+    vec3 under = uViewMean[ia] * 0.7;
+    if (a.a < 0.999 && vClipA.w > 1e-4) {
+      vec4 edge = viewTexel(ia, clamp(vClipA.xy / vClipA.w * 0.5 + 0.5, vec2(0.002), vec2(0.998)));
+      under = edge.rgb * uViewGain + under * (1.0 - edge.a);
+    }
+    col = a.rgb * uViewGain + under * (1.0 - a.a);
+  }
+  if (uCoverDebug > 0.5) col = mix(col, covered > 0.5 ? vec3(1.0, 0.1, 0.1) : vec3(0.1, 0.2, 1.0), 0.5);
+  float trip = vPick.z;
+  // Fast and small, a shard is its own colour (the photos have no mips to shimmer from), and it
+  // darkens into the hole.
+  col = mix(col, vFlat, smoothstep(0.4, 0.8, trip));
+  col *= vLight * mix(1.0, 0.12, smoothstep(0.45, 1.0, trip));
+#ifdef PREVIEW
+  gl_FragColor = vec4(col, 1.0);
+  #include <colorspace_fragment>
+#else
+  // Always opaque: with blending off, any alpha under 1 would show the real room through the void.
+  writeColor(col, 1.0);
+#endif
+#else
+  // Torn, or the backstop: pitch black, except where a real hand stands in front.
+#ifdef PREVIEW
+#ifdef BACKSTOP
+  if (uBackFade <= 0.0) discard;
+#endif
+  gl_FragColor = vec4(0.0, 0.0, 0.0, 1.0);
+#else
+  float alpha = 1.0;
+#ifdef BACKSTOP
+  alpha = uBackFade;
+#endif
+  float gate = 0.0;
+  float occ = handOcclusion(vRest, vViewZ, gate);
+  writeColor(vec3(0.0), alpha * (1.0 - occ));
+#endif
+#endif
+}
+`;
+
+/**
+ * The void's four draws (room-void.ts). `rest`: untouched shards, depth only. `torn`: black where a
+ * shard has left, depth test only so flying shards are never clipped by it. `fly`: the shards on
+ * their way, opaque. `backstop`: black past the scan once the room has gone.
+ */
+export type VoidRole = 'rest' | 'torn' | 'fly' | 'backstop';
+
+export function voidMaterial(uniforms: VoidUniformSet, preview: boolean, role: VoidRole): ShaderMaterial {
+  const defines: Record<string, string> = {};
+  if (preview) defines.PREVIEW = '';
+  else if (role === 'torn' || role === 'backstop') defines.ENV_DEPTH = '';
+  if (role === 'rest') defines.VOID_REST = '';
+  if (role === 'torn' || role === 'backstop') defines.VOID_TORN = '';
+  if (role === 'backstop') defines.BACKSTOP = '';
+  if (role === 'fly') defines.VOID_FLY = '';
+  const material = new ShaderMaterial({
+    uniforms,
+    vertexShader: VOID_VERTEX,
+    fragmentShader: VOID_FRAGMENT,
+    name: `jonze-void-${role}${preview ? '-preview' : ''}`,
+    defines,
+    transparent: false,
+    depthTest: true,
+    depthWrite: role === 'rest' || role === 'fly',
+    side: DoubleSide,
+    toneMapped: false,
+  });
+  if (preview && role === 'torn') {
+    // On the desk the stand-in room sits exactly where the black does.
+    material.polygonOffset = true;
+    material.polygonOffsetFactor = -1;
+    material.polygonOffsetUnits = -4;
+  }
+  return material;
 }

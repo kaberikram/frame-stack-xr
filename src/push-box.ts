@@ -82,6 +82,7 @@ export class PushBox {
       uBoxV: room.uBoxV,
       uBoxN: room.uBoxN,
       uBoxDepth: room.uBoxDepth,
+      uHandBall: room.uHandBall,
     };
     this.headset = rubberMaterial(this.uniforms, false, false, 'box');
     this.preview = rubberMaterial(this.uniforms, true, false, 'box');
