@@ -66,11 +66,12 @@ export class RoomVoid {
 
   /**
    * Every stretch-mode frame. `on` draws the void; otherwise only the warmers draw (and a new set,
-   * collapsed, for two frames). `shards` off leaves only the backstop, once every shard is gone.
+   * collapsed, for two frames). `flying` off leaves the black alone, once every shard is gone.
+   * A new set is taken up only while `idle`, so its upload never lands on a pinch or a push.
    * `preview` picks the desk programs.
    */
-  sync(on: boolean, preview: boolean, shards = on): void {
-    if (!on && this.pending) this.adopt();
+  sync(on: boolean, preview: boolean, flying = on, idle = true): void {
+    if (!on && idle && this.pending) this.adopt();
     if (preview !== this.previewMode) {
       this.previewMode = preview;
       const list = preview ? this.preview : this.headset;
@@ -79,9 +80,15 @@ export class RoomVoid {
       this.backstop.material = list[3];
     }
     this.uniforms.uVoidOn.value = on ? 1 : 0;
-    const drawn = ((on && shards) || this.warm > 0) && !!this.geometry;
+    const ready = !!this.geometry;
+    const warming = this.warm > 0;
     if (this.warm > 0) this.warm--;
-    for (let i = 0; i < this.meshes.length; i++) this.meshes[i].visible = drawn;
+    // Untouched and flying shards only while some are; the black stays drawn with the void, so each
+    // surface keeps its own hand cut.
+    for (let i = 0; i < this.meshes.length; i++) {
+      const black = SHARD_ROLES[i] === 'torn';
+      this.meshes[i].visible = ready && (warming || (on && (black || flying)));
+    }
     this.backstop.visible = on;
     for (let i = 0; i < this.warmers.length; i++) this.warmers[i].visible = true;
   }

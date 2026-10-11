@@ -668,6 +668,8 @@ export class StretchSound {
     reverb.channelCountMode = 'explicit';
     reverb.normalize = true;
     reverb.buffer = impulse(ctx);
+    // The suction's noise too, here at the Enter click rather than on the first fist's frame.
+    this.noise ??= pinkNoise(ctx);
     const tone = ctx.createBiquadFilter();
     tone.type = 'lowpass';
     tone.frequency.value = 3800;
