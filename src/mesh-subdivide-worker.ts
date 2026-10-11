@@ -1,4 +1,12 @@
-import { snapToPlanes, subdivideMesh, type SnapPlane } from './mesh-subdivide.js';
+import {
+  buildShards,
+  SHARD_EDGE,
+  SHARD_MAX_TRIANGLES,
+  snapToPlanes,
+  subdivideMesh,
+  type ShardReply,
+  type SnapPlane,
+} from './mesh-subdivide.js';
 
 interface SubdivideRequest {
   kind: 'subdivide';
@@ -32,7 +40,7 @@ interface SubdivideReply {
 }
 
 interface WorkerScope {
-  postMessage(message: SubdivideReply, transfer: Transferable[]): void;
+  postMessage(message: SubdivideReply | ShardReply, transfer: Transferable[]): void;
   onmessage: ((event: MessageEvent<SubdivideRequest | SnapRequest>) => void) | null;
 }
 
@@ -63,4 +71,19 @@ scope.onmessage = (event) => {
     planes: snap.planes,
   };
   scope.postMessage(reply, indices ? [positions.buffer, indices.buffer] : [positions.buffer]);
+  if (request.kind === 'subdivide') postShards(request);
 };
+
+/**
+ * Builds the coarse mesh the fist tears into shards, from the same scan and planes, after the dense
+ * room is posted so that never waits on it. The request's arrays are still whole here:
+ * `subdivideMesh` only reads them, and the dense reply sends copies, never them.
+ */
+function postShards(request: SubdivideRequest): void {
+  const coarse = subdivideMesh(request.positions, request.indices, SHARD_EDGE, SHARD_MAX_TRIANGLES, request.focus);
+  const snapped = new Float32Array(coarse.positions.length);
+  snapToPlanes(coarse.positions, coarse.indices, request.planes, snapped);
+  const mesh = buildShards(snapped, coarse.indices);
+  const reply: ShardReply = { kind: 'shards', id: request.id, ...mesh };
+  scope.postMessage(reply, [mesh.position.buffer, mesh.shard.buffer, mesh.centres.buffer, mesh.bounds.buffer]);
+}

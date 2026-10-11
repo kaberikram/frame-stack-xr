@@ -33,6 +33,8 @@ const PINKY_TIP = 24;
 /** Thumb and index distal and tip joints: the pinching fingertips, drawn without lag and a little larger. */
 const PINCH_JOINTS = [3, 4, 8, 9] as const;
 const PINCH_RADIUS = 0.017;
+/** Sphere radius scale while slim: against a black void the real room shows as a rim round spheres wider than fingers. */
+const SLIM = 0.75;
 const PER_HAND = JOINT_COUNT + BONES.length;
 const HANDS = 2;
 /**
@@ -43,8 +45,9 @@ const RING = 16;
 /** A history lookup this much older than the oldest frame kept has no answer. */
 const HISTORY_SLACK = 0.03;
 /**
- * Where the depth cut may act: four segments fanned from the wrist to the thumb, index, middle and
- * pinky tips (they cover the palm and fingers, spread or not), and the forearm. Reach is from the
+ * Where the depth cut may act: four segments fanned from the wrist along the thumb, index, middle
+ * and pinky, each to that finger's joint farthest from the wrist (the tip when open, the knuckles in
+ * a fist; they cover the palm and fingers, spread or curled), and the forearm. Reach is from the
  * segment's axis.
  */
 export const SEGMENTS_PER_HAND = 5;
@@ -52,6 +55,8 @@ export const SEGMENTS = SEGMENTS_PER_HAND * HANDS;
 const HAND_REACH = 0.035;
 const FOREARM_REACH = FOREARM_RADIUS + 0.02;
 const FOREARM_GATE = 0.26;
+/** The shader's gate softening (GATE_SOFT in stretch-material.ts): a segment gates nothing past reach + this. */
+const GATE_SOFT = 0.015;
 /** Kind codes in segA.w for the shader. */
 const KIND_HAND = 1;
 const KIND_ARM = 2;
@@ -67,6 +72,8 @@ const FOREARM = 0.26;
 const POLE_OUT = 0.6;
 const UP = new Vector3(0, 1, 0);
 const TIPS = [THUMB_TIP, INDEX_TIP, MIDDLE_TIP, PINKY_TIP] as const;
+/** Each finger's proximal phalanx joint, in TIPS order: its segment may end at any joint from here to the tip. */
+const FINGER_FIRST = [2, 6, 11, 21] as const;
 const ARM_SEGMENT = TIPS.length;
 
 type Side = 'left' | 'right';
@@ -109,6 +116,13 @@ export class HandOccluder {
    */
   readonly segA = Array.from({ length: SEGMENTS }, () => new Vector4());
   readonly segB = Array.from({ length: SEGMENTS }, () => new Vector4());
+  /**
+   * Per hand, a ball holding all its live segments grown by the largest reach plus GATE_SOFT: xyz
+   * centre, w radius, 0 when the hand has none. `balls[0]` is the left hand, segments
+   * 0..SEGMENTS_PER_HAND-1; `balls[1]` the right, the next SEGMENTS_PER_HAND. A line of sight that
+   * misses both can't be gated by any segment.
+   */
+  readonly balls = Array.from({ length: HANDS }, () => new Vector4());
   readonly indexTip = { left: new Vector3(), right: new Vector3() };
   readonly thumbTip = { left: new Vector3(), right: new Vector3() };
   readonly hasPinch = { left: false, right: false };
@@ -144,6 +158,8 @@ export class HandOccluder {
   private readonly spaces: Record<Side, XRSpace[]> = { left: [], right: [] };
   private readonly handRef: Record<Side, XRHand | null> = { left: null, right: null };
   private readonly local = new Float32Array(JOINT_COUNT * 3);
+  /** Sphere radius scale: 1, or SLIM while setSlim(true). */
+  private slim = 1;
 
   /** `debug` draws the occluders 30% green instead of invisible, for `?occ=debug`. */
   constructor(parent: Object3D, debug = false) {
@@ -174,6 +190,7 @@ export class HandOccluder {
       this.ringCount[0] = 0;
       this.ringCount[1] = 0;
       for (let i = 0; i < SEGMENTS; i++) this.segA[i].w = 0;
+      for (let i = 0; i < HANDS; i++) this.balls[i].w = 0;
       this.jointCount = 0;
       this.leftCount = 0;
       this.rightCount = 0;
@@ -182,6 +199,11 @@ export class HandOccluder {
       this.armOk[0] = 0;
       this.armOk[1] = 0;
     }
+  }
+
+  /** Thinner spheres over the black void, from the next update(); the forearm capsule keeps its size. */
+  setSlim(on: boolean): void {
+    this.slim = on ? SLIM : 1;
   }
 
   update(
@@ -211,12 +233,14 @@ export class HandOccluder {
         this.hasPinch[side] = false;
         this.ringCount[s] = 0;
         for (let i = 0; i < SEGMENTS_PER_HAND; i++) this.segA[s * SEGMENTS_PER_HAND + i].w = 0;
+        this.balls[s].w = 0;
         this.hideRange(base, PER_HAND);
         this.hideArm(s);
         continue;
       }
       const start = this.jointCount;
       this.writeHand(side, base, playerWorld, shownAt);
+      this.fitBall(s);
       if (side === 'left') {
         this.leftStart = start;
         this.leftCount = JOINT_COUNT;
@@ -324,9 +348,10 @@ export class HandOccluder {
         d[j + 2] = this.local[j + 2];
       }
     }
+    const slim = this.slim;
     for (let i = 0; i < JOINT_COUNT; i++) {
       const radius = i === WRIST ? 0.02 : pinching && isPinchJoint(i) ? PINCH_RADIUS : 0.013;
-      this.place(base + i, d[i * 3], d[i * 3 + 1], d[i * 3 + 2], radius);
+      this.place(base + i, d[i * 3], d[i * 3 + 1], d[i * 3 + 2], radius * slim);
     }
     for (let i = 0; i < BONES.length; i++) {
       const [a, b] = BONES[i];
@@ -335,13 +360,14 @@ export class HandOccluder {
         (d[a * 3] + d[b * 3]) * 0.5,
         (d[a * 3 + 1] + d[b * 3 + 1]) * 0.5,
         (d[a * 3 + 2] + d[b * 3 + 2]) * 0.5,
-        0.012,
+        0.012 * slim,
       );
     }
     const w = WRIST * 3;
     const s0 = h * SEGMENTS_PER_HAND;
     for (let i = 0; i < TIPS.length; i++) {
-      const t = TIPS[i] * 3;
+      // A fist curls the tip back into the palm: ending at the farthest joint keeps the knuckles in.
+      const t = farthestJoint(d, FINGER_FIRST[i], TIPS[i]) * 3;
       this.segA[s0 + i].set(d[w], d[w + 1], d[w + 2], KIND_HAND);
       this.segB[s0 + i].set(d[t], d[t + 1], d[t + 2], HAND_REACH);
     }
@@ -368,6 +394,49 @@ export class HandOccluder {
     this.dummy.updateMatrix();
     this.arm.setMatrixAt(h, this.dummy.matrix);
     this.dummy.quaternion.identity();
+  }
+
+  /**
+   * Fits `balls[h]` round hand `h`'s live segments: centred on their bounds, out to the farthest end
+   * plus the largest reach and GATE_SOFT, so every point any of them can gate is inside.
+   */
+  private fitBall(h: number): void {
+    const ball = this.balls[h];
+    const s0 = h * SEGMENTS_PER_HAND;
+    let minX = Infinity;
+    let minY = Infinity;
+    let minZ = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    let maxZ = -Infinity;
+    let reach = 0;
+    for (let i = s0; i < s0 + SEGMENTS_PER_HAND; i++) {
+      const a = this.segA[i];
+      if (a.w < 0.5) continue;
+      const b = this.segB[i];
+      minX = Math.min(minX, a.x, b.x);
+      minY = Math.min(minY, a.y, b.y);
+      minZ = Math.min(minZ, a.z, b.z);
+      maxX = Math.max(maxX, a.x, b.x);
+      maxY = Math.max(maxY, a.y, b.y);
+      maxZ = Math.max(maxZ, a.z, b.z);
+      reach = Math.max(reach, b.w);
+    }
+    if (minX === Infinity) {
+      ball.w = 0;
+      return;
+    }
+    const cx = (minX + maxX) * 0.5;
+    const cy = (minY + maxY) * 0.5;
+    const cz = (minZ + maxZ) * 0.5;
+    // A segment's farthest point from the centre is one of its ends.
+    let far = 0;
+    for (let i = s0; i < s0 + SEGMENTS_PER_HAND; i++) {
+      const a = this.segA[i];
+      if (a.w < 0.5) continue;
+      far = Math.max(far, distSq(a, cx, cy, cz), distSq(this.segB[i], cx, cy, cz));
+    }
+    ball.set(cx, cy, cz, Math.sqrt(far) + reach + GATE_SOFT);
   }
 
   /** The head's position and its level right and back directions, for the shoulder model. */
@@ -532,6 +601,31 @@ export class HandOccluder {
 
 function isPinchJoint(i: number): boolean {
   return i === 3 || i === 4 || i === 8 || i === 9;
+}
+
+/** Of joints `first..last` in one hand's packed xyz, the one farthest from the wrist; the later on a tie. */
+function farthestJoint(joints: Float32Array, first: number, last: number): number {
+  const w = WRIST * 3;
+  let best = last;
+  let far = -1;
+  for (let j = first; j <= last; j++) {
+    const dx = joints[j * 3] - joints[w];
+    const dy = joints[j * 3 + 1] - joints[w + 1];
+    const dz = joints[j * 3 + 2] - joints[w + 2];
+    const dd = dx * dx + dy * dy + dz * dz;
+    if (dd >= far) {
+      far = dd;
+      best = j;
+    }
+  }
+  return best;
+}
+
+function distSq(v: Vector4, x: number, y: number, z: number): number {
+  const dx = v.x - x;
+  const dy = v.y - y;
+  const dz = v.z - z;
+  return dx * dx + dy * dy + dz * dz;
 }
 
 /**

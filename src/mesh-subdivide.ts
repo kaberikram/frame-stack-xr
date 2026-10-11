@@ -321,3 +321,231 @@ export function snapToPlanes(
   for (let k = 0; k < used.length; k++) usedPlanes += used[k];
   return { moved, planes: usedPlanes };
 }
+
+/** Edge length the coarse shard mesh aims for. Shard outlines follow its triangles, so this is how jagged they are. */
+export const SHARD_EDGE = 0.1;
+/** Triangle cap for the shard mesh: de-indexed, 180k vertices, about 5 MB with the shard attribute. */
+export const SHARD_MAX_TRIANGLES = 60_000;
+/** Spacing of the shard seed grid: shards come out about this wide. */
+export const SHARD_CELL = 0.3;
+/** Below this squared cross product a triangle has no normal: it takes bin 0 and no area weight. */
+const SHARD_DEGENERATE = 1e-14;
+/** Shard keys pack grid cell and normal bin into one integer; a grid past this grows its cells instead. */
+const SHARD_KEY_LIMIT = Math.floor(Number.MAX_SAFE_INTEGER / 6);
+
+/**
+ * The room broken into flat shards, de-indexed and grouped by shard, so each shard is one run of
+ * triangles. Every vertex carries its shard's centre and seed, so a shader moves a shard as one piece.
+ */
+export interface ShardMesh {
+  /** Rest positions, 9 floats per triangle. */
+  position: Float32Array;
+  /** Per vertex: the shard's area-weighted centre xyz and its seed in [0, 1). 12 floats per triangle. */
+  shard: Float32Array;
+  /** Per shard, in the order the triangles are grouped: centre xyz, seed. */
+  centres: Float32Array;
+  /** Number of shards. */
+  count: number;
+  /** Triangles kept: every input triangle whose corners are finite. */
+  triangles: number;
+  /** Min xyz then max xyz of every position. */
+  bounds: Float32Array;
+}
+
+/** What the worker posts after each subdivide: the shard mesh for request `id`, its buffers transferred. */
+export interface ShardReply extends ShardMesh {
+  kind: 'shards';
+  id: number;
+}
+
+/** Integer hash of a grid cell and a salt. Pure 32-bit maths, so the worker, desk demo and tests all agree. */
+function cellHash(x: number, y: number, z: number, salt: number): number {
+  let h = Math.imul(x, 0x8da6b343) ^ Math.imul(y, 0xd8163841) ^ Math.imul(z, 0xcb1ab31f) ^ Math.imul(salt, 0x27d4eb2d);
+  h = Math.imul(h ^ (h >>> 16), 0x7feb352d);
+  h = Math.imul(h ^ (h >>> 15), 0x846ca68b);
+  return h ^ (h >>> 16);
+}
+
+/**
+ * Breaks a triangle soup into flat shards about `cell` wide. Each triangle goes to the nearest seed
+ * of a jittered 3D grid, searched over the 27 cells round its centroid, and to the bin of its
+ * dominant normal axis (±x, ±y, ±z), so a shard is a flat tile that never bends round a corner.
+ * Shard outlines follow the triangles, so they come out jagged. Triangles with a non-finite corner
+ * are dropped. Pure and deterministic: no Three, safe in a worker, same input gives the same bytes.
+ */
+export function buildShards(positions: ArrayLike<number>, indices: ArrayLike<number>, cell = SHARD_CELL): ShardMesh {
+  const total = Math.floor(indices.length / 3);
+  const source = new Int32Array(total);
+  const mid = new Float64Array(total * 3);
+  const area = new Float64Array(total);
+  const bin = new Uint8Array(total);
+  let kept = 0;
+  let minX = Infinity;
+  let minY = Infinity;
+  let minZ = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  let maxZ = -Infinity;
+  for (let t = 0; t < total; t++) {
+    const a = indices[t * 3] * 3;
+    const b = indices[t * 3 + 1] * 3;
+    const c = indices[t * 3 + 2] * 3;
+    const mx = (positions[a] + positions[b] + positions[c]) / 3;
+    const my = (positions[a + 1] + positions[b + 1] + positions[c + 1]) / 3;
+    const mz = (positions[a + 2] + positions[b + 2] + positions[c + 2]) / 3;
+    if (!Number.isFinite(mx + my + mz)) continue;
+    const ux = positions[b] - positions[a];
+    const uy = positions[b + 1] - positions[a + 1];
+    const uz = positions[b + 2] - positions[a + 2];
+    const vx = positions[c] - positions[a];
+    const vy = positions[c + 1] - positions[a + 1];
+    const vz = positions[c + 2] - positions[a + 2];
+    const nx = uy * vz - uz * vy;
+    const ny = uz * vx - ux * vz;
+    const nz = ux * vy - uy * vx;
+    const len2 = nx * nx + ny * ny + nz * nz;
+    if (len2 > SHARD_DEGENERATE) {
+      const px = Math.abs(nx);
+      const py = Math.abs(ny);
+      const pz = Math.abs(nz);
+      bin[kept] = px >= py && px >= pz ? (nx > 0 ? 0 : 1) : py >= pz ? (ny > 0 ? 2 : 3) : nz > 0 ? 4 : 5;
+      area[kept] = Math.sqrt(len2);
+    }
+    source[kept] = t;
+    mid[kept * 3] = mx;
+    mid[kept * 3 + 1] = my;
+    mid[kept * 3 + 2] = mz;
+    if (mx < minX) minX = mx;
+    if (my < minY) minY = my;
+    if (mz < minZ) minZ = mz;
+    if (mx > maxX) maxX = mx;
+    if (my > maxY) maxY = my;
+    if (mz > maxZ) maxZ = mz;
+    kept++;
+  }
+
+  // The winning seed can sit one cell past the centroids' own, hence the margin of one each side.
+  let size = Math.max(cell, 1e-3);
+  let inv = 1 / size;
+  let ox = 0;
+  let oy = 0;
+  let oz = 0;
+  let spanY = 1;
+  let spanZ = 1;
+  for (; kept > 0; size *= 2, inv = 1 / size) {
+    ox = Math.floor(minX * inv) - 1;
+    oy = Math.floor(minY * inv) - 1;
+    oz = Math.floor(minZ * inv) - 1;
+    spanY = Math.floor(maxY * inv) + 2 - oy;
+    spanZ = Math.floor(maxZ * inv) + 2 - oz;
+    if ((Math.floor(maxX * inv) + 2 - ox) * spanY * spanZ <= SHARD_KEY_LIMIT) break;
+  }
+
+  const ids = new Map<number, number>();
+  const owner = new Int32Array(kept);
+  const seeds = new Float32Array(kept);
+  const start = new Int32Array(kept + 1);
+  let count = 0;
+  for (let i = 0; i < kept; i++) {
+    const ux = mid[i * 3] * inv;
+    const uy = mid[i * 3 + 1] * inv;
+    const uz = mid[i * 3 + 2] * inv;
+    const gx = Math.floor(ux);
+    const gy = Math.floor(uy);
+    const gz = Math.floor(uz);
+    let best = Infinity;
+    let sx = gx;
+    let sy = gy;
+    let sz = gz;
+    for (let x = gx - 1; x <= gx + 1; x++) {
+      for (let y = gy - 1; y <= gy + 1; y++) {
+        for (let z = gz - 1; z <= gz + 1; z++) {
+          // Ten bits of the hash per axis place the cell's seed anywhere inside it. Hashed from absolute
+          // cell coordinates, so a rebuilt room tears the same way wherever its triangles didn't change.
+          const h = cellHash(x, y, z, 0);
+          const dx = x + (h & 1023) / 1024 - ux;
+          const dy = y + ((h >>> 10) & 1023) / 1024 - uy;
+          const dz = z + ((h >>> 20) & 1023) / 1024 - uz;
+          const d = dx * dx + dy * dy + dz * dz;
+          if (d < best) {
+            best = d;
+            sx = x;
+            sy = y;
+            sz = z;
+          }
+        }
+      }
+    }
+    const key = (((sx - ox) * spanY + (sy - oy)) * spanZ + (sz - oz)) * 6 + bin[i];
+    let id = ids.get(key);
+    if (id === undefined) {
+      id = count++;
+      ids.set(key, id);
+      // 24 bits, so the seed stays below 1 once stored as a Float32.
+      seeds[id] = (cellHash(sx, sy, sz, 1 + bin[i]) >>> 8) / 16777216;
+    }
+    owner[i] = id;
+    start[id + 1]++;
+  }
+
+  // Counting sort by shard, stable, so each shard keeps its triangles in scan order.
+  for (let k = 0; k < count; k++) start[k + 1] += start[k];
+  const cursor = start.slice(0, count);
+  const order = new Int32Array(kept);
+  for (let i = 0; i < kept; i++) order[cursor[owner[i]]++] = i;
+
+  const centres = new Float32Array(count * 4);
+  const position = new Float32Array(kept * 9);
+  const shard = new Float32Array(kept * 12);
+  const bounds = new Float32Array(6);
+  if (kept > 0) bounds.set([Infinity, Infinity, Infinity, -Infinity, -Infinity, -Infinity]);
+  for (let k = 0; k < count; k++) {
+    let wx = 0;
+    let wy = 0;
+    let wz = 0;
+    let w = 0;
+    let px = 0;
+    let py = 0;
+    let pz = 0;
+    for (let j = start[k]; j < start[k + 1]; j++) {
+      const i = order[j];
+      const s = area[i];
+      wx += mid[i * 3] * s;
+      wy += mid[i * 3 + 1] * s;
+      wz += mid[i * 3 + 2] * s;
+      w += s;
+      px += mid[i * 3];
+      py += mid[i * 3 + 1];
+      pz += mid[i * 3 + 2];
+    }
+    // A shard of degenerate triangles has no area to weight by: plain mean.
+    const n = start[k + 1] - start[k];
+    centres[k * 4] = w > 0 ? wx / w : px / n;
+    centres[k * 4 + 1] = w > 0 ? wy / w : py / n;
+    centres[k * 4 + 2] = w > 0 ? wz / w : pz / n;
+    centres[k * 4 + 3] = seeds[k];
+    const cx = centres[k * 4];
+    const cy = centres[k * 4 + 1];
+    const cz = centres[k * 4 + 2];
+    for (let j = start[k]; j < start[k + 1]; j++) {
+      const t = source[order[j]];
+      for (let corner = 0; corner < 3; corner++) {
+        const v = indices[t * 3 + corner] * 3;
+        const o = j * 9 + corner * 3;
+        position[o] = positions[v];
+        position[o + 1] = positions[v + 1];
+        position[o + 2] = positions[v + 2];
+        for (let axis = 0; axis < 3; axis++) {
+          if (position[o + axis] < bounds[axis]) bounds[axis] = position[o + axis];
+          if (position[o + axis] > bounds[axis + 3]) bounds[axis + 3] = position[o + axis];
+        }
+        const q = j * 12 + corner * 4;
+        shard[q] = cx;
+        shard[q + 1] = cy;
+        shard[q + 2] = cz;
+        shard[q + 3] = seeds[k];
+      }
+    }
+  }
+  return { position, shard, centres, count, triangles: kept, bounds };
+}

@@ -11,6 +11,7 @@ import {
   MeshBasicMaterial,
   PlaneGeometry,
   Quaternion,
+  SphereGeometry,
   SRGBColorSpace,
   Vector3,
   VisibilityState,
@@ -25,16 +26,18 @@ import { EnvDepth } from './env-depth.js';
 import { PREVIEW_FORCED, getMode } from './experience.js';
 import { HandOccluder, SEGMENTS } from './hand-occluder.js';
 import { MapFrame } from './map-frame.js';
-import { countStraight, makePalmPose, readPalm, type PalmPose } from './palm-pose.js';
+import { countStraight, isFist, makeFistShape, makePalmPose, readFist, readPalm, type FistShape, type PalmPose } from './palm-pose.js';
 import { drawHint, makeCanvas, type Canvas2D } from './labels.js';
 import { cameraMount, PassthroughPhoto, type CameraMount, type CameraSideSetting, type HandJoints } from './passthrough-photo.js';
 import { PushBox } from './push-box.js';
+import { buildShards } from './mesh-subdivide.js';
 import { RoomMeshOverlay } from './room-mesh-overlay.js';
 import { RoomPlanes, type PlaneHit, type PlaneMiss } from './room-planes.js';
+import { RoomVoid } from './room-void.js';
 import { StretchLook } from './stretch-component.js';
 import { Spring, averageNormal, buildTriGrid, rayTriGrid, triangleNormal, type RayHit, type TriGrid } from './stretch-math.js';
 import { Stillness } from './touch-logic.js';
-import { BOX_FRONT, type RubberUniformSet } from './stretch-material.js';
+import { BOX_FRONT, VOID_VIEWS, type RubberUniformSet } from './stretch-material.js';
 import { StretchSound } from './stretch-sound.js';
 
 type Side = 'left' | 'right';
@@ -148,6 +151,47 @@ const PALM_STILL_HOLD = 0.25;
 const PALM_WHY_AFTER = 0.5;
 /** A wall to map, or for an open palm near it to stand a vacuum spike down: |n.y| under PUSH_WALL_UP. */
 const PUSH_WALL_UP = 0.5;
+/**
+ * Fist black hole: a fist held in front of your eyes tears the room into shards that fly into it.
+ * To arm, index and middle (and ring or pinky) under FIST_CURL straight with the index and middle
+ * tips within FIST_TIPS metacarpal lengths of the palm and the thumb within FIST_THUMB of the curled
+ * fingers (not a thumbs-up), for FIST_ARM, within FIST_CONE of your gaze.
+ * It stays a fist up to the looser FIST_HOLD_* and opens after FIST_OPEN out of them.
+ */
+const FIST_CURL = 0.6;
+const FIST_TIPS = 0.7;
+const FIST_THUMB = 0.6;
+const FIST_HOLD_CURL = 0.7;
+const FIST_HOLD_TIPS = 0.9;
+const FIST_HOLD_THUMB = 0.9;
+const FIST_ARM = 0.3;
+const FIST_OPEN = 0.12;
+const FIST_LOST = 0.3;
+const FIST_CONE = Math.cos((45 * Math.PI) / 180);
+const FIST_REACH = 0.15;
+/** A hand that let go of the box (a curl lets go) must not fall straight into a fist. */
+const FIST_AFTER_BOX = 0.6;
+/** A hand curled under FIST_NEAR this long without arming says why, once. */
+const FIST_NEAR = 0.75;
+const FIST_WHY_AFTER = 0.5;
+/** The hole sits inside the fist: from the middle knuckle into the palm, and back toward the wrist. */
+const HOLE_IN = 0.025;
+const HOLE_BACK = 0.015;
+/** The hole glides after the fist with this time constant. */
+const HOLE_GLIDE = 0.06;
+/**
+ * The tear front runs out from where the fist closed at VOID_SPEED m/s, VOID_SPEED_UP faster for
+ * every second it has been held. Shards let go of land within VOID_LAND. VOID_JAG is the shader's
+ * JAG (stretch-material.ts): the front is ragged by up to that much.
+ */
+const VOID_SPEED = 0.6;
+const VOID_SPEED_UP = 1;
+const VOID_LAND = 0.7;
+const VOID_JAG = 0.5;
+/** Once the last shard lands, the black past the scan fades in over this. */
+const VOID_BACK_FADE = 0.5;
+/** Frame times kept while the void runs, for the line it prints when the room is gone. */
+const VOID_FRAMES = 2048;
 /**
  * The box is the area you mapped: a pinch on a wall dragged to the opposite corner, at least MAP_MIN
  * each way. Never under PUSH_HALF_FLOOR either way.
@@ -413,6 +457,35 @@ function makePalmTrack(side: Side): PalmTrack {
   };
 }
 
+/** One hand's fist this frame, and whether it holds the black hole. */
+interface FistTrack {
+  readonly side: Side;
+  readonly shape: FistShape;
+  /** Curled by the holding test this frame: its selects and spikes are not pinches. */
+  like: boolean;
+  /** Armed: this hand's fist holds the hole (or can take it over). */
+  on: boolean;
+  /** How long it has passed the arming test, been out of the holding test while on, and been lost. */
+  curlT: number;
+  openT: number;
+  lostT: number;
+  /** Must be seen open before it can arm again. */
+  latch: boolean;
+  /** When this hand last let go of the box. */
+  letGoAt: number;
+  nearT: number;
+  whyLogged: boolean;
+  /** The hole this fist would hold, inside it. */
+  readonly point: Vector3;
+}
+
+function makeFistTrack(side: Side): FistTrack {
+  return {
+    side, shape: makeFistShape(), like: false, on: false, curlT: 0, openT: 0, lostT: 0, latch: false,
+    letGoAt: -Infinity, nearT: 0, whyLogged: false, point: new Vector3(),
+  };
+}
+
 /** The one pushed-in box: its rectangle on the wall, how deep it is, and where it is in its life. */
 interface BoxState {
   phase: BoxPhase;
@@ -468,7 +541,7 @@ const enum Card {
 const COPY: Record<Card, { title: string; body: string }> = {
   [Card.None]: { title: '', body: '' },
   [Card.Map]: { title: 'Map the wall to push', body: 'Pinch a corner, drag to the opposite one.' },
-  [Card.Pinch]: { title: 'Pinch anything and pull', body: 'Or hold a palm up to the box and push.' },
+  [Card.Pinch]: { title: 'Pinch anything and pull', body: 'Push with a palm. Fist: swallow the room.' },
   [Card.Scan]: { title: 'No room mesh yet', body: 'Finish Space Setup, then enter again.' },
   [Card.Spatial]: { title: 'Room scan is off', body: 'Allow spatial data, then enter again.' },
   [Card.Camera]: { title: 'Camera is off', body: 'Allow the camera, then enter again.' },
@@ -598,6 +671,12 @@ const OCC_DELTA = OCC_MODE === 'delta';
 
 /** Desk preview: `?demo=push` loops a box pushed into the stand-in wall instead of the two-hand pull. */
 const DEMO_PUSH = typeof location !== 'undefined' && new URLSearchParams(location.search).get('demo') === 'push';
+/** Desk preview: `?demo=void` loops a fist tearing the stand-in room into its black hole. */
+const DEMO_VOID = typeof location !== 'undefined' && new URLSearchParams(location.search).get('demo') === 'void';
+/** `&at=<s>` with `demo=void` holds the loop at that moment, for screenshots. */
+const DEMO_AT = typeof location !== 'undefined' ? Number(new URLSearchParams(location.search).get('at') ?? NaN) : NaN;
+/** `?voidcover=1`: the shards' photo red, their fallback blue. */
+const VOID_COVER = typeof location !== 'undefined' && new URLSearchParams(location.search).get('voidcover') === '1';
 
 /** Developer check: `?lens=overlay` draws the live camera in stripes over the room at rest. */
 const LENS_OVERLAY = typeof location !== 'undefined' && new URLSearchParams(location.search).get('lens') === 'overlay';
@@ -763,6 +842,43 @@ export class RoomStretchSystem extends createSystem({
     v: 0,
     release: false,
   };
+  private readonly fists: Record<Side, FistTrack> = { left: makeFistTrack('left'), right: makeFistTrack('right') };
+  private voidDraw!: RoomVoid;
+  /**
+   * The fist's black hole: `on` while it tears the room and its shards fly, `gone` once the last has
+   * landed and the black closes over the rest; it stays until the mode, the session or a recentre
+   * ends it. The front `rip` runs out from O, where the fist closed; `mark`, `done` and `drain` time
+   * the shards let go of (stretch-material.ts tripOf). `at` is the hole, gliding after the fist.
+   */
+  private readonly blackHole = {
+    phase: 'none' as 'none' | 'on' | 'gone',
+    side: 'right' as Side,
+    holding: false,
+    growing: false,
+    O: new Vector3(),
+    at: new Vector3(),
+    spin: new Vector3(0, 0, 1),
+    rip: 0,
+    mark: 0,
+    done: 0,
+    drain: 0,
+    held: 0,
+    dmin: 0,
+    dmax: 0,
+    back: 0,
+    startAt: 0,
+    views: 0,
+    retryAt: 0,
+    /** Shard sets already handed to the void, by build. */
+    offered: -1,
+    frames: new Float32Array(VOID_FRAMES),
+    frameCount: 0,
+  };
+  /** The six photo uniforms, by index, so the frame loop never builds a key. */
+  private readonly viewSlots: { value: unknown }[] = [];
+  private demoFist!: Mesh;
+  private demoCut = false;
+  private demoHeldAt = false;
 
   init(): void {
     this.overlay = new RoomMeshOverlay(this.scene, LENS_OVERLAY);
@@ -770,6 +886,10 @@ export class RoomStretchSystem extends createSystem({
     this.hands = new HandOccluder(this.scene, OCC_DEBUG);
     this.mapFrame = new MapFrame(this.scene);
     this.pushBox = new PushBox(this.scene, this.overlay.uniforms);
+    this.voidDraw = new RoomVoid(this.scene, this.overlay.uniforms);
+    const V = this.voidDraw.uniforms;
+    this.viewSlots.push(V.uView0, V.uView1, V.uView2, V.uView3, V.uView4, V.uView5);
+    V.uCoverDebug.value = VOID_COVER ? 1 : 0;
     this.photo.history = this.hands;
     this.joints.points = this.hands.points;
     this.joints.arms = this.hands.arms;
@@ -854,6 +974,7 @@ export class RoomStretchSystem extends createSystem({
       this.overlay.hide(true);
       this.pushBox.setVisible(false, false);
       this.mapFrame.setVisible(false);
+      this.voidDraw.hide();
       this.hands.setActive(false);
       this.stopCamera();
       this.clearGrabs();
@@ -889,18 +1010,23 @@ export class RoomStretchSystem extends createSystem({
       const meshes = this.findMeshes();
       this.syncGrids(meshes);
       this.photo.capture(true, this.camera, this.handJoints(), this.handsKnown(), now);
+      this.offerShards();
       this.stepPush(dt, now);
-      this.resolvePending(this.left, dt, now);
-      this.resolvePending(this.right, dt, now);
-      this.stepMap();
-      this.stepHand(this.left, dt);
-      this.stepHand(this.right, dt);
-      this.stepHover(this.left, dt, now);
-      this.stepHover(this.right, dt, now);
+      // The black hole owns the room: no pinch, map or spike while it is up.
+      const voided = this.blackHole.phase !== 'none';
+      if (!voided) {
+        this.resolvePending(this.left, dt, now);
+        this.resolvePending(this.right, dt, now);
+        this.stepMap();
+        this.stepHand(this.left, dt);
+        this.stepHand(this.right, dt);
+        this.stepHover(this.left, dt, now);
+        this.stepHover(this.right, dt, now);
+      }
       // A spike draws the room only once it has a photo to show.
       const active = this.left.on || this.right.on || (this.left.hovering && this.left.hoverPhoto) || (this.right.hovering && this.right.hoverPhoto);
       if (LENS_OVERLAY) {
-        const live = !active && hasVideo && this.photo.projectFrame(true, this.camera, now);
+        const live = !active && !voided && hasVideo && this.photo.projectFrame(true, this.camera, now);
         this.overlay.setLive(video, live, this.photo.worldToClip);
         this.overlay.uniforms.uLensOn.value = live ? 1 : 0;
       }
@@ -908,16 +1034,19 @@ export class RoomStretchSystem extends createSystem({
       // depth around its opening: when nothing else moves, that is all the room draws.
       const debug = this.overlay.uniforms.uLensOn.value > 0 || OCC_DEBUG || OCC_DELTA;
       const boxed = this.box.phase === 'held' || this.box.phase === 'rest' || this.box.phase === 'out';
+      this.overlay.hold(voided);
       this.overlay.setVariant(!boxed ? 'full' : active || debug ? 'hole' : 'depth');
-      this.overlay.setActive(active || boxed || debug);
+      this.overlay.setActive(!voided && (active || boxed || debug));
       this.overlay.sync(meshes, this.head);
       this.overlay.syncPlanes(this.roomPlanes);
       this.publish(this.left, this.right, time, hasVideo);
       this.pushBox.setVisible(true, false);
       this.writePushBox(dt);
+      this.writeVoid(false);
       this.sing(this.left);
       this.sing(this.right);
       this.singBox();
+      this.singVoid();
       this.rearmCamera(now);
       const updateMs = performance.now() - startMs;
       if (this.left.pinchUpdateMs < 0) this.left.pinchUpdateMs = updateMs;
@@ -929,6 +1058,7 @@ export class RoomStretchSystem extends createSystem({
       this.overlay.hide(false);
       this.pushBox.setVisible(false, false);
       this.mapFrame.setVisible(false);
+      this.voidDraw.hide();
       this.hands.setActive(false);
       this.hud.visible = false;
       this.sound.stop();
@@ -948,12 +1078,14 @@ export class RoomStretchSystem extends createSystem({
       const live = this.photo.projectFrame(false, this.camera, now);
       this.photo.capture(false, this.camera, null, true, now);
       if (DEMO_PUSH) this.updatePushDemo(dt, now);
+      else if (DEMO_VOID) this.updateVoidDemo(dt, now);
       else this.updateDemo(dt, now);
       this.overlay.setLive(video, live, this.photo.worldToClip);
       this.publish(this.demoL, this.demoR, time, hasVideo);
       this.pushBox.setVisible(true, true);
       this.mapFrame.setVisible(false);
       this.writePushBox(dt);
+      this.writeVoid(true);
     }
     this.hud.visible = true;
     this.updateHud(dt, presenting, hasVideo, now);
@@ -983,6 +1115,11 @@ export class RoomStretchSystem extends createSystem({
     const table = new Mesh(new BoxGeometry(1.2, 0.72, 0.7, 24, 14, 14));
     table.position.set(0.85, 0.36, -1.15);
     add(table);
+    // `?demo=void`: where the fist would be.
+    this.demoFist = new Mesh(new SphereGeometry(0.035, 16, 12), new MeshBasicMaterial({ color: 0x202020 }));
+    this.demoFist.position.set(0.25, 1.15, -0.9);
+    this.demoFist.visible = DEMO_VOID;
+    this.room.add(this.demoFist);
     this.room.visible = false;
     this.scene.add(this.room);
   }
@@ -1154,6 +1291,8 @@ export class RoomStretchSystem extends createSystem({
     const now = performance.now() / 1000;
     for (const side of SIDES) if (this.palms[side].hold.on) this.letGo(this.palms[side], now, 'pause');
     if (this.box.phase === 'seek') this.box.phase = 'none';
+    // The hole stops tearing; what already flies lands.
+    for (const side of SIDES) this.fists[side].on = false;
     this.sound.stop();
   }
 
@@ -1176,6 +1315,8 @@ export class RoomStretchSystem extends createSystem({
     // An open palm doesn't pinch: a select from a hand arming or holding the box is a false one.
     if (grab.holding || grab.pending || this.pushOwns(side)) return;
     this.sound.unlock();
+    // Closing a fist can brush thumb past index: not a pinch. Nor is anything while the void is up.
+    if (this.blackHole.phase !== 'none' || this.fists[side].like) return;
     grab.pending = true;
     grab.pendingAt = performance.now() / 1000;
   };
@@ -1249,6 +1390,8 @@ export class RoomStretchSystem extends createSystem({
       U.uSegA.value[i].copy(this.hands.segA[i]);
       U.uSegB.value[i].copy(this.hands.segB[i]);
     }
+    U.uHandBall.value[0].copy(this.hands.balls[0]);
+    U.uHandBall.value[1].copy(this.hands.balls[1]);
     if (!d.on) return;
     U.uEnvDepth.value = d.texture;
     U.uDepthRaw.value = d.rawToMeters;
@@ -1379,6 +1522,10 @@ export class RoomStretchSystem extends createSystem({
   /** Turns a pinch from the last select event into a grab, now that the hand joints are readable. */
   private resolvePending(grab: Grab, dt: number, now: number): void {
     if (!grab.pending) return;
+    if (this.blackHole.phase !== 'none' || this.fists[grab.side].like) {
+      grab.pending = false;
+      return;
+    }
     if (this.handMap[grab.side] && !this.hands.hasPinch[grab.side]) {
       if (now - grab.pendingAt > PENDING_GIVEUP) grab.pending = false;
       return;
@@ -1532,6 +1679,8 @@ export class RoomStretchSystem extends createSystem({
    * tip. It rises from the tip's foot on that surface's plane, so it reaches straight up to the finger.
    */
   private aimSpike(grab: Grab, dt: number): number {
+    // A curled index in a fist is not a fingertip held to the wall.
+    if (this.fists[grab.side].like) return 0;
     const tip = this.hands.indexTip[grab.side];
     this.pinch.copy(tip);
     if (!this.raycast(this.head, this.pinch) || !this.hitMesh) return 0;
@@ -1611,6 +1760,9 @@ export class RoomStretchSystem extends createSystem({
     this.gaze.set(0, 0, -1).applyQuaternion(this.headQuat);
     this.readPalmTrack(this.palms.left, dt, now);
     this.readPalmTrack(this.palms.right, dt, now);
+    this.stepFists(dt, now);
+    this.stepBlackHole(dt, now);
+    if (this.blackHole.phase !== 'none') return;
     const box = this.box;
     switch (box.phase) {
       case 'none':
@@ -1990,6 +2142,7 @@ export class RoomStretchSystem extends createSystem({
   private letGo(track: PalmTrack, now: number, why: string): void {
     const box = this.box;
     const hold = track.hold;
+    this.fists[track.side].letGoAt = now;
     hold.on = false;
     track.latch = true;
     const other = this.palms[track.side === 'left' ? 'right' : 'left'];
@@ -2218,6 +2371,345 @@ export class RoomStretchSystem extends createSystem({
       box.phase = 'out';
       box.spring.step(0, dt, this.look.stiffness, this.look.damping);
     }
+  }
+
+  // ---------------------------------------------------------------- fist black hole
+
+  /** Hands the void each new cut of the room; it takes it up while it is off. */
+  private offerShards(): void {
+    const o = this.overlay;
+    if (!o.shards || o.shardsId === this.blackHole.offered) return;
+    this.blackHole.offered = o.shardsId;
+    this.voidDraw.offer(o.shards, o.shardsId);
+  }
+
+  /** The void's shards are cut from the room as it is drawn now. */
+  private roomReady(): boolean {
+    return !!this.voidDraw.shards && this.voidDraw.buildId === this.overlay.builtId && this.overlay.ready;
+  }
+
+  /** Reads both fists after their palms, and which of them holds (or may take) the hole. */
+  private stepFists(dt: number, now: number): void {
+    const j = this.joints;
+    for (let i = 0; i < SIDES.length; i++) {
+      const side = SIDES[i];
+      const fist = this.fists[side];
+      const track = this.palms[side];
+      if (!track.valid) {
+        fist.like = false;
+        fist.curlT = 0;
+        fist.nearT = 0;
+        fist.lostT += dt;
+        if (fist.on && fist.lostT > FIST_LOST) fist.on = false;
+        continue;
+      }
+      fist.lostT = 0;
+      const start = side === 'right' ? j.rightStart : j.leftStart;
+      const pose = track.pose;
+      readFist(j.points, start, pose, fist.shape);
+      fist.like = isFist(pose, fist.shape, FIST_HOLD_CURL, FIST_HOLD_TIPS, FIST_HOLD_THUMB);
+      if (!fist.like) fist.latch = false;
+      // Inside the fist: from the middle knuckle into the curl of the fingers, a little back.
+      const k = (start + 11) * 3;
+      fist.point.set(j.points[k], j.points[k + 1], j.points[k + 2]).addScaledVector(pose.normal, HOLE_IN).addScaledVector(pose.up, -HOLE_BACK);
+      fist.curlT = isFist(pose, fist.shape, FIST_CURL, FIST_TIPS, FIST_THUMB) ? fist.curlT + dt : 0;
+      const curled = pose.straight[0] < FIST_NEAR && pose.straight[1] < FIST_NEAR;
+      if (!curled) fist.whyLogged = false;
+      fist.nearT = curled && !fist.on ? fist.nearT + dt : 0;
+      if (fist.on) {
+        fist.openT = fist.like ? 0 : fist.openT + dt;
+        if (fist.openT > FIST_OPEN) fist.on = false;
+      } else if (this.canArm(fist, track, now)) {
+        fist.on = true;
+        fist.openT = 0;
+        this.logFist(fist, track, '');
+      } else if (!fist.whyLogged && !fist.latch && fist.curlT < FIST_ARM && fist.nearT > FIST_WHY_AFTER) {
+        fist.whyLogged = true;
+        this.logFist(fist, track, 'not a fist');
+      }
+    }
+  }
+
+  /** A fist held long enough, in front of your eyes, off the box: says once why not when it isn't. */
+  private canArm(fist: FistTrack, track: PalmTrack, now: number): boolean {
+    if (fist.latch || fist.curlT < FIST_ARM) return false;
+    const toFist = this.tmpA.copy(fist.point).sub(this.head);
+    const reach = toFist.length();
+    const cone = toFist.dot(this.gaze) / Math.max(reach, 1e-6);
+    let why = '';
+    if (track.hold.on || (this.box.phase === 'seek' && this.box.side === fist.side)) why = 'on the box';
+    else if (now - fist.letGoAt < FIST_AFTER_BOX) why = 'just let go of the box';
+    else if (reach < FIST_REACH || cone < FIST_CONE) why = `cone ${Math.round(Math.acos(Math.min(1, Math.max(-1, cone))) / DEG)}°`;
+    else if (this.blackHole.phase === 'none' && !this.roomReady()) why = 'room not ready';
+    if (!why) return true;
+    if (!fist.whyLogged) {
+      fist.whyLogged = true;
+      this.logFist(fist, track, why);
+    }
+    return false;
+  }
+
+  /** The four fingers' straightness, index and middle tips to the palm, the hand's size: to tune from. */
+  private logFist(fist: FistTrack, track: PalmTrack, why: string): void {
+    const s = track.pose.straight;
+    const t = fist.shape.tips;
+    console.info(
+      `[jonze] fist ${fist.side === 'left' ? 'L' : 'R'}${why ? '?' : ''} ${short(s[0])} ${short(s[1])} ${short(s[2])} ${short(s[3])} ` +
+        `tip ${short(t[0])} ${short(t[1])} th ${short(fist.shape.thumb)} L${(fist.shape.metacarpal * 100).toFixed(1)}${why ? ` ${why}` : ''}`,
+    );
+  }
+
+  /** Opens the hole at the first armed fist; after that, follows whichever fist holds it. */
+  private stepBlackHole(dt: number, now: number): void {
+    const bh = this.blackHole;
+    if (bh.phase === 'none') {
+      for (let i = 0; i < SIDES.length; i++) {
+        const fist = this.fists[SIDES[i]];
+        if (fist.on) {
+          this.startVoid(fist.side, fist.point, now, false);
+          break;
+        }
+      }
+      if (bh.phase === 'none') return;
+    } else if (!this.fists[bh.side].on) {
+      // The other fist, already armed, takes the hole over; it glides across.
+      const other = this.fists[bh.side === 'left' ? 'right' : 'left'];
+      if (other.on) bh.side = other.side;
+    }
+    const fist = this.fists[bh.side];
+    this.runVoid(dt, fist.on, fist.point, now);
+  }
+
+  /** The hole opens at `point`: everything else stops, and the room's photos are frozen for its shards. */
+  private startVoid(side: Side, point: Vector3, now: number, liveOk: boolean): void {
+    const set = this.voidDraw.shards;
+    if (!set) return;
+    this.sound.stop();
+    this.clearGrabs(true);
+    const bh = this.blackHole;
+    bh.phase = 'on';
+    bh.side = side;
+    bh.O.copy(point);
+    bh.at.copy(point);
+    bh.spin.copy(this.head).sub(point);
+    if (bh.spin.lengthSq() < 1e-6) bh.spin.set(0, 1, 0);
+    bh.spin.normalize();
+    let near = Infinity;
+    let far = 0;
+    const c = set.centres;
+    for (let i = 0; i < set.count; i++) {
+      const d = Math.hypot(c[i * 4] - point.x, c[i * 4 + 1] - point.y, c[i * 4 + 2] - point.z);
+      if (d < near) near = d;
+      if (d > far) far = d;
+    }
+    bh.dmin = Number.isFinite(near) ? near : 0;
+    bh.dmax = far + VOID_JAG;
+    bh.rip = bh.dmin;
+    bh.mark = bh.dmin;
+    bh.done = bh.dmin;
+    // Nothing is landing yet, so the front may grow at once.
+    bh.drain = 2;
+    bh.held = 0;
+    bh.back = 0;
+    bh.growing = false;
+    bh.startAt = now;
+    bh.frameCount = 0;
+    this.hands.setSlim(true);
+    console.info(`[jonze] void ${side === 'left' ? 'L' : 'R'} start ${set.count} shards ${short(bh.dmin)}-${bh.dmax.toFixed(1)}m`);
+    this.freezeViews(now, liveOk);
+  }
+
+  /** Freezes the photos the shards wear, chosen to cover them. Retried on the desk until the webcam is up. */
+  private freezeViews(now: number, liveOk: boolean): void {
+    const set = this.voidDraw.shards;
+    const bh = this.blackHole;
+    if (!set) return;
+    bh.retryAt = now + 0.5;
+    const pick = this.photo.freezeViews(this.head, this.gaze, set.centres, set.count, liveOk);
+    bh.views = pick.views;
+    if (pick.views > 0 || !liveOk) {
+      console.info(`[jonze] void views ${pick.views} cover ${Math.round(pick.cover * 100)}% (in view ${Math.round(pick.inView * 100)}%)`);
+    }
+  }
+
+  /**
+   * The tear front and its timeline, shared with the desk demo. While the fist holds, the front runs
+   * out faster and faster; let go, the shards already torn finish their flight. It grows again only
+   * once those have landed, so a flick of the fist never snaps any out of the air.
+   */
+  private runVoid(dt: number, holding: boolean, point: Vector3, now: number): void {
+    const bh = this.blackHole;
+    bh.holding = holding;
+    if (holding) bh.at.lerp(point, 1 - Math.exp(-Math.min(dt, STEP_MAX) / HOLE_GLIDE));
+    const grow = holding && bh.rip < bh.dmax && (bh.rip > bh.mark || bh.drain >= 1);
+    if (grow) {
+      bh.held += dt;
+      bh.rip = Math.min(bh.dmax, bh.rip + (VOID_SPEED + VOID_SPEED_UP * bh.held) * dt);
+    } else if (bh.rip > bh.mark) {
+      bh.done = bh.mark;
+      bh.mark = bh.rip;
+      bh.drain = 0;
+    }
+    bh.drain = Math.min(2, bh.drain + dt / VOID_LAND);
+    bh.growing = grow;
+    if (bh.phase === 'on') {
+      if (bh.frameCount < VOID_FRAMES) bh.frames[bh.frameCount++] = this.frameDt * 1000;
+      if (bh.mark >= bh.dmax && bh.drain >= 1) this.voidGone(now);
+    } else {
+      bh.back = Math.min(1, bh.back + dt / VOID_BACK_FADE);
+    }
+  }
+
+  /** The last shard has landed: a thunk, and the black closes over everything past the scan too. */
+  private voidGone(now: number): void {
+    const bh = this.blackHole;
+    bh.phase = 'gone';
+    if (this.renderer.xr.isPresenting) this.sound.gone(bh.at.x, bh.at.y, bh.at.z);
+    else console.info('[jonze] void sound gone');
+    const n = bh.frameCount;
+    const sorted = bh.frames.slice(0, n).sort();
+    const worst = n ? sorted[n - 1] : 0;
+    const p95 = n ? sorted[Math.floor(0.95 * (n - 1))] : 0;
+    console.info(`[jonze] void gone ${(now - bh.startAt).toFixed(1)}s worst ${worst.toFixed(1)}ms p95 ${p95.toFixed(1)}ms`);
+  }
+
+  /** The room comes back: the mode, the session or a recentre ended the void. Both fists must open first. */
+  private endVoid(): void {
+    const bh = this.blackHole;
+    if (bh.phase === 'none') return;
+    console.info(`[jonze] void end after ${(performance.now() / 1000 - bh.startAt).toFixed(1)}s`);
+    bh.phase = 'none';
+    bh.holding = false;
+    bh.growing = false;
+    bh.back = 0;
+    bh.views = 0;
+    this.photo.releaseViews();
+    this.hands.setSlim(false);
+    this.overlay.hold(false);
+    this.voidDraw.hide();
+    for (let i = 0; i < SIDES.length; i++) {
+      const fist = this.fists[SIDES[i]];
+      fist.on = false;
+      fist.latch = true;
+      fist.curlT = 0;
+    }
+  }
+
+  /** The void's uniforms and photos, then draws it (or keeps it warm). Every stretch-mode frame. */
+  private writeVoid(preview: boolean): void {
+    const bh = this.blackHole;
+    const on = bh.phase !== 'none';
+    if (on) {
+      const U = this.voidDraw.uniforms;
+      U.uVoidO.value.copy(bh.O);
+      U.uHole.value.copy(bh.at);
+      U.uHead.value.copy(this.head);
+      U.uSpin.value.copy(bh.spin);
+      U.uRip.value = bh.rip;
+      U.uMark.value = bh.mark;
+      U.uDone.value = bh.done;
+      U.uDrain.value = bh.drain;
+      U.uBackFade.value = bh.back;
+      // One photo uploads per frame, in the order they were chosen: the fist's own view first.
+      this.photo.uploadView(this.renderer);
+      const views = this.photo.views;
+      for (let i = 0; i < VOID_VIEWS; i++) {
+        const view = views[i];
+        const ready = view.has && view.ready;
+        U.uViewOn.value[i] = ready ? 1 : 0;
+        this.viewSlots[i].value = view.texture;
+        if (!ready) continue;
+        U.uViewToClip.value[i].copy(view.toClip);
+        U.uViewMean.value[i].copy(view.mean);
+      }
+      U.uViewGain.value.copy(this.photo.viewGain);
+    }
+    // On the desk the stand-in room still draws under the black, so its shards' black stays too.
+    this.voidDraw.sync(on, preview, preview || bh.back < 1);
+  }
+
+  /** The hole's voice: a suction that rises with the front, quieting as the last shards land. */
+  private singVoid(): void {
+    const bh = this.blackHole;
+    if (bh.phase !== 'on') return;
+    const level = bh.growing ? Math.min(1, 0.35 + 0.65 * (bh.held / 3)) : 0.5 * Math.max(0, 1 - bh.drain);
+    this.sound.suck(level, bh.at.x, bh.at.y, bh.at.z);
+  }
+
+  /** Desk preview, `?demo=void`: a fist tears the stand-in room in, opens, closes again, and the black stays. */
+  private updateVoidDemo(dt: number, now: number): void {
+    if (!this.demoCut) this.cutStandIn();
+    this.gaze.set(0, 0, -1).applyQuaternion(this.headQuat);
+    const bh = this.blackHole;
+    if (Number.isFinite(DEMO_AT)) {
+      // Held at one moment for screenshots: the loop runs up to it once, in headset-sized steps.
+      if (!this.voidDraw.shards) return;
+      if (!this.demoHeldAt) {
+        this.demoHeldAt = true;
+        this.demoT = 0;
+        const step = 1 / 72;
+        while (this.demoT + step <= DEMO_AT) this.voidDemoStep(step, now);
+      }
+    } else {
+      this.voidDemoStep(dt, now);
+    }
+    if (bh.phase !== 'none' && bh.views === 0 && now >= bh.retryAt) this.freezeViews(now, true);
+  }
+
+  private voidDemoStep(dt: number, now: number): void {
+    this.demoT += dt;
+    const t = this.demoT % 9;
+    const bh = this.blackHole;
+    if (t < 0.3) {
+      if (bh.phase !== 'none') this.endVoid();
+      return;
+    }
+    const fist = this.demoFist.position;
+    fist.set(0.25 + 0.03 * Math.sin(t * 2), 1.15 + 0.02 * Math.sin(t * 3), -0.9);
+    const holding = (t >= 0.5 && t < 1.7) || (t >= 2.6 && t < 5);
+    if (bh.phase === 'none') {
+      if (!holding || !this.voidDraw.shards) return;
+      this.startVoid('right', fist, now, true);
+      if (bh.phase === 'none') return;
+    }
+    this.runVoid(dt, holding, fist, now);
+  }
+
+  /** The stand-in room, cut into shards the way the worker cuts a scanned one. */
+  private cutStandIn(): void {
+    this.demoCut = true;
+    this.room.updateMatrixWorld(true);
+    const parts: Mesh[] = [];
+    this.room.traverse((object) => {
+      if ((object as Mesh).isMesh && object !== this.demoFist) parts.push(object as Mesh);
+    });
+    let vertices = 0;
+    let corners = 0;
+    for (const mesh of parts) {
+      vertices += mesh.geometry.getAttribute('position').count;
+      corners += mesh.geometry.getIndex()?.count ?? 0;
+    }
+    const positions = new Float32Array(vertices * 3);
+    const indices = new Uint32Array(corners);
+    let vBase = 0;
+    let iBase = 0;
+    const v = this.tmpA;
+    for (const mesh of parts) {
+      const position = mesh.geometry.getAttribute('position');
+      for (let k = 0; k < position.count; k++) {
+        v.fromBufferAttribute(position, k).applyMatrix4(mesh.matrixWorld);
+        positions[(vBase + k) * 3] = v.x;
+        positions[(vBase + k) * 3 + 1] = v.y;
+        positions[(vBase + k) * 3 + 2] = v.z;
+      }
+      const index = mesh.geometry.getIndex();
+      if (index) for (let k = 0; k < index.count; k++) indices[iBase + k] = vBase + index.getX(k);
+      vBase += position.count;
+      iBase += index?.count ?? 0;
+    }
+    const set = buildShards(positions, indices);
+    this.voidDraw.offer(set, -2);
+    console.info(`[jonze] shards (stand-in): ${set.count} pieces, ${set.triangles} triangles`);
   }
 
   private stepHand(grab: Grab, dt: number): void {
@@ -2479,7 +2971,9 @@ export class RoomStretchSystem extends createSystem({
     slide.multiplyScalar(lo);
   }
 
-  private clearGrabs(): void {
+  /** `keepMap` keeps a mapped area: the fist clears everything else as its void opens. */
+  private clearGrabs(keepMap = false): void {
+    this.endVoid();
     this.resetGrab(this.left);
     this.resetGrab(this.right);
     this.resetSpike(this.left);
@@ -2490,7 +2984,7 @@ export class RoomStretchSystem extends createSystem({
     this.photo.drop(1);
     this.clearPush();
     // A new session, or leaving the mode: the area to push is mapped again.
-    this.map.phase = 'mapping';
+    if (!keepMap || this.map.phase !== 'set') this.map.phase = 'mapping';
     this.map.release = false;
     this.mapFrame.setVisible(false);
   }
@@ -2676,7 +3170,8 @@ export class RoomStretchSystem extends createSystem({
   private updateHud(dt: number, presenting: boolean, hasVideo: boolean, now: number): void {
     const want = this.cardFor(presenting, hasVideo, now);
     if (want !== Card.None && want !== this.cardShown) this.paintCard(want);
-    const holding = this.left.holding || this.right.holding || this.box.phase === 'held' || this.map.phase === 'drag';
+    const holding =
+      this.left.holding || this.right.holding || this.box.phase === 'held' || this.map.phase === 'drag' || this.blackHole.phase !== 'none';
     const target = want !== Card.None && !holding ? 1 : 0;
     this.placeCard(dt, target);
   }
@@ -2865,6 +3360,7 @@ export class RoomStretchSystem extends createSystem({
     this.stopCamera();
     this.overlay.dispose();
     this.pushBox.dispose();
+    this.voidDraw.dispose();
     this.mapFrame.dispose();
     this.hands.dispose();
     this.photo.dispose();

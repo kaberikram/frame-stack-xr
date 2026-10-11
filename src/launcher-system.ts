@@ -21,8 +21,8 @@ import { TableTouchSystem } from './table-touch-system.js';
 const NO_PASSTHROUGH = 'Open this page in the Meta Quest browser to use passthrough.';
 const DEPTH_WAIT = 'Downloading the depth model. Passthrough unlocks when it’s ready.';
 const DEPTH_FAIL = 'The depth model didn’t load. Reload the page to try again.';
-const STRETCH_HINT = 'Round 7d. Pinch-drag a frame on a wall, then push it in with your palm.';
-const STRETCH_CAMERA = 'Camera on. Push a palm into a wall, or pinch and pull.';
+const STRETCH_HINT = 'Round 8. Make a fist to tear the room into it. Or pinch, push, pull.';
+const STRETCH_CAMERA = 'Camera on. Make a fist, push a palm into a wall, or pinch and pull.';
 const STRETCH_ASKING = 'Allow the camera so the pull can show your room.';
 const STRETCH_BLOCKED = 'Camera blocked. Allow it for this site so the pull can show your room.';
 const SORANG_HINT = 'Click the view to look around. WASD walks. Shift is faster.';
@@ -85,8 +85,8 @@ export class LauncherSystem extends createSystem({}) {
     const version = document.getElementById('stretchVersion');
     if (version) {
       version.textContent =
-        `Round 7d · jonze-${__BUILD_SHA__}. Map a wall by pinch-dragging a frame on it, then push it in with ` +
-        'your palm: it sinks in like a box, with everything against it, and stays. Pinch it to pop it back.';
+        `Round 8 · jonze-${__BUILD_SHA__}. Make a fist in front of you: the room tears into shards that fly ` +
+        'into it, leaving pitch black. Hold it to swallow everything; open your hand and the black stays.';
     }
 
     enter.disabled = true;
@@ -269,7 +269,7 @@ export class LauncherSystem extends createSystem({}) {
     const lensOn = params.get('lens') === 'overlay';
     const handsOn = params.get('occ') === 'debug';
     const consoleOn = params.get('debug') === '1';
-    const pushDemo = params.get('demo') === 'push';
+    const pushDemo = params.get('demo') === 'push' || params.get('demo') === 'void';
     const checkId = lensOn ? 'checkLens' : handsOn ? 'checkHands' : consoleOn ? 'checkConsole' : '';
     if (checkId) document.getElementById(checkId)?.setAttribute('aria-current', 'page');
     const modeParam = params.get('mode');

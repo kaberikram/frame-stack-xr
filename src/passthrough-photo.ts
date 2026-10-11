@@ -9,6 +9,7 @@ import {
   Vector3,
   type Object3D,
   type PerspectiveCamera,
+  type Texture,
 } from '@iwsdk/core';
 
 /** Which visor camera feeds the photos. A webcam on a desk is `view`: its pose is the preview camera's. */
@@ -85,6 +86,13 @@ const FOOTPRINT_MAX = 32;
 /** One photo slot per hand, and a third for a pushed-in box, which stays while both hands pinch on. */
 const SLOTS = 3;
 export type SlotIndex = 0 | 1 | 2;
+/** Bank photos the void holds at once: the shard shader picks the best of these per shard. */
+const VIEWS = 6;
+/** A shard centre counts as covered by a frame this far (uv) inside its edge. */
+const VIEW_REACH = 0.03;
+/** Shards within 45° of the gaze are where you look while the room tears: they weigh this much more. */
+const GAZE_COS = Math.cos((45 * Math.PI) / 180);
+const GAZE_WEIGHT = 3;
 /** Hand or arm cover below this counts as a clean frame. */
 const CLEANER = 0.02;
 /** Hand and arm cover is measured over nearly the whole frame, on a coarse grid of sample points. */
@@ -228,6 +236,33 @@ export interface PhotoSlot {
   readonly fill: FillPhoto;
 }
 
+/**
+ * One of the void's photos: a bank frame shown as is, for the shards flying to the fist. It wraps
+ * the bank entry's own canvas, so choosing one copies nothing; the bank takes no frames meanwhile.
+ */
+export interface VoidView {
+  readonly texture: CanvasTexture;
+  readonly toClip: Matrix4;
+  readonly cam: Vector3;
+  /** The photo's mean colour, linear 0..1: what a shard no photo holds is tinted from. */
+  readonly mean: Vector3;
+  has: boolean;
+  /** Its texture has reached the GPU, so its pixels match `toClip`. */
+  ready: boolean;
+}
+
+interface ViewStore extends VoidView {
+  /** Replaced only when a canvas of another size comes along. */
+  texture: CanvasTexture;
+  /** What `texture.image` is: a bank entry's canvas, or the live copy on a desk. */
+  canvas: HTMLCanvasElement;
+  /** needsUpdate was raised for the photo it holds now. */
+  sent: boolean;
+  /** The canvas size at the texture's first upload: its storage is immutable at that size. 0 before. */
+  texW: number;
+  texH: number;
+}
+
 interface SlotStore {
   canvas: HTMLCanvasElement;
   ctx: CanvasRenderingContext2D;
@@ -277,6 +312,10 @@ export class PassthroughPhoto {
   readonly worldToClip = new Matrix4();
   readonly liveCam = new Vector3();
   readonly slots: readonly PhotoSlot[];
+  /** The void's photos, most coverage first. Exactly VIEWS; `has` is false on the unused ones. */
+  readonly views: VoidView[];
+  /** Exposure, warmth and tint, as every slot's gain: the void's shards multiply their photos by it. */
+  readonly viewGain = new Vector3(1, 1, 1);
   /** Why the last freeze() returned false. */
   lastMiss: PhotoMiss = 'none';
   private readonly pickNote: PickNote = { source: 'none', age: 0, base: 0, margin: 0, tier: 0, seen: 0, old: 0, edge: 0, hand: 0 };
@@ -299,6 +338,18 @@ export class PassthroughPhoto {
   private readonly fillStores: readonly SlotStore[];
   /** Bank entries a freeze chose as fills, copied in at the start of the next frame. */
   private readonly pendingFill: (BankEntry | null)[] = Array.from({ length: SLOTS }, () => null);
+  private readonly viewStores: ViewStore[];
+  /** The bank entries the views were chosen from, for skipping near-duplicates. */
+  private readonly viewFrom: (BankEntry | null)[] = Array.from({ length: VIEWS }, () => null);
+  /** The void holds bank canvases: capture() must not overwrite any. */
+  private holdBank = false;
+  /** The live frame copied for the void on a desk, made on first use. */
+  private liveStore: SlotStore | null = null;
+  /** Per shard centre, grown to the largest shard set: gaze weight, weight still uncovered, which bank entries hold it. */
+  private viewWeight = new Uint8Array(0);
+  private viewLeft = new Uint8Array(0);
+  private viewMask = new Uint8Array(0);
+  private readonly viewNote = { views: 0, cover: 0, inView: 0 };
   private readonly inner = new Float32Array(FOOTPRINT_MAX * 3);
   /** The last freeze wanted its whole footprint clear of hands: test the area, not just its points. */
   private wholeClean = false;
@@ -367,6 +418,9 @@ export class PassthroughPhoto {
     this.stores = Array.from({ length: SLOTS }, makeStore);
     this.fillStores = Array.from({ length: SLOTS }, makeStore);
     this.slots = Array.from({ length: SLOTS }, makeSlot);
+    this.viewStores = Array.from({ length: VIEWS }, (_, i) => makeView(this.bank[i].canvas));
+    this.views = this.viewStores;
+    this.writeGain(this.viewGain);
     this.probe = document.createElement('canvas');
     this.probe.width = PROBE_W;
     this.probe.height = PROBE_H;
@@ -431,6 +485,7 @@ export class PassthroughPhoto {
       for (let i = 0; i < this.bank.length; i++) this.bank[i].used = false;
       this.measuredAt = -Infinity;
       this.prepare(this.videoW, this.videoH);
+      this.prepareViews(this.videoW, this.videoH);
       console.info(`[jonze] camera frame ${this.videoW}x${this.videoH}`);
     }
     if (track && track !== this.loggedTrack) {
@@ -511,6 +566,8 @@ export class PassthroughPhoto {
   capture(presenting: boolean, viewCamera: PerspectiveCamera, joints: HandJoints | null, handsKnown: boolean, now: number): void {
     // Before anything can overwrite a bank entry that a freeze picked as a fill.
     this.flushFills();
+    // The void's photos are bank canvases: none may be overwritten while it holds them.
+    if (this.holdBank) return;
     const video = this.video;
     if (!video || !this.videoW || !handsKnown) return;
     if (now - this.activeAt < WARMUP || now - this.lastAdmit < ADMIT_GAP) return;
@@ -741,6 +798,7 @@ export class PassthroughPhoto {
   /** Re-derives each slot's colour from the current exposure, warmth and tint. */
   updateGains(): void {
     for (let k = 0; k < SLOTS; k++) this.writeGain(this.slots[k].gain);
+    this.writeGain(this.viewGain);
   }
 
   drop(k: SlotIndex): void {
@@ -749,8 +807,135 @@ export class PassthroughPhoto {
     this.pendingFill[k] = null;
   }
 
+  /**
+   * Holds up to VIEWS bank photos for the void, chosen greedily over the shard centres (xyz and a
+   * seed each): every pick adds the most weight no earlier pick covers, a centre within 45° of the
+   * gaze counting GAZE_WEIGHT, discounted like freeze() by how far from here it was taken. A view
+   * within SAME_VIEW of one already held adds too little to be worth an upload. No live frame on a
+   * headset: it has the fist cut out right where tearing starts. `liveOk` (the desk, with no real
+   * hands) takes the frame of the last projectFrame() when the bank is empty. The bank takes no
+   * frames until releaseViews(). Returns shares of the weight and of the gaze's weight covered, in
+   * the same object every call.
+   */
+  freezeViews(eye: Vector3, gaze: Vector3, centres: Float32Array, count: number, liveOk: boolean): { views: number; cover: number; inView: number } {
+    this.releaseViews();
+    const note = this.viewNote;
+    note.views = 0;
+    note.cover = 0;
+    note.inView = 0;
+    count = Math.min(count, centres.length >> 2);
+    if (this.viewWeight.length < count) {
+      this.viewWeight = new Uint8Array(count);
+      this.viewLeft = new Uint8Array(count);
+      this.viewMask = new Uint8Array(count);
+    }
+    const weight = this.viewWeight;
+    const left = this.viewLeft;
+    const mask = this.viewMask;
+    let used = 0;
+    for (let b = 0; b < BANK; b++) if (this.bank[b].used) used |= 1 << b;
+    const gazeLen = gaze.length();
+    let total = 0;
+    let totalIn = 0;
+    for (let i = 0; i < count; i++) {
+      const x = centres[i * 4];
+      const y = centres[i * 4 + 1];
+      const z = centres[i * 4 + 2];
+      const dx = x - eye.x;
+      const dy = y - eye.y;
+      const dz = z - eye.z;
+      const ahead = dx * gaze.x + dy * gaze.y + dz * gaze.z >= GAZE_COS * gazeLen * Math.hypot(dx, dy, dz);
+      const w = ahead ? GAZE_WEIGHT : 1;
+      weight[i] = w;
+      left[i] = w;
+      total += w;
+      if (ahead) totalIn += w;
+      let bits = 0;
+      for (let b = 0; b < BANK; b++) {
+        if ((used & (1 << b)) !== 0 && uvMargin(this.bank[b].toClip, x, y, z) >= VIEW_REACH) bits |= 1 << b;
+      }
+      mask[i] = bits;
+    }
+    let taken = 0;
+    let n = 0;
+    while (n < VIEWS) {
+      let best = -1;
+      let bestScore = 0;
+      for (let b = 0; b < BANK; b++) {
+        const bit = 1 << b;
+        if (!(used & bit) || taken & bit) continue;
+        const entry = this.bank[b];
+        if (this.sameAsHeld(entry, n)) continue;
+        let gain = 0;
+        for (let i = 0; i < count; i++) if (mask[i] & bit) gain += left[i];
+        const score = gain / (1 + entry.cam.distanceTo(eye) / BASE_HALF);
+        if (score > bestScore) {
+          bestScore = score;
+          best = b;
+        }
+      }
+      if (best < 0) break;
+      const bit = 1 << best;
+      taken |= bit;
+      for (let i = 0; i < count; i++) if (mask[i] & bit) left[i] = 0;
+      const entry = this.bank[best];
+      this.viewFrom[n] = entry;
+      this.takeView(n, entry.canvas, entry.toClip, entry.cam, entry);
+      n++;
+    }
+    if (n > 0) {
+      this.holdBank = true;
+    } else if (liveOk && used === 0 && this.takeLive()) {
+      n = 1;
+      for (let i = 0; i < count; i++) {
+        if (uvMargin(this.worldToClip, centres[i * 4], centres[i * 4 + 1], centres[i * 4 + 2]) >= VIEW_REACH) left[i] = 0;
+      }
+    }
+    if (n === 0) return note;
+    let covered = 0;
+    let coveredIn = 0;
+    for (let i = 0; i < count; i++) {
+      if (left[i] !== 0) continue;
+      covered += weight[i];
+      if (weight[i] === GAZE_WEIGHT) coveredIn += weight[i];
+    }
+    note.views = n;
+    note.cover = total > 0 ? covered / total : 0;
+    note.inView = totalIn > 0 ? coveredIn / totalIn : 0;
+    return note;
+  }
+
+  /**
+   * Sends the first held view that hasn't been sent to the GPU, most coverage first. Call once a
+   * frame: the fist's first frames then carry one upload each, not six at once. True when it sent one.
+   */
+  uploadView(renderer: { initTexture(texture: Texture): void }): boolean {
+    for (let i = 0; i < VIEWS; i++) {
+      const view = this.viewStores[i];
+      if (!view.has || view.sent || view.ready) continue;
+      view.sent = true;
+      view.texture.needsUpdate = true;
+      renderer.initTexture(view.texture);
+      return true;
+    }
+    return false;
+  }
+
+  /** Lets the void's photos go and the bank take frames again. Cheap: it runs every frame outside stretch mode. */
+  releaseViews(): void {
+    this.holdBank = false;
+    for (let i = 0; i < VIEWS; i++) {
+      const view = this.viewStores[i];
+      view.has = false;
+      view.ready = false;
+      view.sent = false;
+      this.viewFrom[i] = null;
+    }
+  }
+
   /** Forget every frame: a new session, a recentred space, or a restarted camera. */
   clear(): void {
+    this.releaseViews();
     for (let i = 0; i < this.bank.length; i++) this.bank[i].used = false;
     for (let k = 0; k < SLOTS; k++) this.drop(k as SlotIndex);
     this.measuredAt = -Infinity;
@@ -776,6 +961,7 @@ export class PassthroughPhoto {
       this.slots[k].fill.texture?.dispose();
       this.slots[k].fill.texture = null;
     }
+    for (let i = 0; i < VIEWS; i++) this.viewStores[i].texture.dispose();
   }
 
   // ---------------------------------------------------------------- internals
@@ -1141,6 +1327,79 @@ export class PassthroughPhoto {
     }
   }
 
+  /** True when `entry` looks within SAME_VIEW of one of the first `n` views held. */
+  private sameAsHeld(entry: BankEntry, n: number): boolean {
+    for (let j = 0; j < n; j++) {
+      const held = this.viewFrom[j];
+      if (held && entry.dir.dot(held.dir) > SAME_VIEW) return true;
+    }
+    return false;
+  }
+
+  /** Points view `k` at a canvas the void will hold, with the pose and mean it was taken with. Uploads later. */
+  private takeView(k: number, canvas: HTMLCanvasElement, toClip: Matrix4, cam: Vector3, rgb: MeanRgb): void {
+    const view = this.viewStores[k];
+    view.canvas = canvas;
+    if (view.texW !== 0 && (view.texW !== canvas.width || view.texH !== canvas.height)) {
+      view.texture.dispose();
+      view.texture = makeViewTexture(view);
+      view.texW = 0;
+      view.texH = 0;
+    } else {
+      view.texture.image = canvas;
+    }
+    view.toClip.copy(toClip);
+    view.cam.copy(cam);
+    view.mean.set(rgb.r, rgb.g, rgb.b);
+    view.has = true;
+    view.ready = false;
+    view.sent = false;
+  }
+
+  /**
+   * The desk's stand-in for an empty bank: the live frame, copied into a canvas of its own, posed as
+   * the last projectFrame() left it (the desk loop runs that every frame). False while the webcam is dark.
+   */
+  private takeLive(): boolean {
+    const video = this.video;
+    if (!video || !this.videoW || !this.measure(video, performance.now() / 1000)) return false;
+    const store = this.liveStore ?? (this.liveStore = makeStore());
+    sizeStore(store, this.videoW, this.videoH);
+    store.ctx.clearRect(0, 0, store.w, store.h);
+    store.ctx.drawImage(video, 0, 0, store.w, store.h);
+    this.takeView(0, store.canvas, this.worldToClip, this.liveCam, this.probeMean);
+    return true;
+  }
+
+  /**
+   * Gives the void's textures storage at the camera's frame size now, as prepare() does for the slots:
+   * a fist then uploads into storage that exists, and no texture is left for a draw to upload unasked.
+   * The bank was just dropped, so any views held go with it.
+   */
+  private prepareViews(w: number, h: number): void {
+    this.releaseViews();
+    // Entry 0 takes the bank's first frame anyway: its canvas can take the size now and stand in for all six.
+    const canvas = this.bank[0].canvas;
+    if (canvas.width !== w || canvas.height !== h) {
+      canvas.width = w;
+      canvas.height = h;
+    }
+    for (let i = 0; i < VIEWS; i++) {
+      const view = this.viewStores[i];
+      if (view.texW === w && view.texH === h) continue;
+      view.canvas = canvas;
+      if (view.texW !== 0) {
+        view.texture.dispose();
+        view.texture = makeViewTexture(view);
+        view.texW = 0;
+        view.texH = 0;
+      } else {
+        view.texture.image = canvas;
+      }
+      this.warmList.push(view.texture);
+    }
+  }
+
   /** An unused bank entry, or null when all eight hold photos. */
   private freeEntry(): BankEntry | null {
     for (let i = 0; i < this.bank.length; i++) if (!this.bank[i].used) return this.bank[i];
@@ -1388,8 +1647,33 @@ function makeTexture(canvas: HTMLCanvasElement, slot: { ready: boolean }): Canva
   return tex;
 }
 
+/** A void view over `canvas`, holding nothing yet. */
+function makeView(canvas: HTMLCanvasElement): ViewStore {
+  const view = {
+    canvas, has: false, ready: false, sent: false, texW: 0, texH: 0,
+    toClip: new Matrix4(), cam: new Vector3(), mean: new Vector3(),
+  } as ViewStore;
+  view.texture = makeViewTexture(view);
+  return view;
+}
+
+/** Like a slot's texture, but it also notes the size its storage took on the first upload. */
+function makeViewTexture(view: ViewStore): CanvasTexture {
+  const tex = makeTexture(view.canvas, view);
+  tex.onUpdate = () => {
+    // Uploads land a frame late under multiview: one for a texture since replaced is not this view's.
+    if (view.texture !== tex) return;
+    if (view.texW === 0) {
+      view.texW = view.canvas.width;
+      view.texH = view.canvas.height;
+    }
+    view.ready = true;
+  };
+  return tex;
+}
+
 /** Distance from the point's uv to the nearest frame edge; negative outside or behind. */
-function uvMargin(clip: Matrix4, x: number, y: number, z: number): number {
+export function uvMargin(clip: Matrix4, x: number, y: number, z: number): number {
   const e = clip.elements;
   const w = e[3] * x + e[7] * y + e[11] * z + e[15];
   if (w <= 1e-4) return -1;

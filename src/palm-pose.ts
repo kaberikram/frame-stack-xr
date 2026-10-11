@@ -88,3 +88,55 @@ export function countStraight(pose: PalmPose, min: number): number {
   for (let f = 0; f < 4; f++) if (pose.straight[f] >= min) n++;
   return n;
 }
+
+/** Index, middle, ring and pinky tips. */
+const TIPS = [9, 14, 19, 24] as const;
+/** Where a fist's thumb rests: across the index's middle or end bone, or the middle finger's middle bone. */
+const THUMB_RESTS = [7, 8, 12] as const;
+
+/** How closed a hand is beyond what `readPalm` measures: each fingertip's distance to the palm. */
+export interface FistShape {
+  /** The middle metacarpal, metres: the hand's own size, so the test fits any hand. */
+  metacarpal: number;
+  /** Index, middle, ring and pinky: tip to `PalmPose.centre`, in metacarpal lengths. */
+  readonly tips: Float32Array;
+  /** Thumb tip to the nearest place a fist's thumb rests (or the palm, tucked in), in metacarpal lengths. */
+  thumb: number;
+}
+
+export function makeFistShape(): FistShape {
+  return { metacarpal: 0, tips: new Float32Array(4), thumb: 0 };
+}
+
+/** Reads the fingertips against a palm `readPalm` has just read from the same joints. */
+export function readFist(points: Float32Array, start: number, pose: PalmPose, out: FistShape): void {
+  const o = start * 3;
+  const base = o + MIDDLE_BASE * 3;
+  const knuckle = o + MIDDLE_KNUCKLE * 3;
+  const length = Math.max(1e-4, Math.hypot(points[knuckle] - points[base], points[knuckle + 1] - points[base + 1], points[knuckle + 2] - points[base + 2]));
+  out.metacarpal = length;
+  const c = pose.centre;
+  for (let f = 0; f < 4; f++) {
+    const t = o + TIPS[f] * 3;
+    out.tips[f] = Math.hypot(points[t] - c.x, points[t + 1] - c.y, points[t + 2] - c.z) / length;
+  }
+  const th = o + THUMB_TIP * 3;
+  let thumb = Math.hypot(points[th] - c.x, points[th + 1] - c.y, points[th + 2] - c.z);
+  for (let r = 0; r < THUMB_RESTS.length; r++) {
+    const q = o + THUMB_RESTS[r] * 3;
+    thumb = Math.min(thumb, Math.hypot(points[th] - points[q], points[th + 1] - points[q + 1], points[th + 2] - points[q + 2]));
+  }
+  out.thumb = thumb / length;
+}
+
+/**
+ * A fist: index and middle curled under `curl` with their tips within `tips` metacarpal lengths of
+ * the palm, ring or pinky curled too, and the thumb within `thumb` of where a fist's thumb rests.
+ * `straight` only sees bend past the knuckle, so the tips are what tell a fist from a point, a cup
+ * or a pinch with the other fingers tucked; the thumb tells it from a thumbs-up.
+ */
+export function isFist(pose: PalmPose, shape: FistShape, curl: number, tips: number, thumb: number): boolean {
+  const s = pose.straight;
+  if (s[0] >= curl || s[1] >= curl || (s[2] >= curl && s[3] >= curl)) return false;
+  return shape.tips[0] < tips && shape.tips[1] < tips && shape.thumb < thumb;
+}
