@@ -195,9 +195,9 @@ const VOID_REACH_START = 1.5;
 const VOID_REACH_END = 8;
 const VOID_RATE_START = 8;
 const VOID_RATE_END = 320;
-const VOID_TUG = 0.4;
-const VOID_FLIGHT_NEAR = 1.8;
-const VOID_FLIGHT_FAR = 2.2;
+const VOID_TUG = 0.33;
+const VOID_FLIGHT_NEAR = 1.5;
+const VOID_FLIGHT_FAR = 1.83;
 const VOID_FLIGHT_FAR_AT = 5;
 /** The most shards one frame will pick up. The rate cap is what actually limits the trickle. */
 const VOID_CATCH_SLOTS = 8;
@@ -2570,13 +2570,20 @@ export class RoomStretchSystem extends createSystem({
   private runVoid(dt: number, holding: boolean, point: Vector3, aim: Vector3, now: number): void {
     const bh = this.blackHole;
     if (bh.phase !== 'on') return;
+    const wasHolding = bh.holding;
     bh.holding = holding;
     bh.clock += dt;
     if (holding) {
       bh.held += dt;
-      const glide = 1 - Math.exp(-Math.min(dt, STEP_MAX) / HOLE_GLIDE);
-      bh.at.lerp(point, glide);
-      bh.aim.lerp(aim, glide);
+      if (!wasHolding) {
+        // The ring belongs on the fist. Coming back from a lowered hand starts there, not at the old spot.
+        bh.at.copy(point);
+        bh.aim.copy(aim);
+      } else {
+        const glide = 1 - Math.exp(-Math.min(dt, STEP_MAX) / HOLE_GLIDE);
+        bh.at.lerp(point, glide);
+        bh.aim.lerp(aim, glide);
+      }
       if (bh.aim.lengthSq() < 1e-8) bh.aim.set(0, 0, -1);
       else bh.aim.normalize();
       this.aimSide(bh.aim, bh.spin);
@@ -2739,8 +2746,8 @@ export class RoomStretchSystem extends createSystem({
     }
     // On the desk the stand-in room still draws under the black, so its shards' black stays too.
     this.voidDraw.sync(on, preview, preview || bh.back < 1);
-    const suck = !on || bh.back >= 1 ? 0 : bh.holding ? Math.max(0.45, Math.min(1, 0.35 + bh.rate / VOID_RATE_END)) : 0.18;
-    this.voidDraw.placeVortex(on && bh.back < 1, suck, bh.at, bh.aim, bh.clock, preview);
+    const suck = on && bh.back < 1 && bh.holding ? Math.max(0.45, Math.min(1, 0.35 + bh.rate / VOID_RATE_END)) : 0;
+    this.voidDraw.placeVortex(suck > 0, suck, bh.at, bh.aim, bh.clock, preview);
   }
 
   /** The hole's voice: a suction that follows how fast shards are being caught. */

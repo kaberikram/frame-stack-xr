@@ -1092,9 +1092,9 @@ varying float vLight;
 /** Shards stay this far from your eyes: nothing flies through your face. */
 const float HEAD_CLEAR = 0.5;
 /** Must match VOID_TUG, VOID_FLIGHT_NEAR, VOID_FLIGHT_FAR and VOID_FLIGHT_FAR_AT in room-stretch-system.ts. */
-const float TUG = 0.4;
-const float FLIGHT_NEAR = 1.8;
-const float FLIGHT_FAR = 2.2;
+const float TUG = 0.33;
+const float FLIGHT_NEAR = 1.5;
+const float FLIGHT_FAR = 1.83;
 const float FLIGHT_FAR_AT = 5.0;
 
 /**
@@ -1188,9 +1188,9 @@ void main() {
     if (headGap < HEAD_CLEAR) q = uHead + (headGap > 1.0e-4 ? fromHead / headGap : -uAim) * HEAD_CLEAR;
     float left = length(uHole - q);
     float span0 = max(length(from), 0.25);
-    // Smaller the closer it is. The last half-metre is only a scrap, so it slips into the fist.
+    // Smaller toward the fist, but still a shard you can follow until the last stretch.
     float approach = clamp(left / span0, 0.0, 1.0);
-    float size = pow(approach, 1.45) * smoothstep(0.02, 0.5, left);
+    float size = pow(approach, 1.05) * smoothstep(0.02, 0.28, left);
     vec3 axis = normalize(fract(sin(vec3(seed * 91.3, seed * 47.7, seed * 13.1) + 1.0) * 43758.5453) - 0.5 + 1.0e-3);
     off = turn(position - c, axis, trip * 1.2);
     off *= size;
