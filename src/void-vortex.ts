@@ -6,12 +6,10 @@ const AIM = new Vector3(0, 0, 1);
 /** After the flying shards (3) and before the far black (3.5), so the ring sits over the mouth. */
 const ORDER = 3.4;
 const RING_SEG = 48;
-const BANDS = 3;
-const STEPS = 28;
 
 /**
- * The vacuum's nozzle: a ring about 9 cm across at the fist, and a short cone of spiral streaks
- * in front of it. Depth-tested, no depth write, so shards and hands stay visible through it.
+ * The vacuum's nozzle: a ring about 9 cm across at the fist. Depth-tested, no depth write, so
+ * shards and hands stay visible through it.
  */
 export class VoidVortex {
   private readonly mesh: Mesh;
@@ -91,7 +89,7 @@ export class VoidVortex {
   }
 }
 
-/** A ring in the local XY plane, then three ribbons the vertex shader scrolls down +Z into it. */
+/** A ring in the local XY plane. The mesh is aimed so the ring faces along the fist. */
 function buildVortex(): BufferGeometry {
   const positions: number[] = [];
   const vortex: number[] = [];
@@ -108,18 +106,6 @@ function buildVortex(): BufferGeometry {
   for (let i = 0; i < RING_SEG; i++) {
     const a = i * 2;
     indices.push(a, a + 1, a + 3, a, a + 3, a + 2);
-  }
-  for (let band = 0; band < BANDS; band++) {
-    const base = positions.length / 3;
-    for (let step = 0; step <= STEPS; step++) {
-      const along = step / STEPS;
-      positions.push(0, 0, 0, 0, 0, 0);
-      vortex.push(along, band, 0, along, band, 1);
-    }
-    for (let step = 0; step < STEPS; step++) {
-      const a = base + step * 2;
-      indices.push(a, a + 1, a + 3, a, a + 3, a + 2);
-    }
   }
   const geometry = new BufferGeometry();
   geometry.setAttribute('position', new BufferAttribute(new Float32Array(positions), 3));

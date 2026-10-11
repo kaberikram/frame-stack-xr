@@ -1363,33 +1363,15 @@ export function voidMaterial(uniforms: VoidUniformSet, preview: boolean, role: V
 }
 
 const VORTEX_VERTEX = /* glsl */ `
-attribute vec3 aVortex;
 uniform float uTime;
 varying vec3 vRest;
 varying float vViewZ;
-varying float vAlong;
-varying float vBand;
 
 void main() {
-  vec3 p;
-  if (aVortex.y < 0.0) {
-    float ang = uTime * 1.2;
-    float c = cos(ang);
-    float s = sin(ang);
-    p = vec3(position.x * c - position.y * s, position.x * s + position.y * c, position.z);
-    vAlong = 0.0;
-  } else {
-    // Scroll toward the mouth. The strip wraps, and the fragment fades both ends so the wrap is hidden.
-    float along = fract(aVortex.x - uTime * 0.35);
-    float ang = aVortex.y * 2.094395102 + along * 4.2;
-    float rad = mix(0.046, 0.22, along);
-    float w = (aVortex.z - 0.5) * 0.014 * mix(0.6, 1.4, along);
-    float ca = cos(ang);
-    float sa = sin(ang);
-    p = vec3(ca * rad - sa * w, sa * rad + ca * w, along * 0.6);
-    vAlong = along;
-  }
-  vBand = aVortex.y;
+  float ang = uTime * 1.2;
+  float c = cos(ang);
+  float s = sin(ang);
+  vec3 p = vec3(position.x * c - position.y * s, position.x * s + position.y * c, position.z);
   vec4 world = modelMatrix * vec4(p, 1.0);
   vRest = world.xyz;
   vec4 viewPos = viewMatrix * world;
@@ -1404,19 +1386,12 @@ uniform float uFeather;
 uniform float uLinear;
 varying vec3 vRest;
 varying float vViewZ;
-varying float vAlong;
-varying float vBand;
 ${DEPTH_CUT}
 ${PHOTO}
 
 void main() {
-  float alpha = uSuck;
+  float alpha = uSuck * 0.9;
   vec3 col = vec3(0.62, 0.86, 1.0) * (0.35 + 0.65 * uSuck);
-  if (vBand < 0.0) alpha *= 0.9;
-  else {
-    float fade = smoothstep(0.0, 0.12, vAlong) * (1.0 - smoothstep(0.7, 0.98, vAlong));
-    alpha *= 0.5 * fade;
-  }
 #ifdef ENV_DEPTH
   float gate = 0.0;
   float occ = handOcclusion(vRest, vViewZ, gate);
@@ -1427,7 +1402,7 @@ void main() {
 }
 `;
 
-/** The nozzle: a ring at the fist and faint streaks funneling into it. Premultiplied, no depth write. */
+/** The nozzle: a ring at the fist. Premultiplied, no depth write. */
 export function vortexMaterial(room: RubberUniformSet, preview: boolean): ShaderMaterial {
   const defines: Record<string, string> = {};
   if (!preview) defines.ENV_DEPTH = '';
