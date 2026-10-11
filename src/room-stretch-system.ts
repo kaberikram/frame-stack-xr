@@ -24,17 +24,15 @@ import {
 import { EnvDepth } from './env-depth.js';
 import { PREVIEW_FORCED, getMode } from './experience.js';
 import { HandOccluder, SEGMENTS } from './hand-occluder.js';
-import { polygonDepth } from './mesh-subdivide.js';
 import { countStraight, makePalmPose, readPalm, type PalmPose } from './palm-pose.js';
 import { drawHint, makeCanvas, type Canvas2D } from './labels.js';
 import { cameraMount, PassthroughPhoto, type CameraMount, type CameraSideSetting, type HandJoints } from './passthrough-photo.js';
-import { PushBox } from './push-box.js';
 import { RoomMeshOverlay } from './room-mesh-overlay.js';
 import { RoomPlanes, type PlaneHit, type PlaneMiss } from './room-planes.js';
 import { StretchLook } from './stretch-component.js';
 import { Spring, averageNormal, buildTriGrid, rayTriGrid, triangleNormal, type RayHit, type TriGrid } from './stretch-math.js';
 import { Stillness } from './touch-logic.js';
-import { BOX_SKIN, type RubberUniformSet } from './stretch-material.js';
+import { SLAB_FRONT, type RubberUniformSet } from './stretch-material.js';
 import { StretchSound } from './stretch-sound.js';
 
 type Side = 'left' | 'right';
@@ -152,20 +150,20 @@ const PUSH_WALL_UP = 0.5;
 const PUSH_WALL_MIN = 0.4;
 const PUSH_WALL_MAX = 5;
 /**
- * The box's half width is PUSH_SIZE of the wall's distance (about a third of what you see), between
- * these; its half height PUSH_ASPECT of that. It only shrinks, to stay on the wall's detected outline
- * (by PUSH_EDGE) and inside its photo (by PUSH_PHOTO_MARGIN uv), never below PUSH_HALF_FLOOR.
+ * The pushed wall is the detected wall the palm faces, edge to edge and floor to ceiling, PUSH_EDGE in
+ * from its outline. With no detected wall, a section PUSH_SIZE of its distance either side (about a
+ * third of what you see), between these, PUSH_ASPECT as tall. Then each edge that its photo (with
+ * its fill) does not reach by PUSH_PHOTO_MARGIN uv steps in by PUSH_TRIM of its span, alone, so a
+ * photo short of the ceiling costs only the top. Never under PUSH_HALF_FLOOR either way.
  */
+const PUSH_EDGE = 0.02;
 const PUSH_SIZE = 0.3;
 const PUSH_HALF_MIN = 0.25;
 const PUSH_HALF_MAX = 0.9;
 const PUSH_ASPECT = 0.8;
 const PUSH_HALF_FLOOR = 0.12;
-const PUSH_EDGE = 0.03;
-const PUSH_PHOTO_MARGIN = 0.09;
-const PUSH_SHRINK = 0.85;
-/** The camera sees little above your gaze: the box moves toward the gaze's hit by up to this share of its height. */
-const PUSH_BIAS = 0.6;
+const PUSH_PHOTO_MARGIN = 0.06;
+const PUSH_TRIM = 0.06;
 /** A photo is tried at these scales at most every PUSH_RETRY, the live frame from PUSH_LIVE_AFTER, and given up at PUSH_GIVE_UP. */
 const PUSH_SCALES = [1, 0.7, 0.5] as const;
 const PUSH_RETRY = 0.3;
@@ -439,15 +437,20 @@ interface BoxState {
   readonly U: Vector3;
   readonly V: Vector3;
   readonly N: Vector3;
+  /** Half sizes, from the edges. */
   hw: number;
   hh: number;
-  /** The size laid out on the wall, before any photo shrank it: each photo attempt starts from it. */
-  hw0: number;
-  hh0: number;
-  fit0: number;
-  /** Where the arming palm's line of sight met the wall, and how far below it the gaze met it. */
+  /** Where the arming palm's line of sight met the wall: the edges are measured from it along U and V. */
   readonly hit: Vector3;
-  bias: number;
+  u0: number;
+  u1: number;
+  v0: number;
+  v1: number;
+  /** The edges laid out on the wall, before the photo trimmed them: each attempt starts from them, and a palm on them is on the box. */
+  bu0: number;
+  bu1: number;
+  bv0: number;
+  bv1: number;
   dist: number;
   /** How much of its first size it kept, after the wall's outline and the photo. */
   fit: number;
@@ -747,11 +750,11 @@ export class RoomStretchSystem extends createSystem({
   private readonly bestD = new Vector3();
   private readonly inv = new Matrix4();
 
-  private pushBox!: PushBox;
   private readonly palms: Record<Side, PalmTrack> = { left: makePalmTrack('left'), right: makePalmTrack('right') };
   private readonly box: BoxState = {
     phase: 'none', side: 'right', C: new Vector3(), U: new Vector3(1, 0, 0), V: new Vector3(0, 1, 0), N: new Vector3(0, 0, 1),
-    hw: 0.3, hh: 0.24, hw0: 0.3, hh0: 0.24, fit0: 1, hit: new Vector3(), bias: 0, dist: 2, fit: 1, plane: -1, spring: new Spring(), depthTo: 0, target: 0, peak: 0, fade: 0,
+    hw: 0.3, hh: 0.24, hit: new Vector3(), u0: -0.3, u1: 0.3, v0: -0.24, v1: 0.24, bu0: -0.3, bu1: 0.3, bv0: -0.24, bv1: 0.24,
+    dist: 2, fit: 1, plane: -1, spring: new Spring(), depthTo: 0, target: 0, peak: 0, fade: 0,
     seekAt: 0, retryAt: 0, startAt: 0, restAt: 0, outStiff: 90, outDamp: 9, next: null,
     ringT: new Float32Array(PUSH_RING).fill(-Infinity), ringD: new Float32Array(PUSH_RING), ringL: new Uint8Array(PUSH_RING), ringHead: 0,
   };
@@ -766,7 +769,6 @@ export class RoomStretchSystem extends createSystem({
     this.overlay = new RoomMeshOverlay(this.scene, LENS_OVERLAY);
     if (LENS_OVERLAY) console.info('[jonze] lens overlay: live camera in stripes over the room at rest; hold still to read it');
     this.hands = new HandOccluder(this.scene, OCC_DEBUG);
-    this.pushBox = new PushBox(this.scene, this.overlay.uniforms);
     this.photo.history = this.hands;
     this.joints.points = this.hands.points;
     this.joints.arms = this.hands.arms;
@@ -849,7 +851,6 @@ export class RoomStretchSystem extends createSystem({
       this.hud.visible = false;
       this.room.visible = false;
       this.overlay.hide(true);
-      this.pushBox.setVisible(false, false);
       this.hands.setActive(false);
       this.stopCamera();
       this.clearGrabs();
@@ -903,12 +904,10 @@ export class RoomStretchSystem extends createSystem({
       // depth around its opening: when nothing else moves, that is all the room draws.
       const debug = this.overlay.uniforms.uLensOn.value > 0 || OCC_DEBUG || OCC_DELTA;
       const boxed = this.box.phase === 'held' || this.box.phase === 'rest' || this.box.phase === 'out';
-      this.overlay.setVariant(!boxed ? 'full' : active || debug ? 'hole' : 'depth');
       this.overlay.setActive(active || boxed || debug);
       this.overlay.sync(meshes, this.head);
       this.overlay.syncPlanes(this.roomPlanes);
       this.publish(this.left, this.right, time, hasVideo);
-      this.pushBox.setVisible(true, false);
       this.writePushBox(dt);
       this.sing(this.left);
       this.sing(this.right);
@@ -922,7 +921,6 @@ export class RoomStretchSystem extends createSystem({
       // between the Enter click and the session starting must not.
       this.room.visible = false;
       this.overlay.hide(false);
-      this.pushBox.setVisible(false, false);
       this.hands.setActive(false);
       this.hud.visible = false;
       this.sound.stop();
@@ -945,7 +943,6 @@ export class RoomStretchSystem extends createSystem({
       else this.updateDemo(dt, now);
       this.overlay.setLive(video, live, this.photo.worldToClip);
       this.publish(this.demoL, this.demoR, time, hasVideo);
-      this.pushBox.setVisible(true, true);
       this.writePushBox(dt);
     }
     this.hud.visible = true;
@@ -1741,33 +1738,29 @@ export class RoomStretchSystem extends createSystem({
     return false;
   }
 
-  /** Lays the box's rectangle out on the wall under this palm and starts looking for its photo. */
+  /** Lays the box out on the wall under this palm (the whole detected wall) and starts looking for its photo. */
   private beginSeek(track: PalmTrack, now: number): void {
     const box = this.box;
     const N = box.N.copy(track.n);
-    const C = box.C.copy(track.hit);
-    const U = box.U.set(0, 1, 0).cross(N).normalize();
-    const V = box.V.copy(N).cross(U);
+    box.U.set(0, 1, 0).cross(N).normalize();
+    box.V.copy(N).cross(box.U);
+    box.hit.copy(track.hit);
     box.dist = track.dist;
     box.plane = track.plane;
-    const half = Math.min(PUSH_HALF_MAX, Math.max(PUSH_HALF_MIN, PUSH_SIZE * track.dist));
-    box.hw = half;
-    box.hh = PUSH_ASPECT * half;
-    box.fit = 1;
-    // The camera sees little above your gaze: a palm raised high centres the box nearer the gaze.
-    box.hit.copy(C);
-    box.bias = 0;
-    const along = this.gaze.dot(N);
-    if (along < -1e-3) {
-      const t = this.tmpA.copy(C).sub(this.head).dot(N) / along;
-      const below = this.tmpA.copy(this.head).addScaledVector(this.gaze, t).sub(C).dot(V);
-      if (t > 0 && below < 0) box.bias = -below;
+    if (!this.wallEdges(track.plane)) {
+      // No detected wall: a third of what you see, around the palm.
+      const half = Math.min(PUSH_HALF_MAX, Math.max(PUSH_HALF_MIN, PUSH_SIZE * track.dist));
+      box.u0 = -half;
+      box.u1 = half;
+      box.v0 = -PUSH_ASPECT * half;
+      box.v1 = PUSH_ASPECT * half;
     }
-    this.centreBox();
-    this.fitBox((p) => this.onPlane(p));
-    box.hw0 = box.hw;
-    box.hh0 = box.hh;
-    box.fit0 = box.fit;
+    box.bu0 = box.u0;
+    box.bu1 = box.u1;
+    box.bv0 = box.v0;
+    box.bv1 = box.v1;
+    box.fit = 1;
+    this.applyEdges();
     if (box.hw < PUSH_HALF_FLOOR || box.hh < PUSH_HALF_FLOOR) {
       console.info(`[jonze] push ${track.side === 'left' ? 'L' : 'R'}? edge ${(2 * box.hw).toFixed(2)}x${(2 * box.hh).toFixed(2)}`);
       track.latch = true;
@@ -1781,66 +1774,111 @@ export class RoomStretchSystem extends createSystem({
     track.still.reset();
   }
 
-  /** Shrinks the box's width and height, each by PUSH_SHRINK, until every rim point passes `inside`. */
-  private fitBox(inside: (p: Vector3) => boolean): void {
+  /**
+   * The detected wall's outline, as edges along the box's U and V from the palm's hit, PUSH_EDGE in.
+   * False when the hit is on no detected wall.
+   */
+  private wallEdges(index: number): boolean {
+    const plane = index >= 0 ? this.roomPlanes.planes[index] : null;
+    if (!plane || plane.points < 3 || plane.horizontal) return false;
     const box = this.box;
-    const w0 = box.hw;
-    const h0 = box.hh;
-    for (let i = 0; i < 12; i++) {
-      let uOut = false;
-      let vOut = false;
-      for (let a = -1; a <= 1; a++) {
-        for (let b = -1; b <= 1; b++) {
-          if (a === 0 && b === 0) continue;
-          const p = this.boxP.copy(box.C).addScaledVector(box.U, a * box.hw).addScaledVector(box.V, b * box.hh);
-          if (inside(p)) continue;
-          if (a !== 0) uOut = true;
-          if (b !== 0) vOut = true;
-        }
-      }
-      if (!uOut && !vOut) break;
-      if (uOut) box.hw *= PUSH_SHRINK;
-      if (vOut) box.hh *= PUSH_SHRINK;
-      this.centreBox();
+    let u0 = Infinity;
+    let u1 = -Infinity;
+    let v0 = Infinity;
+    let v1 = -Infinity;
+    for (let i = 0; i < plane.points; i++) {
+      const p = this.boxP.set(plane.polygon[i * 2], 0, plane.polygon[i * 2 + 1]).applyMatrix4(plane.world).sub(box.hit);
+      const u = p.dot(box.U);
+      const v = p.dot(box.V);
+      u0 = Math.min(u0, u);
+      u1 = Math.max(u1, u);
+      v0 = Math.min(v0, v);
+      v1 = Math.max(v1, v);
     }
-    box.fit *= Math.min(box.hw / w0, box.hh / h0);
+    // The palm's hit lies on the outline it was snapped to; anything else is a stale plane.
+    if (!(u0 < 0 && u1 > 0 && v0 < 0 && v1 > 0)) return false;
+    box.u0 = u0 + PUSH_EDGE;
+    box.u1 = u1 - PUSH_EDGE;
+    box.v0 = v0 + PUSH_EDGE;
+    box.v1 = v1 - PUSH_EDGE;
+    return true;
+  }
+
+  /** The box's centre and half sizes from its edges. */
+  private applyEdges(): void {
+    const box = this.box;
+    box.hw = 0.5 * (box.u1 - box.u0);
+    box.hh = 0.5 * (box.v1 - box.v0);
+    box.C.copy(box.hit).addScaledVector(box.U, 0.5 * (box.u0 + box.u1)).addScaledVector(box.V, 0.5 * (box.v0 + box.v1));
+  }
+
+  /** A point on the box's wall at fractions `a`, `b` (0..1) across its edges. */
+  private boxPoint(a: number, b: number): Vector3 {
+    const box = this.box;
+    const u = box.u0 + (box.u1 - box.u0) * a;
+    const v = box.v0 + (box.v1 - box.v0) * b;
+    return this.boxP.copy(box.hit).addScaledVector(box.U, u).addScaledVector(box.V, v);
   }
 
   /**
-   * The box's centre: the arming palm's hit, moved toward the gaze's by up to PUSH_BIAS of its
-   * height. Kept that way as it shrinks, so the palm that armed it is always on it.
+   * Steps each edge that has a point failing `inside` in by PUSH_TRIM of its span, on its own, until
+   * all four pass: a photo short of the ceiling costs the top, not the floor too.
    */
-  private centreBox(): void {
+  private fitEdges(inside: (p: Vector3) => boolean): void {
     const box = this.box;
-    box.C.copy(box.hit).addScaledVector(box.V, -Math.min(box.bias, PUSH_BIAS * box.hh));
+    for (let i = 0; i < 16; i++) {
+      let left = false;
+      let right = false;
+      let bottom = false;
+      let top = false;
+      for (let k = 0; k <= 4; k++) {
+        const t = k / 4;
+        if (!inside(this.boxPoint(0, t))) left = true;
+        if (!inside(this.boxPoint(1, t))) right = true;
+        if (!inside(this.boxPoint(t, 0))) bottom = true;
+        if (!inside(this.boxPoint(t, 1))) top = true;
+      }
+      if (!left && !right && !bottom && !top) break;
+      const du = PUSH_TRIM * (box.u1 - box.u0);
+      const dv = PUSH_TRIM * (box.v1 - box.v0);
+      if (left) box.u0 += du;
+      if (right) box.u1 -= du;
+      if (bottom) box.v0 += dv;
+      if (top) box.v1 -= dv;
+    }
+    this.applyEdges();
   }
 
-  /** On the wall's detected outline, PUSH_EDGE in from its edge. Any point counts when the wall has none. */
-  private onPlane(p: Vector3): boolean {
-    const plane = this.box.plane >= 0 ? this.roomPlanes.planes[this.box.plane] : null;
-    if (!plane || plane.points < 3) return true;
-    const q = this.boxQ.copy(p).applyMatrix4(plane.inverse);
-    return polygonDepth(plane.polygon, plane.points, q.x, q.z) >= PUSH_EDGE;
-  }
-
-  /** Centre first, then a 5x5 grid over the rectangle: all of it must be in the photo and clear of hands. */
-  private writePushFootprint(scale: number): void {
+  /** Centre first, then a 5x5 grid over the box: all of it must be in the photo and clear of hands. */
+  private writePushFootprint(): void {
     const box = this.box;
     const f = this.pushFootprint;
     f[0] = box.C.x;
     f[1] = box.C.y;
     f[2] = box.C.z;
     let i = 1;
-    for (let a = -2; a <= 2; a++) {
-      for (let b = -2; b <= 2; b++) {
-        if (a === 0 && b === 0) continue;
-        const p = this.boxP.copy(box.C).addScaledVector(box.U, 0.5 * a * box.hw * scale).addScaledVector(box.V, 0.5 * b * box.hh * scale);
+    for (let a = 0; a <= 4; a++) {
+      for (let b = 0; b <= 4; b++) {
+        if (a === 2 && b === 2) continue;
+        const p = this.boxPoint(a / 4, b / 4);
         f[i * 3] = p.x;
         f[i * 3 + 1] = p.y;
         f[i * 3 + 2] = p.z;
         i++;
       }
     }
+  }
+
+  /** The box's edges back where they were laid out, scaled by `scale` about their middle. */
+  private resetEdges(scale: number): void {
+    const box = this.box;
+    const cu = 0.5 * (box.bu0 + box.bu1);
+    const cv = 0.5 * (box.bv0 + box.bv1);
+    box.u0 = cu + (box.bu0 - cu) * scale;
+    box.u1 = cu + (box.bu1 - cu) * scale;
+    box.v0 = cv + (box.bv0 - cv) * scale;
+    box.v1 = cv + (box.bv1 - cv) * scale;
+    this.applyEdges();
   }
 
   /** The box's photo: a clean bank frame with no hand anywhere on it, smaller if need be; late, the live frame. */
@@ -1855,28 +1893,22 @@ export class RoomStretchSystem extends createSystem({
     }
     if (now < box.retryAt) return;
     box.retryAt = now + PUSH_RETRY;
-    // Every attempt starts from the size laid out on the wall: a failed one leaves nothing behind.
-    box.hw = box.hw0;
-    box.hh = box.hh0;
-    box.fit = box.fit0;
-    this.centreBox();
+    // Every attempt starts from the edges laid out on the wall: a failed one leaves nothing behind.
     const liveOk = now - box.seekAt >= PUSH_LIVE_AFTER;
     const t0 = performance.now();
     let frozen = false;
     for (let i = 0; i < (liveOk ? 1 : PUSH_SCALES.length) && !frozen; i++) {
       const scale = PUSH_SCALES[i];
-      if (scale * Math.min(box.hw0, box.hh0) < PUSH_HALF_FLOOR) break;
-      this.writePushFootprint(scale);
+      this.resetEdges(scale);
+      if (Math.min(box.hw, box.hh) < PUSH_HALF_FLOOR) break;
+      this.writePushFootprint();
       frozen = this.photo.freeze(2, this.pushFootprint, PUSH_FOOTPRINT, true, this.camera, now, this.handJoints(), this.head, liveOk, Infinity);
-      if (frozen && scale < 1) {
-        box.hw *= scale;
-        box.hh *= scale;
-        box.fit *= scale;
-        this.centreBox();
-      }
     }
     if (frozen) {
-      this.fitBox((p) => this.photo.slotContains(2, p, PUSH_PHOTO_MARGIN));
+      const w0 = box.bu1 - box.bu0;
+      const h0 = box.bv1 - box.bv0;
+      this.fitEdges((p) => this.photo.coverContains(2, p, PUSH_PHOTO_MARGIN));
+      box.fit = Math.min((box.u1 - box.u0) / w0, (box.v1 - box.v0) / h0);
       if (box.hw >= PUSH_HALF_FLOOR && box.hh >= PUSH_HALF_FLOOR) {
         const ms = performance.now() - t0;
         const face = -track.pose.normal.dot(box.N);
@@ -1914,7 +1946,7 @@ export class RoomStretchSystem extends createSystem({
     const box = this.box;
     if (!this.photo.slots[2].live || now < box.retryAt) return;
     box.retryAt = now + PUSH_SWAP;
-    this.writePushFootprint(1);
+    this.writePushFootprint();
     if (this.photo.freeze(2, this.pushFootprint, PUSH_FOOTPRINT, true, this.camera, now, this.handJoints(), this.head, false, Infinity)) {
       console.info(`[jonze] ${this.photo.pickLine(2)}, swapped in`);
     }
@@ -2089,7 +2121,7 @@ export class RoomStretchSystem extends createSystem({
     box.depthTo = 0;
     box.spring.reset(0);
     this.photo.drop(2);
-    this.pushBox.hide();
+    this.hideBox();
     for (const side of SIDES) {
       const track = this.palms[side];
       track.hold.on = false;
@@ -2107,12 +2139,16 @@ export class RoomStretchSystem extends createSystem({
     const dir = this.boxQ.copy(through).sub(origin);
     const across = dir.dot(box.N);
     if (across > -1e-6) return false;
-    const t = this.boxP.copy(box.C).sub(origin).dot(box.N) / across;
+    const t = this.boxP.copy(box.hit).sub(origin).dot(box.N) / across;
     if (t <= 0) return false;
     this.boxT = t * dir.length();
-    const q = this.boxP.copy(origin).addScaledVector(dir, t).sub(box.C);
-    const grow = 1 + margin;
-    return Math.abs(q.dot(box.U)) <= box.hw * grow && Math.abs(q.dot(box.V)) <= box.hh * grow;
+    // Against the edges as laid out on the wall: where the photo trimmed it is still your wall.
+    const q = this.boxP.copy(origin).addScaledVector(dir, t).sub(box.hit);
+    const u = q.dot(box.U);
+    const v = q.dot(box.V);
+    const mu = 0.5 * margin * (box.bu1 - box.bu0);
+    const mv = 0.5 * margin * (box.bv1 - box.bv0);
+    return u >= box.bu0 - mu && u <= box.bu1 + mu && v >= box.bv0 - mv && v <= box.bv1 + mv;
   }
 
   /** A hand busy with the box: arming it or holding it. Its pinches and spikes stand down. */
@@ -2128,26 +2164,53 @@ export class RoomStretchSystem extends createSystem({
     if (this.raycast(this.head, this.pinch) && this.hitMesh) {
       this.hitMesh.updateWorldMatrix(true, false);
       const hit = this.tmpA.copy(this.localHit).applyMatrix4(this.hitMesh.matrixWorld);
-      // Something stands in front of the box (the room draws it there, past BOX_SKIN): pinch that instead.
-      if (hit.sub(box.C).dot(box.N) >= BOX_SKIN) return false;
+      // Something stands further out than the slab carries (a coffee table): pinch that instead.
+      if (hit.sub(box.hit).dot(box.N) >= SLAB_FRONT) return false;
     }
     this.pinched = true;
     this.startOut(performance.now() / 1000, `pinch ${grab.side === 'left' ? 'L' : 'R'}`, this.look.stiffness, this.look.damping);
     return true;
   }
 
-  /** After publish: the box's shape and photo, for the room's opening and the box itself. */
+  /** After publish: the pushed wall's rectangle, depth and photo, for the room's slab. */
   private writePushBox(dt: number): void {
     const box = this.box;
     if (box.phase !== 'held' && box.phase !== 'rest' && box.phase !== 'out') {
-      this.pushBox.hide();
+      this.hideBox();
       return;
     }
-    this.pushBox.place(box.C, box.U, box.hw, box.V, box.hh, box.N, box.spring.value);
+    const U = this.overlay.uniforms;
+    U.uBoxOn.value = 1;
+    U.uBoxC.value.copy(box.C);
+    U.uBoxU.value.set(box.U.x, box.U.y, box.U.z, box.hw);
+    U.uBoxV.value.set(box.V.x, box.V.y, box.V.z, box.hh);
+    U.uBoxN.value.copy(box.N);
+    U.uBoxDepth.value = box.spring.value;
     const slot = this.photo.slots[2];
-    // A swapped-in photo uploads while the box stays up: it never blinks out for it.
+    // A swapped-in photo uploads while the wall stays back: it never blinks out for it.
     box.fade = !slot.has ? 0 : slot.ready ? Math.min(1, box.fade + dt / FADE_IN) : box.fade;
-    this.pushBox.writePhoto(slot, box.fade);
+    const has = slot.has && slot.texture ? 1 : 0;
+    U.uPhoto2.value = slot.texture;
+    U.uWorldToClip2.value.copy(slot.toClip);
+    U.uCamPos2.value.copy(slot.cam);
+    U.uGain2.value.copy(slot.gain);
+    U.uHasPhoto2.value = has;
+    const fill = slot.fill;
+    U.uFill2.value = fill.texture;
+    U.uFillToClip2.value.copy(fill.toClip);
+    U.uFillCam2.value.copy(fill.cam);
+    U.uHasFill2.value = has && fill.has && fill.ready && fill.texture ? 1 : 0;
+    U.uFade2.value = box.fade;
+  }
+
+  /** No pushed wall: the room's slab and its photo are off. */
+  private hideBox(): void {
+    const U = this.overlay.uniforms;
+    U.uBoxOn.value = 0;
+    U.uBoxDepth.value = 0;
+    U.uHasPhoto2.value = 0;
+    U.uHasFill2.value = 0;
+    U.uFade2.value = 0;
   }
 
   /** The box's own voice: it strums when taken, climbs as it goes in, settles or falls when let go. */
@@ -2171,7 +2234,7 @@ export class RoomStretchSystem extends createSystem({
     box.depthTo = 0;
     box.spring.reset(0);
     this.photo.drop(2);
-    this.pushBox.hide();
+    this.hideBox();
     for (const side of SIDES) {
       const track = this.palms[side];
       track.hold.on = false;
@@ -2191,18 +2254,17 @@ export class RoomStretchSystem extends createSystem({
       return;
     }
     if (box.phase === 'none') {
-      box.C.set(0, 0.75, -2);
+      // The whole stand-in wall: the wardrobe against it goes back too, the table half in its slab stretches.
+      box.hit.set(0, 1.2, -2);
       box.U.set(1, 0, 0);
       box.V.set(0, 1, 0);
       box.N.set(0, 0, 1);
-      box.hw = 0.28;
-      box.hh = 0.22;
-      box.hw0 = box.hw;
-      box.hh0 = box.hh;
-      box.fit0 = 1;
-      box.hit.copy(box.C);
-      box.bias = 0;
-      box.dist = box.C.distanceTo(this.head);
+      box.bu0 = box.u0 = -2 + PUSH_EDGE;
+      box.bu1 = box.u1 = 2 - PUSH_EDGE;
+      box.bv0 = box.v0 = -1.2 + PUSH_EDGE;
+      box.bv1 = box.v1 = 1.2 - PUSH_EDGE;
+      this.applyEdges();
+      box.dist = box.hit.distanceTo(this.head);
       box.fit = 1;
       box.plane = -1;
       box.spring.reset(0);
@@ -2213,7 +2275,7 @@ export class RoomStretchSystem extends createSystem({
     // The webcam may start after the loop does: keep trying for a photo.
     if (!this.photo.slots[2].has && now >= box.retryAt) {
       box.retryAt = now + 0.5;
-      this.writePushFootprint(1);
+      this.writePushFootprint();
       this.photo.freeze(2, this.pushFootprint, PUSH_FOOTPRINT, false, this.camera, now, null, this.head, true, Infinity);
       if (this.photo.slots[2].has || this.photo.lastMiss !== 'no-video') console.info(`[jonze] ${this.photo.pickLine(2)}`);
     }
@@ -2880,7 +2942,6 @@ export class RoomStretchSystem extends createSystem({
     outlineMaterial.visible = true;
     this.stopCamera();
     this.overlay.dispose();
-    this.pushBox.dispose();
     this.hands.dispose();
     this.photo.dispose();
     this.sound.dispose();

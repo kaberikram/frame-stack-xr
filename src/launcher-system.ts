@@ -20,7 +20,7 @@ import { TableTouchSystem } from './table-touch-system.js';
 const NO_PASSTHROUGH = 'Open this page in the Meta Quest browser to use passthrough.';
 const DEPTH_WAIT = 'Downloading the depth model. Passthrough unlocks when it’s ready.';
 const DEPTH_FAIL = 'The depth model didn’t load. Reload the page to try again.';
-const STRETCH_HINT = 'Round 7. Hold an open palm up to a wall, then push.';
+const STRETCH_HINT = 'Round 7b. Hold an open palm up to a wall, then push.';
 const STRETCH_CAMERA = 'Camera on. Push a palm into a wall, or pinch and pull.';
 const STRETCH_ASKING = 'Allow the camera so the pull can show your room.';
 const STRETCH_BLOCKED = 'Camera blocked. Allow it for this site so the pull can show your room.';
@@ -64,8 +64,8 @@ export class LauncherSystem extends createSystem({}) {
     const version = document.getElementById('stretchVersion');
     if (version) {
       version.textContent =
-        `Round 7 · jonze-${__BUILD_SHA__}. Hold a palm up to a wall and push: it sinks in like a box and stays. ` +
-        'Pinch it to pop it back. Touching or tapping the mesh does nothing.';
+        `Round 7b · jonze-${__BUILD_SHA__}. Hold a palm up to a wall and push: the whole wall slides back, ` +
+        'with what stands against it, and stays. Pinch it to pop it back. Touching or tapping the mesh does nothing.';
     }
 
     enter.disabled = true;

@@ -300,6 +300,8 @@ export class PassthroughPhoto {
   /** Bank entries a freeze chose as fills, copied in at the start of the next frame. */
   private readonly pendingFill: (BankEntry | null)[] = Array.from({ length: SLOTS }, () => null);
   private readonly inner = new Float32Array(FOOTPRINT_MAX * 3);
+  /** The last freeze wanted its whole footprint clear of hands: test the area, not just its points. */
+  private wholeClean = false;
   private measuredAt = -Infinity;
   private readonly probe: HTMLCanvasElement;
   private readonly probeCtx: CanvasRenderingContext2D;
@@ -598,6 +600,7 @@ export class PassthroughPhoto {
     note.edge = 0;
     note.hand = 0;
     const inner = this.innerRing(footprint, count, clean);
+    this.wholeClean = clean === Infinity;
     let best: BankEntry | null = null;
     let bestScore = -Infinity;
     let bestMargin = 0;
@@ -617,7 +620,7 @@ export class PassthroughPhoto {
         note.edge++;
         continue;
       }
-      if (touchesHands(entry, inner, count)) {
+      if (this.handsOn(entry, inner, count)) {
         note.hand++;
         continue;
       }
@@ -713,6 +716,19 @@ export class PassthroughPhoto {
       return `photo ${side}: live${this.slots[k].masked ? ' masked' : ''}${behind} | ${bank} | ${health}`;
     }
     return `photo ${side}: none (${this.lastMiss}) | ${bank} | ${health}`;
+  }
+
+  /**
+   * True when `point` lands inside slot `k`'s photo, or the fill lined up behind it, with `margin` to
+   * spare: together they can cover more than either frame.
+   */
+  coverContains(k: SlotIndex, point: Vector3, margin: number): boolean {
+    const slot = this.slots[k];
+    if (!slot.has) return false;
+    if (uvMargin(slot.toClip, point.x, point.y, point.z) >= margin) return true;
+    const entry = this.pendingFill[k];
+    const fill = entry ? entry.toClip : slot.fill.has ? slot.fill.toClip : null;
+    return !!fill && uvMargin(fill, point.x, point.y, point.z) >= margin;
   }
 
   /** True when `point` lands inside slot `k`'s photo with `margin` to spare. */
@@ -1075,7 +1091,7 @@ export class PassthroughPhoto {
       const center = footprintMargin(entry.toClip, footprint, 1);
       if (center < 0.02) continue;
       // freeze() left the grab spot's inner ring in `inner`.
-      if (except === null && touchesHands(entry, this.inner, count)) continue;
+      if (except === null && this.handsOn(entry, this.inner, count)) continue;
       const age = now - entry.time;
       const score = center / ((1 + age / 6) * (1 + entry.cam.distanceTo(eye) / BASE_HALF));
       if (score > bestScore) {
@@ -1136,6 +1152,11 @@ export class PassthroughPhoto {
       out[i * 3 + 2] = cz + dz * k;
     }
     return out;
+  }
+
+  /** Whether a frame has a hand on the footprint: on its points, or anywhere over it when it must be wholly clean. */
+  private handsOn(entry: BankEntry, points: Float32Array, count: number): boolean {
+    return this.wholeClean ? touchesHandsArea(entry, points, count) : touchesHands(entry, points, count);
   }
 
   /** True when the head turned less than ~8°/s and moved less than 0.1 m/s between two times. */
@@ -1393,6 +1414,47 @@ function footprintSpread(clip: Matrix4, points: Float32Array, count: number): nu
     far = Math.max(far, 0.5 * Math.hypot(du, dv));
   }
   return far;
+}
+
+/** Samples per side of the grid laid over a footprint's area in the frame, for touchesHandsArea. */
+const AREA_GRID = 9;
+
+/**
+ * True when a hand box or forearm capsule lies anywhere over the footprint in that frame: a grid over
+ * the frame-space bounds of its points, fine enough that a hand between them is still caught.
+ */
+function touchesHandsArea(entry: BankEntry, points: Float32Array, count: number): boolean {
+  const e = entry.toClip.elements;
+  let u0 = Infinity;
+  let v0 = Infinity;
+  let u1 = -Infinity;
+  let v1 = -Infinity;
+  for (let i = 0; i < count; i++) {
+    const x = points[i * 3];
+    const y = points[i * 3 + 1];
+    const z = points[i * 3 + 2];
+    const w = e[3] * x + e[7] * y + e[11] * z + e[15];
+    if (w <= 1e-4) continue;
+    const u = ((e[0] * x + e[4] * y + e[8] * z + e[12]) / w) * 0.5 + 0.5;
+    const v = ((e[1] * x + e[5] * y + e[9] * z + e[13]) / w) * 0.5 + 0.5;
+    u0 = Math.min(u0, u);
+    v0 = Math.min(v0, v);
+    u1 = Math.max(u1, u);
+    v1 = Math.max(v1, v);
+  }
+  if (u0 > u1) return false;
+  u0 = Math.max(0, u0);
+  v0 = Math.max(0, v0);
+  u1 = Math.min(1, u1);
+  v1 = Math.min(1, v1);
+  for (let a = 0; a < AREA_GRID; a++) {
+    const u = u0 + ((u1 - u0) * a) / (AREA_GRID - 1);
+    for (let b = 0; b < AREA_GRID; b++) {
+      const v = v0 + ((v1 - v0) * b) / (AREA_GRID - 1);
+      if (inBoxes(entry.hands, u, v) || inArms(entry.arms, u, v)) return true;
+    }
+  }
+  return false;
 }
 
 /** True when any footprint point lands in a hand box or forearm capsule of that frame. */
