@@ -19,6 +19,7 @@ import {
   WebGLRenderTarget,
   type Camera,
   type IUniform,
+  type Material,
   type Object3D,
   type WebGLRenderer,
 } from '@iwsdk/core';
@@ -45,6 +46,9 @@ const LEVELS = 4;
 const KNEE = 0.12;
 
 export type BloomMode = 'mono' | 'stereo' | 'multiview';
+
+/** Something drawn with one material, and the twin it is drawn with into the glow. */
+export type BloomSwap = readonly [{ material: Material | Material[] }, Material];
 
 interface Level {
   rt: WebGLRenderTarget;
@@ -235,6 +239,8 @@ export class SorangBloom {
   private readonly full = new Vector2();
   /** Visibility of the hidden objects across the source pass, without allocating. */
   private readonly wasVisible: boolean[] = [];
+  /** Materials swapped out for the source pass, without allocating. */
+  private readonly wasMaterial: Array<Material | Material[]> = [];
   private readonly prevClear = new Color();
   private readonly saved = [new Vector4(), new Vector4()];
   private readonly rects = [new Vector4(0, 0, 1, 1), new Vector4()];
@@ -271,9 +277,19 @@ export class SorangBloom {
   /**
    * Draw the glow for this frame. Call after Sorang's uniforms are final and before IWSDK's
    * render. `hide` are drawn in the main pass but not into the glow (the black void).
+   * `swaps` give each piece a twin material for the glow: the glow's targets are linear and the
+   * screen is sRGB, and one material drawn into both would rebuild its program twice a frame.
    * `viewportH` is the uniform the point and tile sizes are measured in.
    */
-  render(root: Object3D, camera: Camera, hide: readonly Object3D[], viewportH: IUniform<number>, strength: number, threshold: number): void {
+  render(
+    root: Object3D,
+    camera: Camera,
+    hide: readonly Object3D[],
+    swaps: readonly BloomSwap[],
+    viewportH: IUniform<number>,
+    strength: number,
+    threshold: number,
+  ): void {
     const renderer = this.renderer;
     const xr = renderer.xr;
     const xrx = xr as unknown as XRExtras;
@@ -312,6 +328,10 @@ export class SorangBloom {
       this.wasVisible[i] = hide[i].visible;
       hide[i].visible = false;
     }
+    for (let i = 0; i < swaps.length; i++) {
+      this.wasMaterial[i] = swaps[i][0].material;
+      swaps[i][0].material = swaps[i][1];
+    }
     renderer.autoClear = false;
     renderer.setClearColor(0x000000, 1);
     renderer.setRenderTarget(src);
@@ -342,6 +362,7 @@ export class SorangBloom {
     }
     viewportH.value = prevH;
     for (let i = 0; i < hide.length; i++) hide[i].visible = this.wasVisible[i];
+    for (let i = 0; i < swaps.length; i++) swaps[i][0].material = this.wasMaterial[i];
 
     // Blur: with XR off, a pass is one fullscreen draw into the whole target.
     xr.enabled = false;

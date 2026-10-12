@@ -33,7 +33,7 @@ import {
   type Painting,
   type PhotoAtlas,
 } from './sorang-assets.js';
-import { SorangBloom } from './sorang-bloom.js';
+import { SorangBloom, type BloomSwap } from './sorang-bloom.js';
 import {
   LINK_PAIRS,
   buildDust,
@@ -81,6 +81,10 @@ const FAN_PULSE = 0.06;
 const EYE_HEIGHT = 1.6;
 /** How quickly the orbits recentre on the viewer, seconds. */
 const ORBIT_FOLLOW = 5;
+/** How fast the music's pull on the pieces dies away while R runs them home, seconds. */
+const FEEL_FADE = 0.2;
+/** Seconds a headset session waits for a select that allows sound before playing silently. */
+const GESTURE_WAIT = 8;
 /** A click on the canvas moves less than this, in CSS pixels. */
 const CLICK_SLOP = 5;
 /** Desktop walk, once the view is clicked: metres per second, and the faster rate while Shift is held. */
@@ -177,12 +181,18 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
   private bloomOn = !BLOOM_OFF;
   /** Objects drawn in the main pass but kept out of the glow. */
   private bloomHidden: Mesh[] = [];
+  /** Each piece with the twin material it is drawn with into the glow. */
+  private bloomSwaps: BloomSwap[] = [];
   /** Where the orbits centre, painting-local: the viewer, followed slowly. */
   private readonly orbitCentre = new Vector3();
   private orbitPlaced = false;
   /** Head distance from the painting's centre, metres. */
   private viewD = 2.5;
   private lastNeedsClick = false;
+  /** Seconds the painting has waited in a headset session for sound to be allowed. */
+  private gestureWait = 0;
+  /** The XR session whose select events can unlock the music. */
+  private session: XRSession | null = null;
   private readonly frozenAt = frozenFromUrl();
   private anchor: Entity | null = null;
   private onFallback = false;
@@ -285,6 +295,12 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     this.bloom = new SorangBloom(this.renderer);
     this.root.add(this.bloom.composite);
     this.bloomHidden = [this.voidMesh];
+    // Same uniforms, so the twins always match; each only ever renders into one kind of target.
+    this.bloomSwaps = [
+      [this.tiles, tileMaterial(this.U)],
+      [this.dust, dustMaterial(this.U)],
+      [this.links, linkMaterial(this.U)],
+    ];
     this.music = new SorangMusic(MUSIC_URL, MUSIC_OFF);
     this.music.onFail = (stage) => {
       this.message(stage === 'context' ? 'This browser won’t play the music. Sorang plays on in silence.' : 'Couldn’t load the music. Sorang plays on in silence.');
@@ -299,6 +315,8 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     window.addEventListener('keydown', this.onKeyDown);
     window.addEventListener('keyup', this.onKeyUp);
     window.addEventListener('blur', this.onBlur);
+    this.renderer.xr.addEventListener('sessionstart', this.onSessionStart);
+    this.renderer.xr.addEventListener('sessionend', this.dropSession);
     this.installHook();
 
     this.cleanupFuncs.push(
@@ -312,6 +330,9 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
         window.removeEventListener('keydown', this.onKeyDown);
         window.removeEventListener('keyup', this.onKeyUp);
         window.removeEventListener('blur', this.onBlur);
+        this.renderer.xr.removeEventListener('sessionstart', this.onSessionStart);
+        this.renderer.xr.removeEventListener('sessionend', this.dropSession);
+        this.dropSession();
         if (document.pointerLockElement === canvas) document.exitPointerLock();
         const w = window as unknown as { __sorang?: SorangHook };
         delete w.__sorang;
@@ -429,6 +450,7 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     const song = this.music.tick(dt);
     if (this.timeline.phase === 'playing' && this.music.ended) this.timeline.finish();
     const ready = this.gate.painting && this.gate.depth && this.gate.atlas && this.built;
+    this.waitForGesture(dt, ready);
     if (this.timeline.waiting && ready && this.music.ready) {
       this.timeline.start();
       this.music.play(0);
@@ -436,8 +458,14 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     }
     this.timeline.update(dt, song, reduced ? 0.2 : 1, this.clocks);
     const frozen = this.timeline.frozen;
-    if (frozen !== null || this.timeline.phase === 'playing') feelAt(this.cues, frozen ?? this.timeline.song, this.feel);
-    else feelAt(null, -1, this.feel);
+    if (frozen !== null || this.timeline.phase === 'playing') {
+      feelAt(this.cues, frozen ?? this.timeline.song, this.feel);
+    } else if (this.timeline.phase === 'rewind') {
+      // Let the spurs and the drop's throw die away as the pieces fly home, not vanish in a frame.
+      if (!this.timeline.paused) this.decayFeel(dt);
+    } else {
+      feelAt(null, -1, this.feel);
+    }
     this.swayClock += dt;
     this.placeView(dt, reduced);
     this.syncUniforms(reduced);
@@ -491,9 +519,62 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
 
   /** R, or a click once the song has ended: run the pieces home, then the song starts again. */
   private rewind(): void {
+    // A frozen timeline ignores input; stopping the music under it would strand the song.
+    if (this.timeline.frozen !== null) return;
     this.timeline.rewind();
     this.music.stop();
   }
+
+  private decayFeel(dt: number): void {
+    const f = this.feel;
+    const k = Math.exp(-dt / FEEL_FADE);
+    f.kick *= k;
+    f.hit *= k;
+    f.bass *= k;
+    f.high *= k;
+    f.energy *= k;
+    f.shock *= k;
+  }
+
+  /**
+   * A headset session can begin from the browser's own button with no click on the page, and the
+   * browser then won't start sound. A select in the session unlocks it; if none comes, play on
+   * the silent clock rather than hold the painting forever.
+   */
+  private waitForGesture(dt: number, ready: boolean): void {
+    // Counted only once everything else is ready, so a slow load never spends the wait.
+    if (!ready || !this.renderer.xr.isPresenting || !this.timeline.waiting || !this.music.needsGesture) {
+      this.gestureWait = 0;
+      return;
+    }
+    this.gestureWait += dt;
+    if (this.gestureWait < GESTURE_WAIT) return;
+    this.gestureWait = 0;
+    this.music.goSilent('was never allowed to start in the headset');
+    this.message('The headset didn’t allow sound, so Sorang plays in silence. Pinch or pull a trigger, or use Enter VR on the page, to hear it next time.');
+  }
+
+  private readonly onXRSelect = (): void => {
+    if (getMode() === 'sorang') this.music.unlock();
+  };
+
+  private readonly onSessionStart = (): void => {
+    const session = this.renderer.xr.getSession();
+    if (!session || session === this.session) return;
+    this.dropSession();
+    this.session = session;
+    // XR select and squeeze count as user activation, so they can start the music.
+    session.addEventListener('select', this.onXRSelect);
+    session.addEventListener('squeeze', this.onXRSelect);
+  };
+
+  private readonly dropSession = (): void => {
+    const session = this.session;
+    this.session = null;
+    if (!session) return;
+    session.removeEventListener('select', this.onXRSelect);
+    session.removeEventListener('squeeze', this.onXRSelect);
+  };
 
   private togglePause(): void {
     this.timeline.togglePause();
@@ -852,7 +933,7 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     const burst = this.clocks.burst;
     const flying = burst * burst * (3 - 2 * burst);
     const strength = this.look.bloom * (0.3 + 0.7 * flying) * (0.75 + 0.35 * f.bass + 0.7 * f.kick + 1.2 * f.shock);
-    this.bloom.render(this.root, this.camera, this.bloomHidden, this.U.uViewportH, strength, this.look.bloomThreshold);
+    this.bloom.render(this.root, this.camera, this.bloomHidden, this.bloomSwaps, this.U.uViewportH, strength, this.look.bloomThreshold);
   }
 
   // ---------------------------------------------------------------- input
@@ -899,6 +980,8 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
   };
 
   private readonly onPointerUp = (e: PointerEvent): void => {
+    // For touch the browser grants the gesture on pointerup, not pointerdown.
+    if (getMode() === 'sorang') this.music.unlock();
     if (this.lookGrab) {
       this.lookGrab = false;
       return;
@@ -934,6 +1017,8 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     const right = pads.right;
     const select = (left?.getButtonDown(InputComponent.Trigger) ?? false) || (right?.getButtonDown(InputComponent.Trigger) ?? false);
     const restart = (left?.getButtonDown(InputComponent.X_Button) ?? false) || (right?.getButtonDown(InputComponent.A_Button) ?? false);
+    // Polling isn't a gesture, but where the browser has already granted one this resumes the music.
+    if (select || restart) this.music.unlock();
     if (restart || (select && this.timeline.phase === 'ended')) this.rewindWanted = true;
   }
 
@@ -1191,6 +1276,7 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     this.pendingAtlas?.texture.dispose();
     this.blank.dispose();
     this.bloom.dispose();
+    for (const [, twin] of this.bloomSwaps) twin.dispose();
     this.music.dispose();
   }
 }
