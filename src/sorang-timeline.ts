@@ -1,10 +1,11 @@
 /**
  * Sorang's clock. One timeline value `T` drives every stage, so any moment can be rendered
- * directly, and running T backwards replays the picture in reverse. The song drives T through
- * `SONG_MAP` in `sorang-song.ts`; before it starts, a short pre-roll fades the painting in.
+ * directly, and running T backwards replays the picture in reverse (R). The song drives T
+ * forward through `SONG_MAP` in `sorang-song.ts`; before it starts, a short pre-roll fades the
+ * painting in, and as the song dies away everything fades out with it.
  * No three.js here: the system turns these plain numbers into uniforms.
  */
-import { ORBIT_FROM, songDirection, songT } from './sorang-song.js';
+import { ORBIT_FROM, fadeOutAt, songT } from './sorang-song.js';
 
 /**
  * Stage windows in T units. Each stage ramps a 0..1 clock across its window; the shader
@@ -35,7 +36,7 @@ const REWIND_RATE = 12;
 
 export type SorangStage = 'fade' | 'hold' | 'rest' | 'relief' | 'fan' | 'burst' | 'drift' | 'orbit' | 'reform';
 
-/** `preroll` fades in and holds, `playing` follows the song, `rewind` runs home for a restart, `ended` rests. */
+/** `preroll` fades in and holds, `playing` follows the song, `rewind` runs home for a restart, `ended` rests in the dark. */
 export type SorangPhase = 'preroll' | 'playing' | 'rewind' | 'ended';
 
 export interface SorangClocks {
@@ -102,11 +103,19 @@ export class SorangTimeline {
     this.paused = false;
   }
 
-  /** Run the pieces home, then start the song again from the top. Ignored before anything has moved. */
+  /**
+   * Run the pieces home, then start the song again from the top. Ignored before anything has
+   * moved. After the song has faded out there is nothing to see fly home, so it fades the painting
+   * back in from black instead.
+   */
   rewind(): void {
     if (this.frozen !== null) return;
     this.paused = false;
     if (this.phase === 'preroll') return;
+    if (this.phase === 'ended') {
+      this.restart();
+      return;
+    }
     // The orbit clock keeps its song time through the rewind, so orbiting pieces don't jump.
     this.phase = this.T > HOLD_AT ? 'rewind' : 'preroll';
     if (this.phase === 'preroll') this.song = 0;
@@ -115,6 +124,13 @@ export class SorangTimeline {
   /** The T on screen: the frozen moment's, or the running one. */
   get shownT(): number {
     return this.frozen !== null ? songT(this.frozen) : this.T;
+  }
+
+  /** 0..1: how far everything has faded out with the end of the song. */
+  get fade(): number {
+    if (this.frozen !== null) return fadeOutAt(this.frozen);
+    if (this.phase === 'ended') return 1;
+    return this.phase === 'playing' ? fadeOutAt(this.song) : 0;
   }
 
   /** The pre-roll has reached the clean painting and waits for the song. */
@@ -130,11 +146,10 @@ export class SorangTimeline {
     this.T = songT(0);
   }
 
-  /** The song has finished: rest on the painting until asked again. */
+  /** The song has finished and everything has faded out: rest in the dark until asked again. */
   finish(): void {
     if (this.phase !== 'playing') return;
     this.phase = 'ended';
-    this.T = HOLD_AT;
   }
 
   togglePause(): void {
@@ -179,9 +194,7 @@ export class SorangTimeline {
       if (this.phase === 'rewind') return 'reform';
       if (this.phase === 'preroll') return this.T < SCHEDULE.show[1] ? 'fade' : 'hold';
     }
-    const s = this.frozen ?? this.song;
-    if (songDirection(s) < 0) return 'reform';
-    const t = this.frozen !== null ? songT(s) : this.T;
+    const t = this.frozen !== null ? songT(this.frozen) : this.T;
     if (t <= HOLD_AT) return 'hold';
     if (t < SCHEDULE.fan[0]) return 'relief';
     if (t < SCHEDULE.burst[0]) return 'fan';

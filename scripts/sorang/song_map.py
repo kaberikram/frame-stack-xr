@@ -1,11 +1,8 @@
-# Bakes Sorang's music cues: smoothed bass/high/energy envelopes at 50 fps plus kick and hit onsets.
-# The runtime samples these at the song's playback time, so the visuals land on the music deterministically.
-# Usage: python3 -I scripts/sorang/bake_music.py public/sorang/music.mp3 public/sorang/music-cues.json
+# Prints a song's map for timing Sorang to it: loudness, bass and highs per 4 s, and the strongest
+# low-end onsets (where the drops are). Read it to re-time SONG_MAP in src/sorang-song.ts.
+# Usage: python3 -I scripts/sorang/song_map.py public/sorang/music.mp3
 import argparse
-import base64
-import json
 import subprocess
-import sys
 
 import numpy as np
 
@@ -22,10 +19,6 @@ HIT_GAP = 0.1
 # A peak must clear the local median by this many local MADs to count as an onset.
 KICK_K = 2.5
 HIT_K = 3.0
-
-
-def log(msg):
-    print(msg, file=sys.stderr, flush=True)
 
 
 def decode(path):
@@ -105,15 +98,10 @@ def onsets(flux, gap, k):
     return [[round(float(t), 3), round(float(min(1.0, v / scale)), 2)] for t, v in zip(times, s)]
 
 
-def pack(v):
-    return base64.b64encode(np.round(np.clip(v, 0, 1) * 255).astype(np.uint8).tobytes()).decode('ascii')
-
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('audio')
-    parser.add_argument('out')
-    parser.add_argument('--source', default='sorang/music.mp3', help='The audio path the cues describe, relative to public/.')
+    parser.add_argument('--drops', type=int, default=6, help='How many of the strongest low-end onsets to list.')
     args = parser.parse_args()
 
     x = decode(args.audio)
@@ -136,28 +124,13 @@ def main():
     kicks = onsets(low_flux, KICK_GAP, KICK_K)
     hits = onsets(full_flux, HIT_GAP, HIT_K)
 
-    cues = {
-        'version': 1,
-        'source': args.source,
-        'duration': round(duration, 3),
-        'fps': FPS,
-        'bass': pack(env['bass']),
-        'high': pack(env['high']),
-        'energy': pack(env['energy']),
-        'kicks': kicks,
-        'hits': hits,
-    }
-    with open(args.out, 'w') as f:
-        json.dump(cues, f, separators=(',', ':'))
-        f.write('\n')
-
-    log(f'{args.audio}: {duration:.2f} s, {len(kicks)} kicks, {len(hits)} hits -> {args.out}')
-    # A coarse map for re-authoring SONG_MAP in src/sorang-song.ts if the track changes.
+    print(f'{args.audio}: {duration:.2f} s, {len(kicks)} low onsets, {len(hits)} hits')
+    print('strongest low onsets (drop candidates):', ', '.join(f'{t:.2f}s' for t, _ in sorted(kicks, key=lambda k: -k[1])[: args.drops]))
     for start in range(0, int(duration), 4):
         sl = slice(start * FPS, (start + 4) * FPS)
         e, b, h = env['energy'][sl].mean(), env['bass'][sl].mean(), env['high'][sl].mean()
         k = sum(1 for t, s in kicks if start <= t < start + 4 and s > 0.4)
-        log(f'{start:4d}s energy {e:.2f} bass {b:.2f} high {h:.2f} strong kicks {k:2d} ' + '#' * int(e * 40))
+        print(f'{start:4d}s energy {e:.2f} bass {b:.2f} high {h:.2f} strong kicks {k:2d} ' + '#' * int(e * 40))
 
 
 if __name__ == '__main__':

@@ -52,14 +52,6 @@ export function createSorangUniforms(photos: Texture) {
     uDustSize: { value: 0.0035 },
     uFogStart: { value: 2.5 },
     uFog: { value: 0.25 },
-    /** The music, 0..1: decays from each kick and each drop; and the high band. */
-    uKick: { value: 0 },
-    uHigh: { value: 0 },
-    uShock: { value: 0 },
-    /** How far a full kick throws a flying piece outward, metres. */
-    uSpur: { value: 0.12 },
-    /** How far a drop throws them, metres. */
-    uShockReach: { value: 1.2 },
   };
 }
 export type SorangUniforms = ReturnType<typeof createSorangUniforms>;
@@ -95,11 +87,6 @@ const COMMON = /* glsl */ `
   uniform float uViewportH;
   uniform float uFogStart;
   uniform float uFog;
-  uniform float uKick;
-  uniform float uHigh;
-  uniform float uShock;
-  uniform float uSpur;
-  uniform float uShockReach;
 
   uint pcg(uint v) {
     uint state = v * 747796405u + 2891336453u;
@@ -159,7 +146,6 @@ const COMMON = /* glsl */ `
 
   // Burst along rays from a point behind the centre (radial on screen), near sheets first,
   // then ease into a closed-form orbit around the viewer. Reform is the same curve backwards.
-  // Once flying, each kick spurs the pieces outward and each drop throws them further.
   vec3 particle(vec3 F, float sN, uint id, float hero, out float b, out float w) {
     vec3 dir = normalize(F + vec3(0.0, 0.0, uFocusBack));
     float reach = uReach * (0.35 + 0.65 * rnd(id, 2u)) * (0.6 + 0.4 * sN);
@@ -168,18 +154,9 @@ const COMMON = /* glsl */ `
     vec3 sc = rndDir(id, 3u) * 0.12 * reach;
     vec3 B = F + dir * reach * b + sc * b * b;
     w = smoothstep(0.0, 1.0, window01(uDrift, 0.4 * rnd(id, 6u), 0.6));
-    vec3 P = B;
-    vec3 radial = dir;
     // Not even computed before the drift: a NaN from the orbit maths times zero is still NaN.
-    if (w > 0.0) {
-      P = mix(B, orbit(F, dir, reach, sc, id, hero, w), w);
-      vec3 out_ = P - uOrbitL;
-      float len = length(out_);
-      vec3 m = len > 1e-4 ? mix(dir, out_ / len, w) : dir;
-      if (dot(m, m) > 1e-6) radial = normalize(m);
-    }
-    float spur = uKick * uSpur * (0.4 + 0.6 * rnd(id, 21u)) + uShock * uShockReach * (0.3 + 0.7 * rnd(id, 22u));
-    return P + radial * spur * max(b, w);
+    if (w <= 0.0) return B;
+    return mix(B, orbit(F, dir, reach, sc, id, hero, w), w);
   }
 
   float pxPerMetre(vec3 p) {
@@ -265,8 +242,6 @@ export function tileMaterial(u: SorangUniforms): ShaderMaterial {
         float reveal = uPhotoOn * clamp((aTile.z - uScan + 4.0 * rnd(id, 16u)) / 6.0, 0.0, 1.0);
         float sheetShade = mix(1.0, mix(0.72, 1.0, sN), uFan * (1.0 - b));
         float gain = uShow * mix(1.0, uDim, w) * sheetShade * fogAt(P) * energy * energy;
-        // Flying pieces flash on the kick, the big ones most.
-        gain *= 1.0 + (0.25 + 0.6 * aInfo.z) * uKick * max(b, w);
         float scanD = (aTile.z - uScan) / 2.5; // squared by hand: pow() of a negative base is undefined
         float glow = uScanGain * exp(-scanD * scanD) * (1.0 - b);
         vLook = vec3(reveal, gain, glow * gain);
@@ -335,9 +310,6 @@ export function dustMaterial(u: SorangUniforms): ShaderMaterial {
         float vis = smoothstep(0.02, 0.12, uRelief) * uShow;
         vUv = position.xy;
         vGain = vis * min(1.0, px * px) * fogAt(P) * mix(1.0, uDim, w);
-        // A few dust points glint on the hats, and the cloud brightens on the kick.
-        float glint = rnd(id, 19u);
-        vGain *= 1.0 + 1.6 * uHigh * glint * glint * glint * glint + 0.5 * uKick * max(b, w);
         gl_Position = projectionMatrix * modelViewMatrix * vec4(P, 1.0);
         if (vis <= 0.0) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
         gl_PointSize = clamp(px, 1.0, uMaxPoint);
