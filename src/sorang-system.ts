@@ -27,7 +27,6 @@ import {
   MUSIC_URL,
   PAINTING_DEPTH,
   decodeImageFile,
-  loadMusicCues,
   loadPainting,
   loadPhotoAtlas,
   type Painting,
@@ -51,7 +50,6 @@ import {
 import { SorangLook } from './sorang-component.js';
 import { blankPhotos, createSorangUniforms, dustMaterial, linkMaterial, tileMaterial, voidMaterial, type SorangUniforms } from './sorang-materials.js';
 import { SorangMusic } from './sorang-music.js';
-import { createFeel, feelAt, type MusicCues, type SongFeel } from './sorang-song.js';
 import { HOLD_AT, SLICES, SorangTimeline, createClocks, type SorangPhase, type SorangStage } from './sorang-timeline.js';
 
 const LOOK_KEYS = ['size', 'tiles', 'dust', 'relief', 'radial', 'fan', 'mosaic', 'parallax', 'bloom', 'bloomThreshold', 'volume'] as const;
@@ -71,18 +69,10 @@ const GATE_TIMEOUT_MS = 8000;
 const REF_SIZE = 1.83;
 /** Burst reach at REF_SIZE, metres. */
 const REACH = 2.2;
-/** How far a full kick spurs a flying piece outward, and a drop throws it, at REF_SIZE, metres. */
-const SPUR = 0.12;
-const SHOCK_REACH = 1.1;
-/** How much the relief swells on a hit, and the fan on a kick, before the burst. */
-const RELIEF_PULSE = 0.12;
-const FAN_PULSE = 0.06;
 /** The scripted desktop eye stands at this height, metres: a person looking up at the painting. */
 const EYE_HEIGHT = 1.6;
 /** How quickly the orbits recentre on the viewer, seconds. */
 const ORBIT_FOLLOW = 5;
-/** How fast the music's pull on the pieces dies away while R runs them home, seconds. */
-const FEEL_FADE = 0.2;
 /** Seconds a headset session waits for a select that allows sound before playing silently. */
 const GESTURE_WAIT = 8;
 /** A click on the canvas moves less than this, in CSS pixels. */
@@ -132,7 +122,6 @@ export interface SorangHook {
   setPhotos(on: boolean): void;
   setView(on: boolean): void;
   setBloom(on: boolean): void;
-  feel(): SongFeel;
   paintingRect(): { x0: number; y0: number; x1: number; y1: number } | null;
   stats(): Record<string, number | string>;
 }
@@ -169,14 +158,11 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     fan: 0.33,
     mosaic: 0.9,
     parallax: 0.15,
-    bloom: 1.2,
+    bloom: 1.4,
     bloomThreshold: 0.3,
     volume: 0.9,
   };
   private music!: SorangMusic;
-  private cues: MusicCues | null = null;
-  private cuesStarted = false;
-  private readonly feel = createFeel();
   private bloom!: SorangBloom;
   private bloomOn = !BLOOM_OFF;
   /** Objects drawn in the main pass but kept out of the glow. */
@@ -458,14 +444,6 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     }
     this.timeline.update(dt, song, reduced ? 0.2 : 1, this.clocks);
     const frozen = this.timeline.frozen;
-    if (frozen !== null || this.timeline.phase === 'playing') {
-      feelAt(this.cues, frozen ?? this.timeline.song, this.feel);
-    } else if (this.timeline.phase === 'rewind') {
-      // Let the spurs and the drop's throw die away as the pieces fly home, not vanish in a frame.
-      if (!this.timeline.paused) this.decayFeel(dt);
-    } else {
-      feelAt(null, -1, this.feel);
-    }
     this.swayClock += dt;
     this.placeView(dt, reduced);
     this.syncUniforms(reduced);
@@ -525,17 +503,6 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     this.music.stop();
   }
 
-  private decayFeel(dt: number): void {
-    const f = this.feel;
-    const k = Math.exp(-dt / FEEL_FADE);
-    f.kick *= k;
-    f.hit *= k;
-    f.bass *= k;
-    f.high *= k;
-    f.energy *= k;
-    f.shock *= k;
-  }
-
   /**
    * A headset session can begin from the browser's own button with no click on the page, and the
    * browser then won't start sound. A select in the session unlocks it; if none comes, play on
@@ -587,20 +554,6 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
 
   private startMusic(): void {
     this.music.prefetch();
-    if (this.cuesStarted) return;
-    this.cuesStarted = true;
-    loadMusicCues().then(
-      (cues) => {
-        this.cues = cues;
-        // The song's own length once decoded; until then, the cues know it.
-        if (this.music.isSilent || !this.music.ready) this.music.duration = cues.duration;
-        console.info(`[sorang] music cues ${cues.duration.toFixed(1)} s, ${cues.kickT.length} kicks, ${cues.hitT.length} hits`);
-      },
-      (err: unknown) => {
-        // Without cues the choreography still follows the song; only the beat pulses are lost.
-        console.warn('[sorang] music cues unavailable', err);
-      },
-    );
   }
 
   private startDefault(): void {
@@ -880,20 +833,17 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
   private syncUniforms(reduced: boolean): void {
     const U = this.U;
     const c = this.clocks;
-    const f = this.feel;
     const size = this.look.size;
     const k = size / REF_SIZE;
-    // Before the burst the music swells the relief on its hits and breathes the fan on its kicks.
-    const still = 1 - c.burst;
-    U.uShow.value = c.show;
-    U.uRelief.value = c.relief * this.look.relief * size * (1 + RELIEF_PULSE * f.hit * still);
+    // Everything dims together as the song dies away; at 0 the pieces aren't drawn at all.
+    U.uShow.value = c.show * (1 - this.timeline.fade);
+    U.uRelief.value = c.relief * this.look.relief * size;
     U.uQuant.value = c.quant;
     U.uFan.value = c.fan;
-    U.uSpan.value = Math.min(this.look.fan * size, 0.3 * this.viewD) * (1 + FAN_PULSE * f.kick * still);
+    U.uSpan.value = Math.min(this.look.fan * size, 0.3 * this.viewD);
     // The radial push multiplies a depth in metres; divide it back so the shape keeps its proportions.
     U.uRadial.value = this.look.radial / k;
     U.uScan.value = c.scan;
-    U.uScanGain.value = 0.6 * (1 + 0.8 * f.hit);
     U.uBurst.value = c.burst;
     U.uDrift.value = c.drift;
     U.uDim.value = c.dim;
@@ -903,11 +853,6 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
     U.uShell.value.set(0.5 * k, 2.8 * k);
     U.uShellH.value = 1.2 * k;
     U.uDustSize.value = 0.0035 * k;
-    U.uKick.value = f.kick;
-    U.uHigh.value = f.high;
-    U.uShock.value = f.shock;
-    U.uSpur.value = SPUR * k * (reduced ? 0.3 : 1);
-    U.uShockReach.value = SHOCK_REACH * k * (reduced ? 0.3 : 1);
     U.uContrast.value = this.look.mosaic;
     U.uPhotoOn.value = this.atlas && this.photosOn ? 1 : 0;
     if (this.renderer.xr.isPresenting) {
@@ -928,11 +873,11 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
       this.bloom.hide();
       return;
     }
-    const f = this.feel;
     // The glow belongs to the pieces in flight: on the whole painting it would wash out the photos.
+    // It follows the burst and the fade only, never the beat.
     const burst = this.clocks.burst;
     const flying = burst * burst * (3 - 2 * burst);
-    const strength = this.look.bloom * (0.3 + 0.7 * flying) * (0.75 + 0.35 * f.bass + 0.7 * f.kick + 1.2 * f.shock);
+    const strength = this.look.bloom * (0.3 + 0.7 * flying) * (1 - this.timeline.fade);
     this.bloom.render(this.root, this.camera, this.bloomHidden, this.bloomSwaps, this.U.uViewportH, strength, this.look.bloomThreshold);
   }
 
@@ -1199,7 +1144,6 @@ export class SorangSystem extends createSystem({ anchors: { required: [SorangLoo
       setBloom: (on) => {
         this.bloomOn = on;
       },
-      feel: () => ({ ...this.feel }),
       paintingRect: () => this.paintingRect(),
       stats: () => this.stats(),
     };

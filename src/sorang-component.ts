@@ -29,8 +29,8 @@ export const SorangLook = createComponent('SorangLook', {
   mosaic: { type: Types.Float32, default: 0.9, min: 0, max: 2, step: 0.05, label: 'Photo contrast' },
   parallax: { type: Types.Float32, default: 0.15, min: 0, max: 0.5, step: 0.01, label: 'Mouse parallax (m)' },
   bloom: {
-    type: Types.Float32, default: 1.2, min: 0, max: 4, step: 0.05, label: 'Bloom',
-    help: 'Glow strength. The bass, the kicks and the drops push it higher. 0 turns bloom off.',
+    type: Types.Float32, default: 1.4, min: 0, max: 4, step: 0.05, label: 'Bloom',
+    help: 'Glow strength, once the pieces fly. Softer on the whole painting. 0 turns bloom off.',
   },
   bloomThreshold: {
     type: Types.Float32, default: 0.3, min: 0, max: 1, step: 0.01, label: 'Bloom threshold',
