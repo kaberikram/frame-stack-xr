@@ -77,19 +77,30 @@ export class RoomsVideos {
     }
   }
 
-  dispose(): void {
+  /** Let go of every clip and its decoder; the cards show until `load` opens them again. */
+  unload(): void {
     for (const cleanup of this.cleanups) cleanup();
     this.cleanups.length = 0;
+    this.loading = false;
+    this.playing = false;
     for (const slot of this.slots) {
       slot.texture?.dispose();
-      slot.card.dispose();
+      slot.texture = null;
+      slot.live = false;
+      slot.aspect = ASPECT;
       const v = slot.video;
+      slot.video = null;
       if (v) {
         v.pause();
         v.removeAttribute('src');
         v.load();
       }
     }
+  }
+
+  dispose(): void {
+    this.unload();
+    for (const slot of this.slots) slot.card.dispose();
   }
 
   // ----------------------------------------------------------------

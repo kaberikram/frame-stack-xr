@@ -15,11 +15,12 @@ World.create(document.getElementById('scene-container') as HTMLDivElement, proje
   world
     // Registered first so the others can reach it; priority 1 runs it after touch input each frame.
     .registerSystem(FrameStackSystem, { priority: 1 })
+    // Before the other modes, so leaving Rooms puts the camera's lens back before they read it.
+    .registerSystem(RoomsSystem)
     .registerSystem(TableTouchSystem)
     .registerSystem(RoomStretchSystem)
-    // Before the launcher, which reaches them in init.
+    // Before the launcher, which reaches it and Rooms in init.
     .registerSystem(SorangSystem)
-    .registerSystem(RoomsSystem)
     .registerSystem(LauncherSystem)
     // Runs last, so a line logged this frame is drawn this frame.
     .registerSystem(DebugConsoleSystem, { priority: 2 });

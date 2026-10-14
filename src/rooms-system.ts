@@ -172,7 +172,8 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
   private anchor: Entity | null = null;
   private fallback: Entity | null = null;
   private onFallback = false;
-  private savedFov: number | null = null;
+  /** The camera's own lens, put back when Rooms lets go of it. */
+  private savedLens: { fov: number; far: number } | null = null;
   private lastShot = -1;
   private lastNeedsClick = false;
 
@@ -317,7 +318,8 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
   // ---------------------------------------------------------------- frame loop
 
   update(delta: number): void {
-    const on = getMode() === 'rooms';
+    // Desktop only: a headset session (the browser can offer one by itself) stops the piece.
+    const on = getMode() === 'rooms' && !this.renderer.xr.isPresenting;
     this.root.visible = on;
     if (!on) {
       if (this.active) this.leave();
@@ -372,7 +374,7 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
       this.fallback.object3D?.position.copy(FALLBACK_POS);
       this.onFallback = true;
     }
-    this.savedFov = this.camera.fov;
+    this.savedLens = { fov: this.camera.fov, far: this.camera.far };
     this.music.prefetch();
     this.videos.load();
     this.toPreroll(true);
@@ -383,15 +385,23 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
   private leave(): void {
     this.active = false;
     this.music.stop();
-    this.videos.pause();
+    // Release the decoders too: the other modes (and a headset's 2D page) need them more.
+    this.videos.unload();
+    for (const rig of this.boxes) this.useClip(rig);
     this.bloom.hide();
     this.toPreroll(true);
     this.downId = -1;
-    if (this.savedFov !== null) {
-      this.camera.fov = this.savedFov;
-      this.camera.updateProjectionMatrix();
-      this.savedFov = null;
-    }
+    this.releaseCamera();
+  }
+
+  /** The lens back as it was. Safe to call twice. */
+  private releaseCamera(): void {
+    const lens = this.savedLens;
+    if (!lens) return;
+    this.savedLens = null;
+    this.camera.fov = lens.fov;
+    this.camera.far = lens.far;
+    this.camera.updateProjectionMatrix();
   }
 
   /** Back to the empty frame, waiting for the song. `fromBlack` fades the frame in again. */
@@ -477,8 +487,11 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     }
     cam.position.copy(this.tmp);
     cam.lookAt(this.targetW);
-    if (cam.fov !== pose.fov) {
+    // Far enough for the outro's long pull, however tall the window.
+    const far = Math.max(this.savedLens?.far ?? cam.far, pose.dist + 30);
+    if (cam.fov !== pose.fov || cam.far !== far) {
       cam.fov = pose.fov;
+      cam.far = far;
       cam.updateProjectionMatrix();
     }
     cam.updateMatrixWorld();
@@ -694,6 +707,11 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
         if (this.phase !== 'playing') this.begin();
         this.music.play(s);
         this.song = Math.max(0, s);
+        // Playing from there, so it no longer counts as paused.
+        if (this.paused) {
+          this.paused = false;
+          this.videos.play();
+        }
       },
       freeze: (s) => {
         this.frozen = s === null ? null : Math.max(0, s);
@@ -726,6 +744,7 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
       music: this.music.isSilent ? 'silent' : this.music.isPlaying ? 'playing' : this.music.needsGesture ? 'locked' : 'idle',
       clips: `${this.videos.liveCount}/${BOXES.length}`,
       fov: this.camera.fov,
+      far: this.camera.far,
       calls: info.render.calls,
       triangles: info.render.triangles,
       points: info.render.points,
@@ -738,6 +757,7 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
   }
 
   private dispose(): void {
+    this.releaseCamera();
     this.root.removeFromParent();
     this.root.traverse((object) => {
       const mesh = object as Mesh;

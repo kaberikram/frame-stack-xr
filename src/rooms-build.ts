@@ -242,7 +242,8 @@ export function glassMaterial(u: BoxUniforms): ShaderMaterial {
       varying vec3 vView;
       void main() {
         float ndv = abs(dot(normalize(vWorldN), normalize(vView)));
-        float fres = pow(1.0 - ndv, 3.0);
+        float graze = max(1.0 - ndv, 0.0);
+        float fres = graze * graze * graze;
         vec3 q = vLocal / uSize + 0.5;
         float top = smoothstep(0.1, 1.0, q.y);
         float mist = fbm(vec3(vLocal.xy * 2.2, vLocal.z * 2.2 + uSong * 0.08));
@@ -359,9 +360,12 @@ export function frameMaterial(U: RoomsUniforms): ShaderMaterial {
       void main() {
         float g = vW * (0.5 + 0.2 * uEnergy);
         // A band of light climbing the walls through each bar.
-        float band = exp(-pow((vP.y - uScan.x) / 0.35, 2.0)) * step(0.01, vP.y);
+        // Squared by hand: pow() of a negative base is undefined.
+        float db = (vP.y - uScan.x) / 0.35;
+        float band = exp(-db * db) * step(0.01, vP.y);
         // A ring running out across the floor from the centre on the beat.
-        float ring = exp(-pow((length(vP.xz) - uBeatAge * 9.0) / 0.45, 2.0)) * step(vP.y, 0.01) * step(-0.01, vP.y);
+        float dr = (length(vP.xz) - uBeatAge * 9.0) / 0.45;
+        float ring = exp(-dr * dr) * step(vP.y, 0.01) * step(-0.01, vP.y);
         g += uScan.y * band * 0.9 + uRing * ring * 0.8;
         g *= 1.0 + 0.8 * uFlash;
         gl_FragColor = vec4(vec3(0.86, 0.89, 1.0) * g * uFrameShow, 1.0);
@@ -435,7 +439,7 @@ export function dustMaterial(U: RoomsUniforms): ShaderMaterial {
           float c = cos(uBoxYaw[b]);
           float sn = sin(uBoxYaw[b]);
           P = uBoxPos[b] + vec3(q.x * c + q.z * sn, q.y, -q.x * sn + q.z * c);
-          float tw = pow(0.5 + 0.5 * sin(uSong * mix(1.5, 4.0, rnd(id, 24u)) + rnd(id, 25u) * 40.0), 6.0);
+          float tw = pow(max(0.5 + 0.5 * sin(uSong * mix(1.5, 4.0, rnd(id, 24u)) + rnd(id, 25u) * 40.0), 0.0), 6.0);
           gain = uBoxBright[b] * (0.15 + 0.85 * tw) * step(rnd(id, 26u), uDustAmount) * 0.8;
           size = mix(0.008, 0.02, rnd(id, 27u));
           vTint = vec3(1.0);
