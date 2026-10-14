@@ -1,7 +1,7 @@
 /**
- * Sorang's soundtrack: one decoded song on its own AudioContext, and a clock that says which
- * second of it you are hearing now. Without audio (blocked, failed, or `?music=0`) a silent
- * clock runs in its place, so the piece still plays in time.
+ * A piece's soundtrack (Sorang's, and Rooms'): one decoded song on its own AudioContext, and a
+ * clock that says which second of it you are hearing now. Without audio (blocked, failed, or
+ * `?music=0`) a silent clock runs in its place, so the piece still plays in time.
  */
 
 /** Seconds the first sample is scheduled ahead, so playback starts on a known context time. */
@@ -52,6 +52,8 @@ export class SorangMusic {
   constructor(
     private readonly url: string,
     forceSilent: boolean,
+    /** Prefix for its console lines, so each piece's music reads as its own. */
+    private readonly tag = 'sorang',
   ) {
     this.silent = forceSilent;
   }
@@ -182,7 +184,7 @@ export class SorangMusic {
   /** No gesture came: play on the silent clock until one does. */
   goSilent(why: string): void {
     if (this.silent) return;
-    console.warn(`[sorang] music ${why}; playing on a silent clock`);
+    console.warn(`[${this.tag}] music ${why}; playing on a silent clock`);
     this.silent = true;
     this.silentForGesture = true;
     this.stopSource(false);
@@ -257,7 +259,7 @@ export class SorangMusic {
         if (this.silent) return;
         this.buffer = buffer;
         this.duration = buffer.duration;
-        console.info(`[sorang] music ${buffer.duration.toFixed(1)} s at ${buffer.sampleRate} Hz`);
+        console.info(`[${this.tag}] music ${buffer.duration.toFixed(1)} s at ${buffer.sampleRate} Hz`);
       })
       .catch((err: unknown) => this.fail('decode', err));
   }
@@ -295,7 +297,7 @@ export class SorangMusic {
 
   private fail(stage: string, err: unknown): void {
     if (this.silent) return;
-    console.warn(`[sorang] music ${stage} failed; playing on a silent clock`, err);
+    console.warn(`[${this.tag}] music ${stage} failed; playing on a silent clock`, err);
     this.silent = true;
     this.stopSource(false);
     // A song already under way carries on silently from where it was.

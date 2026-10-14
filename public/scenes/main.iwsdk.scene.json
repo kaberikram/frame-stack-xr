@@ -79,6 +79,29 @@
         "SorangLook": {}
       },
       "children": []
+    },
+    {
+      "id": "rooms",
+      "name": "Rooms",
+      "metadata": {
+        "iwsdk.validation": {
+          "allowFloating": true
+        }
+      },
+      "content": {
+        "type": "group"
+      },
+      "transform": {
+        "position": [
+          0,
+          0,
+          -20
+        ]
+      },
+      "components": {
+        "RoomsLook": {}
+      },
+      "children": []
     }
   ]
 }

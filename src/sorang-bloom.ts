@@ -245,7 +245,11 @@ export class SorangBloom {
   private readonly saved = [new Vector4(), new Vector4()];
   private readonly rects = [new Vector4(0, 0, 1, 1), new Vector4()];
 
-  constructor(private readonly renderer: WebGLRenderer) {
+  constructor(
+    private readonly renderer: WebGLRenderer,
+    /** Names it in the console, so each piece's glow reads as its own. */
+    private readonly label = 'sorang',
+  ) {
     this.compositeMat = compositeMaterial();
     this.composite = new Mesh(this.geometry, this.compositeMat);
     this.composite.name = 'sorang-bloom';
@@ -443,7 +447,7 @@ export class SorangBloom {
       this.renderer.resetState();
     }
     console.info(
-      `[jonze] sorang bloom mode=${mode} ${sizes[0][0]}x${sizes[0][1]}` +
+      `[jonze] ${this.label} bloom mode=${mode} ${sizes[0][0]}x${sizes[0][1]}` +
         `${mode === 'multiview' ? ' per eye' : ''} from ${fullW}x${fullH}, ${LEVELS} levels`,
     );
   }
