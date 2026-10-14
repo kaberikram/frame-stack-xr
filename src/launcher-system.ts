@@ -1,6 +1,6 @@
 import { CameraUtils, Quaternion, SessionMode, Vector3, VisibilityState, createSystem } from '@iwsdk/core';
 import { prepareDepthModel } from './depth-model.js';
-import { PREVIEW_FORCED, getMode, isMode, launchSession, setMode, type ExperienceMode } from './experience.js';
+import { PREVIEW_FORCED, getMode, isMode, isStageMode, launchSession, setMode, type ExperienceMode } from './experience.js';
 import {
   DEFAULT_CLIP_DEPTH,
   DEFAULT_CLIP_NAME,
@@ -15,6 +15,7 @@ import {
 } from './frame-sources.js';
 import { FrameStackSystem } from './frame-stack-system.js';
 import { RoomStretchSystem } from './room-stretch-system.js';
+import { RoomsSystem } from './rooms-system.js';
 import { SorangSystem } from './sorang-system.js';
 import { TableTouchSystem } from './table-touch-system.js';
 
@@ -30,10 +31,12 @@ const SORANG_NO_VR = 'Click the view to start the music and look around. WASD wa
 const SORANG_TIP = 'Click to look around. WASD walks. R starts the song again.';
 const SORANG_CLICK = 'Click to start the music.';
 const SORANG_TIP_MS = 4000;
+const ROOMS_HINT = 'Desktop only. Click the view to start the music.';
+const ROOMS_TIP = 'Space pauses. R starts the song again. ←/→ jump a bar. Esc shows the card.';
 const ENTER_PASSTHROUGH = 'Enter passthrough';
 const ENTER_VR = 'Enter VR';
 
-const TITLES: Record<ExperienceMode, string> = { stack: 'Frame stack', stretch: 'Jonze stretch', sorang: 'Sorang' };
+const TITLES: Record<ExperienceMode, string> = { stack: 'Frame stack', stretch: 'Jonze stretch', sorang: 'Sorang', rooms: 'Rooms' };
 
 /** Wires the 2D launch card in index.html: pick a clip and a sample rate, then enter passthrough. */
 export class LauncherSystem extends createSystem({}) {
@@ -48,7 +51,7 @@ export class LauncherSystem extends createSystem({}) {
   private readonly previewPos = new Vector3();
   private readonly previewQuat = new Quaternion();
   private previewSaved = false;
-  /** Sorang plays behind a collapsed card; the chip or Esc opens it. */
+  /** Sorang and Rooms play behind a collapsed card; the chip or Esc opens it. */
   private cardOpen = true;
   private immersive = false;
   private readonly uiOff = typeof location !== 'undefined' && new URLSearchParams(location.search).get('ui') === '0';
@@ -89,6 +92,11 @@ export class LauncherSystem extends createSystem({}) {
     const imageFile = document.getElementById('imageFile') as HTMLInputElement | null;
     const cardBtn = document.getElementById('cardBtn');
     const tip = document.getElementById('sorangTip');
+    const rooms = this.world.getSystem(RoomsSystem)!;
+    // Optional, like Sorang's.
+    const modeRooms = document.getElementById('modeRooms');
+    const roomsPanel = document.getElementById('roomsPanel');
+    const roomsSource = document.getElementById('roomsSource');
     const version = document.getElementById('stretchVersion');
     if (version) {
       version.textContent =
@@ -105,6 +113,10 @@ export class LauncherSystem extends createSystem({}) {
     let depthReady = false;
     let depthNote = DEPTH_WAIT;
     const syncEnter = () => {
+      if (getMode() === 'rooms') {
+        hint.textContent = ROOMS_HINT;
+        return;
+      }
       if (getMode() === 'sorang') {
         enter.disabled = !vrOk;
         hint.textContent = vrOk || !xrKnown ? SORANG_HINT : SORANG_NO_VR;
@@ -126,13 +138,40 @@ export class LauncherSystem extends createSystem({}) {
       void this.openDefault(stack, rate, source);
     };
     const syncCard = () => {
-      const sorangMode = getMode() === 'sorang';
-      launch.hidden = this.immersive || (sorangMode && (!this.cardOpen || this.uiOff));
-      if (cardBtn) cardBtn.hidden = this.immersive || !sorangMode || this.cardOpen || this.uiOff;
-      if (tip && (!sorangMode || this.uiOff || this.immersive)) tip.hidden = true;
+      const stageMode = isStageMode(getMode());
+      launch.hidden = this.immersive || (stageMode && (!this.cardOpen || this.uiOff));
+      if (cardBtn) cardBtn.hidden = this.immersive || !stageMode || this.cardOpen || this.uiOff;
+      if (tip && (!stageMode || this.uiOff || this.immersive)) tip.hidden = true;
+    };
+    const renderRooms = () => {
+      if (roomsSource) roomsSource.textContent = rooms.status().text;
+      if (!tip || this.uiOff || getMode() !== 'rooms' || this.immersive) return;
+      if (rooms.needsClick) {
+        clearTimeout(this.tipTimer);
+        this.clickTip = true;
+        tip.textContent = SORANG_CLICK;
+        tip.hidden = false;
+        return;
+      }
+      if (this.clickTip) {
+        this.clickTip = false;
+        tip.hidden = true;
+      }
+      if (this.tipShown || rooms.currentPhase !== 'playing') return;
+      this.tipShown = true;
+      tip.textContent = ROOMS_TIP;
+      tip.hidden = false;
+      clearTimeout(this.tipTimer);
+      this.tipTimer = window.setTimeout(() => {
+        tip.hidden = true;
+      }, SORANG_TIP_MS);
     };
     const renderSorang = () => {
       if (sorangSource) sorangSource.textContent = sorang.status().text;
+      if (getMode() === 'rooms') {
+        renderRooms();
+        return;
+      }
       if (!tip || this.uiOff || getMode() !== 'sorang' || this.immersive) return;
       if (sorang.needsClick) {
         // Browsers start sound only after a click or a key; ask for one while the painting waits.
@@ -160,6 +199,7 @@ export class LauncherSystem extends createSystem({}) {
       ['stack', modeStack],
       ['stretch', modeStretch],
       ['sorang', modeSorang],
+      ['rooms', modeRooms],
     ];
     const applyMode = (mode: ExperienceMode) => {
       const was = getMode();
@@ -170,9 +210,12 @@ export class LauncherSystem extends createSystem({}) {
       stackPanel.hidden = mode !== 'stack';
       stretchPanel.hidden = mode !== 'stretch';
       if (sorangPanel) sorangPanel.hidden = mode !== 'sorang';
+      if (roomsPanel) roomsPanel.hidden = mode !== 'rooms';
       load.hidden = mode !== 'stack';
       if (imageBtn) imageBtn.hidden = mode !== 'sorang';
-      if (playBtn) playBtn.hidden = mode !== 'sorang';
+      if (playBtn) playBtn.hidden = !isStageMode(mode);
+      // Rooms is desktop only: there is nothing to enter.
+      enter.hidden = mode === 'rooms';
       enter.textContent = mode === 'sorang' ? ENTER_VR : ENTER_PASSTHROUGH;
       for (const [m, tab] of tabs) tab?.setAttribute('aria-selected', m === mode ? 'true' : 'false');
       this.applyPreview(mode);
@@ -181,9 +224,13 @@ export class LauncherSystem extends createSystem({}) {
         openDefaultOnce();
         requestDepthModel();
       }
-      if (mode === 'sorang') {
-        // The painting plays behind a collapsed card; a second click on the tab doesn't restart it.
-        if (was !== 'sorang') this.tipShown = false;
+      if (isStageMode(mode)) {
+        // The piece plays behind a collapsed card; a second click on the tab doesn't restart it.
+        if (was !== mode) {
+          this.tipShown = false;
+          this.clickTip = false;
+          if (tip) tip.hidden = true;
+        }
         this.cardOpen = false;
       } else {
         this.cardOpen = true;
@@ -258,6 +305,11 @@ export class LauncherSystem extends createSystem({}) {
       sorang.unlockAudio();
       applyMode('sorang');
     };
+    const onRooms = () => {
+      // The tab click is a gesture: the music may start as soon as the frame is up.
+      rooms.unlockAudio();
+      applyMode('rooms');
+    };
     const onImage = () => {
       // Start the model download while the picker is open; a loaded picture needs it.
       prepareDepthModel().catch(() => {});
@@ -274,8 +326,13 @@ export class LauncherSystem extends createSystem({}) {
       void sorang.useImage(f);
     };
     const onPlay = () => {
-      sorang.unlockAudio();
-      sorang.restart();
+      if (getMode() === 'rooms') {
+        rooms.unlockAudio();
+        rooms.restart();
+      } else {
+        sorang.unlockAudio();
+        sorang.restart();
+      }
       this.cardOpen = false;
       syncCard();
     };
@@ -284,7 +341,7 @@ export class LauncherSystem extends createSystem({}) {
       syncCard();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.code !== 'Escape' || e.repeat || getMode() !== 'sorang') return;
+      if (e.code !== 'Escape' || e.repeat || !isStageMode(getMode())) return;
       // The first Esc releases the mouse. The card toggles once the view is free.
       if (document.pointerLockElement) return;
       this.cardOpen = !this.cardOpen;
@@ -297,6 +354,7 @@ export class LauncherSystem extends createSystem({}) {
     modeStack.addEventListener('click', onStack);
     modeStretch.addEventListener('click', onStretch);
     modeSorang?.addEventListener('click', onSorang);
+    modeRooms?.addEventListener('click', onRooms);
     imageBtn?.addEventListener('click', onImage);
     imageFile?.addEventListener('change', onImageFile);
     playBtn?.addEventListener('click', onPlay);
@@ -337,12 +395,13 @@ export class LauncherSystem extends createSystem({}) {
       syncEnter();
     }
 
-    // Sorang doesn't need the clip; slicing it in the background would only cost frames.
-    if (getMode() !== 'sorang') openDefaultOnce();
+    // Sorang and Rooms don't need the clip; slicing it in the background would only cost frames.
+    if (!isStageMode(getMode())) openDefaultOnce();
 
     this.cleanupFuncs.push(
       stack.onChange(render),
       sorang.onChange(renderSorang),
+      rooms.onChange(renderRooms),
       sorang.onMessage((message) => {
         this.toast(message);
         if (getMode() !== 'sorang') return;
@@ -365,6 +424,7 @@ export class LauncherSystem extends createSystem({}) {
         modeStack.removeEventListener('click', onStack);
         modeStretch.removeEventListener('click', onStretch);
         modeSorang?.removeEventListener('click', onSorang);
+        modeRooms?.removeEventListener('click', onRooms);
         imageBtn?.removeEventListener('click', onImage);
         imageFile?.removeEventListener('change', onImageFile);
         playBtn?.removeEventListener('click', onPlay);
@@ -471,7 +531,7 @@ export class LauncherSystem extends createSystem({}) {
       this.previewQuat.copy(cam.quaternion);
       this.previewSaved = true;
     }
-    if (mode === 'sorang') return; // SorangSystem places the camera itself
+    if (isStageMode(mode)) return; // SorangSystem and RoomsSystem place the camera themselves
     if (mode === 'stretch') {
       cam.position.set(0.25, 1.6, 2.5);
       cam.lookAt(0, 1, -1.7);

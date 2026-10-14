@@ -4,6 +4,7 @@ import { DebugConsoleSystem, installDebugConsole } from './debug-console.js';
 import { FrameStackSystem } from './frame-stack-system.js';
 import { LauncherSystem } from './launcher-system.js';
 import { RoomStretchSystem } from './room-stretch-system.js';
+import { RoomsSystem } from './rooms-system.js';
 import { SorangSystem } from './sorang-system.js';
 import { TableTouchSystem } from './table-touch-system.js';
 
@@ -14,9 +15,11 @@ World.create(document.getElementById('scene-container') as HTMLDivElement, proje
   world
     // Registered first so the others can reach it; priority 1 runs it after touch input each frame.
     .registerSystem(FrameStackSystem, { priority: 1 })
+    // Before the other modes, so leaving Rooms puts the camera's lens back before they read it.
+    .registerSystem(RoomsSystem)
     .registerSystem(TableTouchSystem)
     .registerSystem(RoomStretchSystem)
-    // Before the launcher, which reaches it in init.
+    // Before the launcher, which reaches it and Rooms in init.
     .registerSystem(SorangSystem)
     .registerSystem(LauncherSystem)
     // Runs last, so a line logged this frame is drawn this frame.

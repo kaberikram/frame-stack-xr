@@ -1,12 +1,14 @@
-# Frame stack, Jonze stretch and Sorang
+# Frame stack, Jonze stretch, Sorang and Rooms
 
-Two passthrough modes and a desktop preview in one page.
+Two passthrough modes and two pieces played to a song, in one page.
 
 **Frame stack** cuts a video into slices and stacks them along a time axis on a real table, with a filmstrip you scrub by touch.
 
 **Jonze stretch** pinches the scanned room and pulls. The spot under your fingers follows your hand, the surface behind it stretches like taffy with its real texture, and a long pull smears into streaks of the column you grabbed. One hand or both. Let go and it springs back.
 
 **Sorang** hangs a painting four metres tall in the dark and plays it slowly through its song. It takes on depth, splits into 100 slices by depth, turns out to be a mosaic of 100 stock photos, and then bursts on the drop into small glowing pieces that drift around you and fade with the song. On the desktop or in VR.
+
+**Rooms** stacks glass rooms in a grid frame under a vault, each looping its own clip, and films them to a song: the camera flies between the overview and single rooms through the verses and cuts on the beat through the drops. Desktop only.
 
 ## Run
 
@@ -63,6 +65,23 @@ Pick **Sorang** on the 2D page. The card folds down to a **Show card** button an
 
 Assets: `public/sorang/painting.jpg` is the painting, perspective-cropped from a screenshot by `scripts/sorang/crop_painting.py`. Its depth was baked with `node scripts/bake-depth/bake.mjs public/sorang/painting.jpg public/depth/sorang-painting --size 512` (stills skip ffmpeg). `public/sorang/photos.jpg` and `photos.json` are 100 photos from [Lorem Picsum](https://picsum.photos), by Unsplash photographers under the Unsplash License, built by `scripts/sorang/build_atlas.py` with fixed seeds. `photos.json` credits each one. `scripts/sorang/song_map.py public/sorang/music.mp3` prints a song's loudness by section and its strongest low-end onsets (where the drops are), for re-timing `SONG_MAP` in `src/sorang-song.ts` to a different song (needs ffmpeg and numpy).
 
+### Rooms
+
+Pick **Rooms** on the 2D page. The card folds down to a **Show card** button and the piece plays in the window. It's desktop only, so there is no Enter button.
+
+- It opens on the empty frame seen from high above: a grid floor, two grid walls, and a vault arch over them. The song (`public/rooms/music.mp3`, 2:42, 110 BPM) starts once the browser allows sound: the tab click allows it, or else the first click or key (the page says so).
+- Over the two-bar intro the camera cranes down while the nine glass rooms and three smoke cubes appear one per half beat, top first, and a plume of dust rises through the middle.
+- Verse (4–39 s): eased flights between the overview and single rooms, every two bars. Each flight lands on the downbeat. In a room's front view its clip fills most of the screen, the other rooms dim, and any room in the way fades out. The camera pushes slowly into the room while it holds, and the build pushes into the gallery.
+- First drop (39.3 s): a hard cut to the wide view, with the edges and grid flaring and the dust bursting outward. Then a cut every bar, punching into each room, and a cut every beat in the last bars.
+- Break (74–109 s): flights again, with the overview turning slowly around the stack. Second drop (109.1 s): cuts every bar, then every two beats, then every beat. Outro (144 s): one long pull back and up while the rooms go out one a bar, then black.
+- Everything answers the beat grid: edges and dust swell on each kick, a band of light climbs the walls each bar, a ring runs across the floor on each beat, strongest in the drops, and the glow swells on the drops.
+- Keys: Space pauses, R starts the song again, M mutes, ←/→ jump a bar (for checking cues). Moving the mouse leans the overview a little. Esc shows or hides the card. Once the song has ended, a click plays it again.
+- **Clips:** each room plays `public/rooms/videos/NN.mp4` (01–09) on a loop, muted, cover-fitted to its 16:9 back wall. Its floor reflects it and its side walls streak its outer columns. A room without a file shows a numbered test card that names the file it wants. `scripts/rooms/prep_clips.sh` turns your clips into these: it crops to 16:9, scales to 960×540, strips the sound, encodes H.264 with a keyframe every second, and can crossfade the end into the start for a seamless loop (`--loop-fade 0.4`). See `public/rooms/videos/README.md`.
+- **The edit** lives in `SHOTS` in `src/rooms-score.ts`, one cue per line on the bar grid (`cut(26, 3)` cuts to slot 3 at bar 26, and `fly(16, 5, 3)` lands on slot 5 at bar 16 after a three-beat flight). Changing one cue never shifts the others. The sections, energy and dust bursts sit beside it. Where the rooms stand, their sizes, tints and yaw, the smoke cubes and the overview presets (`wide`, `mid`, `high`, `low`, `side`, `orbit`, `rise`, `pull`) are in `src/rooms-layout.ts`.
+- The song's grid was measured with `scripts/sorang/song_map.py`: beat 1 at 0.045 s, with sections every 16 bars. Re-time `SECTIONS` and `SHOTS` from its output to use another song.
+- If the music can't play, the piece runs on a silent clock in the same time. `?music=0` forces that. `?mode=rooms` opens straight into it. `?roomsT=<song seconds>` freezes it at that moment, with every clip held on the frame it would show then. `?ui=0` hides the card, and `?bloom=0` turns the glow off. For example, `?roomsT=6` is the overview, `10` a verse front view, `39.4` the first drop, `64` the side view and `150` the outro. `window.__rooms` has `seek`, `freeze`, `pause`, `play`, `restart`, `setBloom`, `shot`, `section`, `bar` and `stats()` for tests, and the console prints a `[rooms] shot=… bar=…` line at every cut.
+- With reduced motion the camera doesn't shake and leans half as far, and the flares and bursts are smaller.
+
 ## Tuning
 
 - `src/layout.ts`: stack size, strip length, touch and hover heights.
@@ -73,4 +92,5 @@ Assets: `public/sorang/painting.jpg` is the painting, perspective-cropped from a
 - Checking the hand cut: `?debug=1&occ=debug` shows the hand occluders 30% green, where the depth cut may act faint cyan, and what it cuts magenta instead of cutting it. `?debug=1&occ=delta` paints the real depth against the scanned room: white where they agree, red where the real surface is nearer, blue where it is farther, over 8 cm. The console keeps its `depth …`, `xr multiview …`, `camera pick …` and `lens …` lines on screen. `StretchLook` has the occluder lag as a developer trim.
 - Timing a pull: each pull prints two `onset` lines at release, with its first 12 frames: frame times, how long the photo freeze and that frame's update took, how far the surface had moved (cm) and the fade (0-9). A hitch is one long frame; a pop is a jump in D.
 - `MAX_LAYERS` in `src/frame-stack-system.ts`: raise it if the headset holds frame rate.
+- The `RoomsLook` component (the "Rooms" node): glass brightness, dust amount, beat response, how far other rooms dim in a front view, cut flare, mouse parallax, bloom strength and threshold, and music volume. Where the frame stands is the node's position.
 - The `SorangLook` component (the "Sorang painting" node): painting size, tiles across (each one photo), dust, relief depth and slice fan (both shares of the size), radial push, photo contrast, mouse parallax, bloom strength and threshold, and music volume. Where the painting hangs is the node's position. The stage windows are in `src/sorang-timeline.ts`, and which moment of the song plays which stage is `SONG_MAP` in `src/sorang-song.ts`.

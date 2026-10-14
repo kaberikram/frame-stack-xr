@@ -1,6 +1,11 @@
-export type ExperienceMode = 'stack' | 'stretch' | 'sorang';
+export type ExperienceMode = 'stack' | 'stretch' | 'sorang' | 'rooms';
 
-export const MODES: readonly ExperienceMode[] = ['stack', 'stretch', 'sorang'];
+export const MODES: readonly ExperienceMode[] = ['stack', 'stretch', 'sorang', 'rooms'];
+
+/** Modes that play on the desktop behind a collapsed card, with their own camera. */
+export function isStageMode(mode: ExperienceMode): boolean {
+  return mode === 'sorang' || mode === 'rooms';
+}
 
 export function isMode(value: unknown): value is ExperienceMode {
   return typeof value === 'string' && (MODES as readonly string[]).includes(value);
