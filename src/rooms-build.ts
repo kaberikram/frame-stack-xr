@@ -1,5 +1,5 @@
 /**
- * Rooms' geometry and shaders: the grid frame with its vault arch, and for each room the parts
+ * Rooms' geometry and shaders: the grid frame, and for each room the parts
  * of its frame stack that Frame stack's own materials (`stack-materials.ts`) don't cover: the
  * sharp frame (the clip itself, travelling through the stack).
  * Everything that moves is driven by uniforms the system writes from the song clock.
@@ -93,7 +93,7 @@ export function currentFrameMaterial(u: FrameUniforms): ShaderMaterial {
 
 // ---------------------------------------------------------------- frame
 
-/** The grid floor and its slab, the two grid walls, the vault arch over them and its chord. */
+/** The grid floor and its slab, and the two grid walls. */
 export function frameGeometry(): BufferGeometry {
   const pos: number[] = [];
   const weight: number[] = [];
@@ -126,14 +126,6 @@ export function frameGeometry(): BufferGeometry {
   line([h, 0, h], [h, -SLAB, h], 0.8);
   line([-h, 0, h], [-h, -SLAB, h], 0.8);
   line([h, 0, -h], [h, -SLAB, -h], 0.8);
-  // The vault: a half circle on the diagonal from the left wall's front top to the right wall's.
-  const r = h * Math.SQRT2;
-  const steps = 72;
-  const R2 = Math.SQRT1_2;
-  const arch = (t: number) => [-Math.cos(t) * r * R2, WALL + Math.sin(t) * r, Math.cos(t) * r * R2];
-  for (let i = 0; i < steps; i++) line(arch((i / steps) * Math.PI), arch(((i + 1) / steps) * Math.PI), 0.85);
-  line([-h, WALL, h], [h, WALL, -h], 0.6);
-  line([0, WALL, 0], [0, WALL + r, 0], 0.25);
   const geo = new BufferGeometry();
   geo.setAttribute('position', new Float32BufferAttribute(pos, 3));
   geo.setAttribute('aW', new Float32BufferAttribute(weight, 1));

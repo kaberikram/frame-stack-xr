@@ -125,7 +125,7 @@ function viewName(view: ShotView): string {
 }
 
 /**
- * Rooms: five clips floating inside a grid frame under a vault, each as a frame stack like Frame
+ * Rooms: five clips floating inside a grid frame, each as a frame stack like Frame
  * stack's: its frames as feathered ghost layers along a time axis, the clip itself travelling
  * through them sharp and lit. The camera follows the shot list in
  * `rooms-score.ts`: eased flights in the verses, hard cuts on the beat in the drops, face on to see

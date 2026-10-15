@@ -8,7 +8,7 @@ Two passthrough modes and two pieces played to a song, in one page.
 
 **Sorang** hangs a painting four metres tall in the dark and plays it slowly through its song. It takes on depth, splits into 100 slices by depth, turns out to be a mosaic of 100 stock photos, and then bursts on the drop into small glowing pieces that drift around you and fade with the song. On the desktop or in VR.
 
-**Rooms** floats five clips in a grid frame under a vault, each as a frame stack: its frames as glowing layers along a time axis, with the clip itself travelling through them. A camera films them to a song, flying between the overview and the stacks through the verses and cutting on the beat through the drops. Desktop only.
+**Rooms** floats five clips in a grid frame, each as a frame stack: its frames as glowing layers along a time axis, with the clip itself travelling through them. A camera films them to a song, flying between the overview and the stacks through the verses and cutting on the beat through the drops. Desktop only.
 
 ## Run
 
@@ -69,7 +69,7 @@ Assets: `public/sorang/painting.jpg` is the painting, perspective-cropped from a
 
 Pick **Rooms** on the 2D page. The card folds down to a **Show card** button and the piece plays in the window. It's desktop only, so there is no Enter button.
 
-- It opens on the empty frame seen from high above: a grid floor, two grid walls, and a vault arch over them. The song (`public/rooms/music.mp3`, 2:42, 110 BPM) starts once the browser allows sound: the tab click allows it, or else the first click or key (the page says so).
+- It opens on the empty frame seen from high above: a grid floor and two grid walls. The song (`public/rooms/music.mp3`, 2:42, 110 BPM) starts once the browser allows sound: the tab click allows it, or else the first click or key (the page says so).
 - Each room is a frame stack, like Frame stack's: 48 frames of its clip, feathered at the edges, spaced along a time axis (the first frame at the front). The clip itself plays sharp and lit inside it. As it loops, its frame travels back through the stack, lighting a short trail of the frames around it. Each stack is the shape of its clip: the car park and the rooftop are wide; the hallway, dark room and train are nearly square.
 - Over the two-bar intro the camera cranes down while the five stacks build up one after another, top first, frame by frame.
 - Verse (4–39 s): eased flights every two bars, each landing on the downbeat. The camera goes round a stack and then turns face on to see that memory in full. Face on, the clip plays at the front of its stack with the layers glowing out behind it. While a room is in view the others dim, and any stack in the way fades out. Every shot keeps moving while it holds: a front view pushes in, a 3/4 view turns round the stack, an oblique view glides down its time axis.

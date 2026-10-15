@@ -1,5 +1,5 @@
 /**
- * Rooms' composition: the frame (a grid floor, two grid walls and a vault arch), the five rooms
+ * Rooms' composition: the frame (a grid floor and two grid walls), the five rooms
  * floating inside it (each a stack of its clip's frames), and the overview camera presets. Pure
  * data in root-local metres: +y up, the floor centred on the origin, every stack's first frame
  * facing roughly +z with time running away from it.
