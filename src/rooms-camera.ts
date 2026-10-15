@@ -5,7 +5,7 @@
  * up front; `evaluate` allocates nothing.
  */
 import { Vector3 } from '@iwsdk/core';
-import { ASPECT, BOXES, FRONT_FILL, FRONT_FOV, ISO, type BoxSpec } from './rooms-layout.js';
+import { BOXES, FRONT_FILL, FRONT_FOV, ISO, boxHeight, type BoxSpec } from './rooms-layout.js';
 import { SHOT_TIMES, shotAt, type SectionKind, type ShotState, type ShotView } from './rooms-score.js';
 
 const DEG = Math.PI / 180;
@@ -95,7 +95,7 @@ export class RoomsCamera {
   }
 
   private frontPose(box: BoxSpec, centre: Vector3, hold: number, kind: SectionKind, aspect: number, out: Pose): void {
-    const h = box.w / ASPECT;
+    const h = boxHeight(box);
     const f = frontFrame(hold, kind);
     // The plane that fills the frame, from the glass front (+d/2) to the video at the back (-d/2).
     const plane = (0.5 - f) * box.d;
@@ -148,7 +148,7 @@ export function segmentHitsBox(p0: Vector3, p1: Vector3, box: BoxSpec, margin: n
   slab.t1 = 1;
   return (
     clip(local.x, dirL.x, box.w / 2 + margin) &&
-    clip(local.y, dirL.y, box.w / ASPECT / 2 + margin) &&
+    clip(local.y, dirL.y, boxHeight(box) / 2 + margin) &&
     clip(local.z, dirL.z, box.d / 2 + margin)
   );
 }

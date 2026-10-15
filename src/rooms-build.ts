@@ -1,6 +1,6 @@
 /**
  * Rooms' geometry and shaders: the glass boxes (a video room inside a frosted shell with bright
- * edges), the grid frame with its vault arch, the dust plume, and the fog cubes.
+ * edges) and the grid frame with its vault arch.
  * Everything that moves is driven by uniforms the system writes from the song clock.
  *
  * Same conventions as sorang-materials.ts: three compiles these as GLSL ES 3.00 with its
@@ -22,17 +22,10 @@ import {
   Vector4,
   type Texture,
 } from '@iwsdk/core';
-import { ASPECT, BOXES, CELLS, FLOOR, SLAB, WALL, type BoxSpec, type FogSpec } from './rooms-layout.js';
-
-/** Dust plume particles, and sparkles per box. */
-export const COLUMN_DUST = 7000;
-export const SPARKLES_PER_BOX = 180;
-/** The plume rises this high, metres: up into the arch. */
-const PLUME_H = 14;
+import { CELLS, FLOOR, SLAB, WALL, boxHeight, type BoxSpec } from './rooms-layout.js';
 
 /** Uniform objects shared by reference across Rooms' materials. */
 export function createRoomsUniforms() {
-  const n = BOXES.length;
   return {
     /** Song seconds: everything that drifts reads it, so a frozen moment always looks the same. */
     uSong: { value: 0 },
@@ -44,19 +37,10 @@ export function createRoomsUniforms() {
     uFrameShow: { value: 0 },
     /** A band of light rising up the walls: height (metres), strength. */
     uScan: { value: new Vector2(-10, 0) },
-    uDustShow: { value: 0 },
-    /** 0..1 share of the dust drawn. */
-    uDustAmount: { value: 1 },
-    uBurstAge: { value: 1e3 },
-    uBurstAmp: { value: 0 },
+    /** The drawing buffer's height, px: the bloom swaps in its own while it draws. */
     uViewportH: { value: 1000 },
-    uMaxPoint: { value: 16 },
     /** 0..1 flare on a cut. */
     uFlash: { value: 0 },
-    uBoxPos: { value: BOXES.map((b) => new Vector3(b.pos[0], b.pos[1], b.pos[2])) },
-    uBoxHalf: { value: BOXES.map((b) => new Vector3(b.w / 2, b.w / ASPECT / 2, b.d / 2)) },
-    uBoxYaw: { value: Float32Array.from(BOXES, (b) => (b.yaw * Math.PI) / 180) },
-    uBoxBright: { value: new Float32Array(n) },
   };
 }
 export type RoomsUniforms = ReturnType<typeof createRoomsUniforms>;
@@ -87,27 +71,13 @@ const NOISE = /* glsl */ `
     return s;
   }`;
 
-const RANDOM = /* glsl */ `
-  uint pcg(uint v) {
-    uint state = v * 747796405u + 2891336453u;
-    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
-    return (word >> 22u) ^ word;
-  }
-  float rnd(uint id, uint key) { return float(pcg(id ^ pcg(key + 1u))) / 4294967295.0; }
-  vec3 rndDir(uint id, uint key) {
-    float z = rnd(id, key) * 2.0 - 1.0;
-    float a = rnd(id, key + 100u) * 6.2831853;
-    float r = sqrt(max(0.0, 1.0 - z * z));
-    return vec3(r * cos(a), r * sin(a), z);
-  }`;
-
 // ---------------------------------------------------------------- boxes
 
 export interface BoxUniforms {
   uSong: { value: number };
   uKick: { value: number };
   uVideo: { value: Texture };
-  /** Cover fit: uv scale (xy) and offset (zw), so any clip fills the 16:9 back wall. */
+  /** Cover fit: uv scale (xy) and offset (zw), so a clip of any shape fills the back wall. */
   uCover: { value: Vector4 };
   /** 1 once a real clip plays; 0 shows the test card's sweep. */
   uLive: { value: number };
@@ -127,7 +97,7 @@ export function createBoxUniforms(U: RoomsUniforms, box: BoxSpec, video: Texture
     uVideo: { value: video },
     uCover: { value: new Vector4(1, 1, 0, 0) },
     uLive: { value: 0 },
-    uSize: { value: new Vector3(box.w, box.w / ASPECT, box.d) },
+    uSize: { value: new Vector3(box.w, boxHeight(box), box.d) },
     uTint: { value: new Vector3(box.tint[0], box.tint[1], box.tint[2]) },
     uBright: { value: 0 },
     uGlass: { value: 0.6 },
@@ -138,7 +108,7 @@ export function createBoxUniforms(U: RoomsUniforms, box: BoxSpec, video: Texture
 
 /** A box's size, for its interior, shell and edges. The shell sits a hair outside the room. */
 export function boxGeometry(box: BoxSpec, grow = 1): BoxGeometry {
-  return new BoxGeometry(box.w * grow, (box.w / ASPECT) * grow, box.d * grow);
+  return new BoxGeometry(box.w * grow, boxHeight(box) * grow, box.d * grow);
 }
 
 /**
@@ -371,179 +341,6 @@ export function frameMaterial(U: RoomsUniforms): ShaderMaterial {
         gl_FragColor = vec4(vec3(0.86, 0.89, 1.0) * g * uFrameShow, 1.0);
         #include <colorspace_fragment>
       }`,
-    transparent: true,
-    blending: AdditiveBlending,
-    depthWrite: false,
-    depthTest: true,
-  });
-}
-
-// ---------------------------------------------------------------- dust
-
-/** The plume's particle count plus each box's sparkles. Positions come from the shader. */
-export function dustGeometry(): BufferGeometry {
-  const count = COLUMN_DUST + SPARKLES_PER_BOX * BOXES.length;
-  const geo = new BufferGeometry();
-  // A placeholder attribute sized to the count: the shader places every point from its index.
-  geo.setAttribute('position', new Float32BufferAttribute(new Float32Array(count * 3), 3));
-  return geo;
-}
-
-export function dustMaterial(U: RoomsUniforms): ShaderMaterial {
-  return new ShaderMaterial({
-    uniforms: U,
-    vertexShader: /* glsl */ `
-      ${RANDOM}
-      uniform float uSong;
-      uniform float uKick;
-      uniform float uDustShow;
-      uniform float uDustAmount;
-      uniform float uBurstAge;
-      uniform float uBurstAmp;
-      uniform float uViewportH;
-      uniform float uMaxPoint;
-      uniform vec3 uBoxPos[${BOXES.length}];
-      uniform vec3 uBoxHalf[${BOXES.length}];
-      uniform float uBoxYaw[${BOXES.length}];
-      uniform float uBoxBright[${BOXES.length}];
-      varying float vGain;
-      varying vec3 vTint;
-      void main() {
-        uint id = uint(gl_VertexID);
-        vec3 P;
-        float gain;
-        float size;
-        if (gl_VertexID < ${COLUMN_DUST}) {
-          // The plume: rising, widening and turning as it climbs into the arch.
-          float speed = mix(0.12, 0.42, rnd(id, 1u));
-          float y = mod(rnd(id, 2u) * ${PLUME_H.toFixed(1)} + uSong * speed, ${PLUME_H.toFixed(1)});
-          float y01 = y / ${PLUME_H.toFixed(1)};
-          float spread = mix(0.35, 2.2, y01 * y01) * sqrt(rnd(id, 3u));
-          float ang = rnd(id, 4u) * 6.2831853 + y * 0.35 + uSong * 0.12 * (rnd(id, 5u) - 0.5);
-          P = vec3(cos(ang) * spread, y, sin(ang) * spread);
-          P.x += 0.18 * sin(uSong * 0.7 + rnd(id, 6u) * 20.0);
-          P.z += 0.18 * cos(uSong * 0.6 + rnd(id, 7u) * 20.0);
-          // A drop throws it outward, then it drifts back in.
-          float k = uBurstAmp * (1.0 - exp(-uBurstAge * 5.0)) * exp(-uBurstAge * 0.3);
-          P += rndDir(id, 8u) * k * mix(1.5, 7.0, rnd(id, 9u));
-          gain = smoothstep(0.0, 0.8, y) * (1.0 - smoothstep(${(PLUME_H - 3).toFixed(1)}, ${PLUME_H.toFixed(1)}, y));
-          gain *= step(rnd(id, 10u), uDustAmount) * uDustShow * mix(0.35, 1.0, rnd(id, 11u));
-          size = mix(0.012, 0.03, rnd(id, 12u));
-          vTint = mix(vec3(1.0), mix(vec3(1.0, 0.7, 0.85), vec3(0.7, 0.8, 1.0), rnd(id, 13u)), 0.5);
-        } else {
-          // Sparkles hanging in and around each box, twinkling.
-          int s = gl_VertexID - ${COLUMN_DUST};
-          int b = s % ${BOXES.length};
-          vec3 q = (vec3(rnd(id, 20u), rnd(id, 21u), rnd(id, 22u)) * 2.0 - 1.0) * uBoxHalf[b] * 1.08;
-          q.y += 0.05 * sin(uSong * 0.5 + rnd(id, 23u) * 30.0);
-          float c = cos(uBoxYaw[b]);
-          float sn = sin(uBoxYaw[b]);
-          P = uBoxPos[b] + vec3(q.x * c + q.z * sn, q.y, -q.x * sn + q.z * c);
-          float tw = pow(max(0.5 + 0.5 * sin(uSong * mix(1.5, 4.0, rnd(id, 24u)) + rnd(id, 25u) * 40.0), 0.0), 6.0);
-          gain = uBoxBright[b] * (0.15 + 0.85 * tw) * step(rnd(id, 26u), uDustAmount) * 0.8;
-          size = mix(0.008, 0.02, rnd(id, 27u));
-          vTint = vec3(1.0);
-        }
-        vec4 mv = modelViewMatrix * vec4(P, 1.0);
-        float px = size * (1.0 + 0.9 * uKick) * projectionMatrix[1][1] * 0.5 * uViewportH / max(0.05, -mv.z);
-        // Out of the way up close, so a front view never looks through a blizzard.
-        vGain = gain * min(1.0, px * px) * smoothstep(0.6, 2.5, -mv.z);
-        gl_Position = projectionMatrix * mv;
-        gl_PointSize = clamp(px, 1.0, uMaxPoint);
-        if (vGain <= 0.002) gl_Position = vec4(2.0, 2.0, 2.0, 1.0);
-      }`,
-    fragmentShader: /* glsl */ `
-      varying float vGain;
-      varying vec3 vTint;
-      void main() {
-        vec2 c = gl_PointCoord * 2.0 - 1.0;
-        float r = dot(c, c);
-        if (r > 1.0) discard;
-        gl_FragColor = vec4(vTint * vGain * (1.0 - r), 1.0);
-        #include <colorspace_fragment>
-      }`,
-    transparent: true,
-    blending: AdditiveBlending,
-    depthWrite: false,
-    depthTest: true,
-  });
-}
-
-// ---------------------------------------------------------------- fog cubes
-
-export interface FogUniforms {
-  uSong: { value: number };
-  uKick: { value: number };
-  /** The camera in the cube's own frame, so the march needs no matrix inverse. */
-  uCamL: { value: Vector3 };
-  uColor: { value: Vector3 };
-  uSize: { value: number };
-  uBright: { value: number };
-  uSeed: { value: number };
-}
-
-export function createFogUniforms(U: RoomsUniforms, fog: FogSpec, seed: number): FogUniforms {
-  return {
-    uSong: U.uSong,
-    uKick: U.uKick,
-    uCamL: { value: new Vector3(0, 0, 10) },
-    uColor: { value: new Vector3(fog.color[0], fog.color[1], fog.color[2]) },
-    uSize: { value: fog.size },
-    uBright: { value: 0 },
-    uSeed: { value: seed },
-  };
-}
-
-/** Smoke held in a cube: a short march through drifting noise, breathing on the kick. */
-export function fogMaterial(u: FogUniforms): ShaderMaterial {
-  return new ShaderMaterial({
-    uniforms: u as unknown as Record<string, { value: unknown }>,
-    vertexShader: /* glsl */ `
-      varying vec3 vLocal;
-      void main() {
-        vLocal = position;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }`,
-    fragmentShader: /* glsl */ `
-      ${NOISE}
-      uniform vec3 uCamL;
-      uniform vec3 uColor;
-      uniform float uSize;
-      uniform float uBright;
-      uniform float uSong;
-      uniform float uKick;
-      uniform float uSeed;
-      varying vec3 vLocal;
-      void main() {
-        vec3 ro = uCamL;
-        vec3 rd = normalize(vLocal - ro);
-        vec3 h = vec3(0.5 * uSize);
-        vec3 inv = 1.0 / rd;
-        vec3 ta = (-h - ro) * inv;
-        vec3 tb = (h - ro) * inv;
-        vec3 tmin = min(ta, tb);
-        vec3 tmax = max(ta, tb);
-        float tn = max(max(tmin.x, tmin.y), max(tmin.z, 0.0));
-        float tf = min(min(tmax.x, tmax.y), tmax.z);
-        if (tf <= tn) discard;
-        const int STEPS = 20;
-        float dt = (tf - tn) / float(STEPS);
-        float acc = 0.0;
-        float trans = 1.0;
-        for (int i = 0; i < STEPS; i++) {
-          vec3 p = ro + rd * (tn + (float(i) + 0.5) * dt);
-          vec3 q = p / uSize;
-          float d = fbm(q * 2.4 + vec3(uSeed, -uSong * 0.1 + uSeed, uSong * 0.04));
-          // A thin even fill gives the cube its edges; the noise rolls through it.
-          d = (0.22 + 0.78 * smoothstep(0.32, 0.8, d)) * (1.0 + 1.1 * uKick);
-          float dens = d * 3.0 * dt / uSize;
-          acc += trans * dens;
-          trans *= exp(-dens * 1.2);
-        }
-        gl_FragColor = vec4(uColor * acc * uBright, 1.0);
-        #include <colorspace_fragment>
-      }`,
-    side: BackSide,
     transparent: true,
     blending: AdditiveBlending,
     depthWrite: false,

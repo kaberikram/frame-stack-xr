@@ -1,7 +1,7 @@
 /**
- * Rooms' composition: the frame (a grid floor, two grid walls and a vault arch), the glass boxes
- * stacked inside it, the fog cubes, and the overview camera presets. Pure data in root-local
- * metres: +y up, the floor centred on the origin, every box's front facing roughly +z.
+ * Rooms' composition: the frame (a grid floor, two grid walls and a vault arch), the five glass
+ * rooms stacked inside it, and the overview camera presets. Pure data in root-local metres: +y up,
+ * the floor centred on the origin, every room's front facing roughly +z.
  *
  * Positions are written as `at(u, y, v)`: `u` runs left to right and `v` toward the viewer as
  * seen from the default overview (looking at the walls' corner from 45°), so the stack can be
@@ -26,20 +26,22 @@ export interface BoxSpec {
   name: string;
   /** Centre, root-local metres. */
   pos: readonly [number, number, number];
-  /** Front width, metres; the front is 16:9 for landscape clips. */
+  /** Front width, metres. */
   w: number;
+  /** Front width over height: its clip's own shape, so the clip fills the back wall uncropped. */
+  aspect: number;
   /** Depth front to back, metres. */
   d: number;
   /** Where the front faces, degrees from +z toward +x. */
   yaw: number;
   /** Glass tint, linear RGB. */
   tint: readonly [number, number, number];
-  /** Rank from the top of the stack: boxes and fog cubes appear and leave in this order. */
+  /** Rank from the top of the stack: rooms appear and leave in this order. */
   order: number;
 }
 
-/** Front height from width: the boxes frame landscape 16:9 video. */
-export const ASPECT = 16 / 9;
+/** Front height, metres. */
+export const boxHeight = (box: BoxSpec): number => box.w / box.aspect;
 
 const PINK = [1, 0.62, 0.78] as const;
 const LILAC = [0.78, 0.68, 1] as const;
@@ -47,35 +49,14 @@ const ICE = [0.7, 0.85, 1] as const;
 const WARM = [1, 0.75, 0.6] as const;
 const VIOLET = [0.9, 0.5, 1] as const;
 
+/** One room per clip, each the shape of its clip (`scripts/rooms/prep_clips.sh --keep-aspect`). */
 export const BOXES: readonly BoxSpec[] = [
-  { slot: 0, name: 'bedroom', pos: at(0.5, 8.1, -0.6), w: 2.2, d: 1.6, yaw: 14, tint: LILAC, order: 1 },
-  { slot: 1, name: 'living room', pos: at(-1.5, 6.7, 0.3), w: 3.0, d: 2.1, yaw: 10, tint: PINK, order: 2 },
-  { slot: 2, name: 'bunk room', pos: at(2.1, 5.5, -0.9), w: 2.4, d: 1.8, yaw: 18, tint: ICE, order: 4 },
-  { slot: 3, name: 'kitchen', pos: at(-3.0, 4.4, 0.7), w: 2.7, d: 2.0, yaw: 8, tint: WARM, order: 5 },
-  { slot: 4, name: 'office', pos: at(3.4, 3.8, 0.4), w: 2.4, d: 1.8, yaw: 20, tint: WARM, order: 7 },
-  { slot: 5, name: 'gallery', pos: at(-0.5, 2.9, 1.4), w: 2.4, d: 1.8, yaw: 12, tint: ICE, order: 8 },
-  { slot: 6, name: 'lounge', pos: at(1.5, 2.2, -0.5), w: 2.8, d: 2.0, yaw: 16, tint: LILAC, order: 9 },
-  { slot: 7, name: 'bathroom', pos: at(-3.5, 1.5, 0.1), w: 2.2, d: 1.6, yaw: 10, tint: ICE, order: 10 },
-  { slot: 8, name: 'purple lounge', pos: at(2.6, 0.72, 2.0), w: 2.4, d: 1.8, yaw: 16, tint: VIOLET, order: 11 },
+  { slot: 0, name: 'car park', pos: at(-2.2, 6.2, 0.4), w: 4.0, aspect: 16 / 9, d: 2.8, yaw: 10, tint: LILAC, order: 1 },
+  { slot: 1, name: 'hallway', pos: at(2.4, 5.0, -0.9), w: 3.0, aspect: 448 / 352, d: 2.2, yaw: 18, tint: WARM, order: 2 },
+  { slot: 2, name: 'dark room', pos: at(-1.8, 2.9, 1.1), w: 2.9, aspect: 592 / 480, d: 2.1, yaw: 12, tint: PINK, order: 3 },
+  { slot: 3, name: 'rooftop', pos: at(0.8, 8.45, -0.6), w: 3.8, aspect: 16 / 9, d: 2.7, yaw: 14, tint: ICE, order: 0 },
+  { slot: 4, name: 'train', pos: at(2.2, 1.5, 1.3), w: 3.1, aspect: 576 / 480, d: 2.2, yaw: 16, tint: VIOLET, order: 4 },
 ];
-
-export interface FogSpec {
-  pos: readonly [number, number, number];
-  size: number;
-  yaw: number;
-  /** Linear RGB of the smoke. */
-  color: readonly [number, number, number];
-  order: number;
-}
-
-export const FOG: readonly FogSpec[] = [
-  { pos: at(-2.7, 9.0, -1.6), size: 1.5, yaw: 12, color: [0.25, 0.75, 0.68], order: 0 },
-  { pos: at(3.3, 6.9, -1.4), size: 1.4, yaw: 15, color: [0.6, 0.62, 0.66], order: 3 },
-  { pos: at(-0.1, 4.6, -2.0), size: 1.5, yaw: 10, color: [0.35, 0.55, 1], order: 6 },
-];
-
-/** Every box and fog cube, for the reveal order. */
-export const PIECES = BOXES.length + FOG.length;
 
 export interface IsoPreset {
   /** What it looks at, root-local metres. */
@@ -95,11 +76,11 @@ export interface IsoPreset {
 export const ISO: Record<'rise' | 'wide' | 'mid' | 'high' | 'low' | 'side' | 'orbit' | 'pull', IsoPreset> = {
   rise: { target: [0, 10.5, 0], az: 45, el: 38, fitH: 10, fitW: 8, fov: 24, spin: 1.5 },
   wide: { target: [0, 7.4, 0], az: 45, el: 18, fitH: 19.5, fitW: 14, fov: 24, spin: 0.8 },
-  mid: { target: [0, 5, 0], az: 42, el: 16, fitH: 11, fitW: 9, fov: 24, spin: 1.2 },
-  high: { target: [0, 7.4, 0], az: 36, el: 10, fitH: 7.5, fitW: 7.5, fov: 26, spin: -1.2 },
-  low: { target: [0, 2.4, 0], az: 54, el: 24, fitH: 7.5, fitW: 7.5, fov: 26, spin: 1.2 },
-  side: { target: [0, 5, 0], az: 72, el: 8, fitH: 12, fitW: 10, fov: 24, spin: -1.5 },
-  orbit: { target: [0, 5, 0], az: 30, el: 15, fitH: 12.5, fitW: 10, fov: 24, spin: 5 },
+  mid: { target: [0, 4.7, 0], az: 42, el: 16, fitH: 10.5, fitW: 9, fov: 24, spin: 1.2 },
+  high: { target: [0, 7.0, 0], az: 36, el: 10, fitH: 6.5, fitW: 7.5, fov: 26, spin: -1.2 },
+  low: { target: [0, 2.4, 0], az: 54, el: 24, fitH: 6.5, fitW: 7.5, fov: 26, spin: 1.2 },
+  side: { target: [0, 4.7, 0], az: 72, el: 8, fitH: 11, fitW: 10, fov: 24, spin: -1.5 },
+  orbit: { target: [0, 4.7, 0], az: 30, el: 15, fitH: 11.5, fitW: 10, fov: 24, spin: 5 },
   pull: { target: [0, 8, 0], az: 45, el: 30, fitH: 30, fitW: 22, fov: 24, spin: 0.6 },
 };
 

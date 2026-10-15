@@ -1,9 +1,7 @@
 import {
-  BoxGeometry,
   Group,
   LineSegments,
   Mesh,
-  Points,
   Vector2,
   Vector3,
   createSystem,
@@ -15,24 +13,19 @@ import { MUSIC_URL } from './rooms-assets.js';
 import {
   boxGeometry,
   createBoxUniforms,
-  createFogUniforms,
   createRoomsUniforms,
-  dustGeometry,
-  dustMaterial,
   edgeGeometry,
   edgeMaterial,
-  fogMaterial,
   frameGeometry,
   frameMaterial,
   glassMaterial,
   interiorMaterial,
   type BoxUniforms,
-  type FogUniforms,
   type RoomsUniforms,
 } from './rooms-build.js';
 import { RoomsCamera, createPose, segmentHitsBox } from './rooms-camera.js';
 import { RoomsLook } from './rooms-component.js';
-import { ASPECT, BOXES, FOG, WALL, type BoxSpec, type FogSpec } from './rooms-layout.js';
+import { BOXES, WALL, type BoxSpec } from './rooms-layout.js';
 import {
   BAR,
   SHOT_TIMES,
@@ -40,7 +33,6 @@ import {
   arrivalFlareAt,
   barTime,
   beatsAt,
-  burstAt,
   energyAt,
   fadeAt,
   flashAt,
@@ -53,7 +45,7 @@ import { RoomsVideos, type VideoSlot } from './rooms-videos.js';
 import { SorangBloom, type BloomSwap } from './sorang-bloom.js';
 import { SorangMusic } from './sorang-music.js';
 
-const LOOK_KEYS = ['glass', 'dust', 'kick', 'focusDim', 'flash', 'parallax', 'bloom', 'bloomThreshold', 'volume'] as const;
+const LOOK_KEYS = ['glass', 'kick', 'focusDim', 'flash', 'parallax', 'bloom', 'bloomThreshold', 'volume'] as const;
 type Look = Record<(typeof LOOK_KEYS)[number], number>;
 
 /** Seconds the empty frame takes to fade in before the song can start. */
@@ -118,19 +110,13 @@ interface BoxRig {
   occ: number;
 }
 
-interface FogRig {
-  readonly spec: FogSpec;
-  readonly u: FogUniforms;
-  readonly mesh: Mesh;
-}
-
 function viewName(view: ShotView): string {
   return typeof view === 'number' ? `box ${view + 1} (${BOXES[view]?.name ?? '?'})` : view;
 }
 
 /**
- * Rooms: glass boxes stacked inside a grid frame under a vault, each looping its own clip, a
- * plume of dust rising through them and smoke held in three cubes. The camera follows the shot
+ * Rooms: glass rooms stacked inside a grid frame under a vault, each looping its own clip and
+ * shaped to it. The camera follows the shot
  * list in `rooms-score.ts`: eased flights between the overview and single rooms in the verses,
  * hard cuts on the beat in the drops. Everything is a function of the song second, so any moment
  * can be frozen and captured. Desktop only.
@@ -139,9 +125,7 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
   private U!: RoomsUniforms;
   private root!: Group;
   private frame!: LineSegments;
-  private dust!: Points;
   private boxes: BoxRig[] = [];
-  private fogs: FogRig[] = [];
   private bloom!: SorangBloom;
   private bloomOn = !BLOOM_OFF;
   private bloomSwaps: BloomSwap[] = [];
@@ -152,7 +136,6 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
   private readonly pose = createPose();
   private readonly look: Look = {
     glass: 0.7,
-    dust: 1,
     kick: 1,
     focusDim: 0.75,
     flash: 1,
@@ -192,7 +175,6 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
   private readonly targetW = new Vector3();
   private readonly tmp = new Vector3();
   private readonly bufSize = new Vector2();
-  private readonly burst = { age: 1e3, amp: 0 };
   private statusNow: RoomsStatus = { text: 'Building the rooms', busy: true };
   private readonly listeners = new Set<() => void>();
   private updateMs = 0;
@@ -200,9 +182,6 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
 
   init(): void {
     this.U = createRoomsUniforms();
-    const gl = this.renderer.getContext();
-    const range = gl.getParameter(gl.ALIASED_POINT_SIZE_RANGE) as Float32Array | null;
-    this.U.uMaxPoint.value = Math.max(1, Math.min(12, range?.[1] ?? 12));
 
     this.root = new Group();
     this.root.name = 'rooms';
@@ -233,27 +212,12 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
       edges.renderOrder = 35;
       group.add(interior, glass, edges);
       this.root.add(group);
-      // The clip glows only where it is bright; the glass and edges glow fully.
-      this.addPiece(interior, interiorMaterial(u, 0.55), false);
+      // The clip glows only where it is brightest (a sky, a window); the glass and edges glow fully.
+      this.addPiece(interior, interiorMaterial(u, 0.3), false);
       this.addPiece(glass, glassMaterial(u), false);
       this.addPiece(edges, edgeMaterial(u), false);
       this.boxes.push({ spec, u, group, interior, glass, edges, slot, occ: 1 });
     }
-
-    FOG.forEach((spec, i) => {
-      const u = createFogUniforms(this.U, spec, 3.7 * (i + 1));
-      const mesh = new Mesh(new BoxGeometry(spec.size, spec.size, spec.size), fogMaterial(u));
-      mesh.name = `rooms-fog-${i + 1}`;
-      mesh.position.set(spec.pos[0], spec.pos[1], spec.pos[2]);
-      mesh.rotation.y = spec.yaw * DEG;
-      mesh.renderOrder = 20;
-      this.addPiece(mesh, fogMaterial(u));
-      this.fogs.push({ spec, u, mesh });
-    });
-
-    this.dust = new Points(dustGeometry(), dustMaterial(this.U));
-    this.dust.renderOrder = 40;
-    this.addPiece(this.dust, dustMaterial(this.U));
 
     this.bloom = new SorangBloom(this.renderer, 'rooms');
     this.bloom.composite.name = 'rooms-bloom';
@@ -518,12 +482,6 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     U.uFrameShow.value = frameShow;
     const barPhase = beats / 4 - Math.floor(beats / 4);
     U.uScan.value.set(barPhase * WALL * 1.1 - 0.3, preroll ? 0 : 0.35 + 0.65 * energy);
-    // Thinner in a front view, so the plume drifting past never hides the room.
-    U.uDustShow.value = frameShow * (preroll ? 0.35 : 0.45 + 0.55 * energy) * (1 - 0.55 * this.cam.focus);
-    U.uDustAmount.value = look.dust;
-    burstAt(s, this.burst);
-    U.uBurstAge.value = this.burst.age;
-    U.uBurstAmp.value = preroll ? 0 : this.burst.amp * (reduced ? 0.4 : 1);
     // A cut flares the scene's own light: edges, grid and glow.
     const flash = preroll ? 0 : flashAt(s, st) * look.flash * (reduced ? 0.3 : 1);
     U.uFlash.value = flash;
@@ -555,17 +513,6 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
       const flare = preroll ? 0 : arrivalFlareAt(s, spec.order);
       rig.u.uEdge.value = presence * rig.occ * (1 - 0.6 * dim) * (0.35 + 0.55 * kick + 1.6 * flare + 1.2 * flash);
       rig.group.visible = presence > 0.001 && rig.occ > 0.01;
-      U.uBoxBright.value[spec.slot] = bright;
-    }
-    for (const rig of this.fogs) {
-      const presence = preroll ? 0 : presenceAt(s, rig.spec.order);
-      const dim = focused ? look.focusDim * focus : 0;
-      rig.u.uBright.value = presence * (1 - dim) * (0.55 + 0.35 * energy);
-      rig.mesh.visible = rig.u.uBright.value > 0.002;
-      // The camera in the cube's frame: undo its position and yaw.
-      const c = rig.u.uCamL.value;
-      c.set(this.eyeL.x - rig.spec.pos[0], this.eyeL.y - rig.spec.pos[1], this.eyeL.z - rig.spec.pos[2]);
-      c.applyAxisAngle(Y_AXIS, -rig.spec.yaw * DEG);
     }
 
     // The glow: everything glows a little, and it swells on the drops and the cuts.
@@ -622,24 +569,24 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
 
   // ---------------------------------------------------------------- helpers
 
-  /** Add a piece to the root, drawn with `twin` into the glow. Positions come from shaders, so bounds mean nothing. */
-  private addPiece(object: Mesh | Points | LineSegments, twin: Material, parent = true): void {
-    if (object instanceof Points) object.frustumCulled = false;
+  /** Add a piece to the root, drawn with `twin` into the glow. */
+  private addPiece(object: Mesh | LineSegments, twin: Material, parent = true): void {
     object.raycast = () => {};
     if (parent) this.root.add(object);
     this.bloomSwaps.push([object, twin]);
     this.twins.push(twin);
   }
 
-  /** A slot's clip has decoded: show it, cover-fitted to the 16:9 back wall. */
+  /** A slot's clip has decoded: show it, cover-fitted to the room's back wall (a no-op when it matches the room's shape). */
   private useClip(rig: BoxRig): void {
     const tex = this.videos.texture(rig.slot);
     rig.u.uVideo.value = tex;
     rig.u.uLive.value = rig.slot.live ? 1 : 0;
     const a = rig.slot.aspect;
+    const room = rig.spec.aspect;
     const cover = rig.u.uCover.value;
-    if (a > ASPECT) cover.set(ASPECT / a, 1, (1 - ASPECT / a) / 2, 0);
-    else cover.set(1, a / ASPECT, 0, (1 - a / ASPECT) / 2);
+    if (a > room) cover.set(room / a, 1, (1 - room / a) / 2, 0);
+    else cover.set(1, a / room, 0, (1 - a / room) / 2);
   }
 
   private readLook(): void {

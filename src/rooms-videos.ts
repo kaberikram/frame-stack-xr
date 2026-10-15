@@ -5,7 +5,7 @@
  */
 import { CanvasTexture, SRGBColorSpace, VideoTexture, type Texture } from '@iwsdk/core';
 import { videoName, videoUrl } from './rooms-assets.js';
-import { ASPECT, type BoxSpec } from './rooms-layout.js';
+import type { BoxSpec } from './rooms-layout.js';
 
 export interface VideoSlot {
   readonly slot: number;
@@ -16,6 +16,8 @@ export interface VideoSlot {
   live: boolean;
   /** Width over height of what the slot shows. */
   aspect: number;
+  /** The room's own shape, shown until a clip says otherwise. */
+  readonly roomAspect: number;
 }
 
 /** A frozen frame is re-seeked only when it is further off than this, seconds. */
@@ -30,7 +32,15 @@ export class RoomsVideos {
   private readonly cleanups: Array<() => void> = [];
 
   constructor(boxes: readonly BoxSpec[]) {
-    this.slots = boxes.map((box) => ({ slot: box.slot, card: testCard(box), video: null, texture: null, live: false, aspect: ASPECT }));
+    this.slots = boxes.map((box) => ({
+      slot: box.slot,
+      card: testCard(box),
+      video: null,
+      texture: null,
+      live: false,
+      aspect: box.aspect,
+      roomAspect: box.aspect,
+    }));
   }
 
   get liveCount(): number {
@@ -87,7 +97,7 @@ export class RoomsVideos {
       slot.texture?.dispose();
       slot.texture = null;
       slot.live = false;
-      slot.aspect = ASPECT;
+      slot.aspect = slot.roomAspect;
       const v = slot.video;
       slot.video = null;
       if (v) {
@@ -119,7 +129,7 @@ export class RoomsVideos {
       if (slot.live) return;
       slot.texture = new VideoTexture(v);
       slot.texture.colorSpace = SRGBColorSpace;
-      slot.aspect = v.videoWidth > 0 && v.videoHeight > 0 ? v.videoWidth / v.videoHeight : ASPECT;
+      slot.aspect = v.videoWidth > 0 && v.videoHeight > 0 ? v.videoWidth / v.videoHeight : slot.roomAspect;
       slot.live = true;
       console.info(`[rooms] slot ${videoName(slot.slot)} ${v.videoWidth}x${v.videoHeight} ${v.duration.toFixed(1)} s`);
       this.onChange?.(slot);
@@ -142,7 +152,8 @@ export class RoomsVideos {
 /** A numbered card for an empty slot: colour bars, the room's name, and the file it wants. */
 function testCard(box: BoxSpec): CanvasTexture {
   const w = 640;
-  const h = 360;
+  // The room's own shape, so the card fills its back wall unstretched.
+  const h = Math.round(w / box.aspect);
   const canvas = document.createElement('canvas');
   canvas.width = w;
   canvas.height = h;

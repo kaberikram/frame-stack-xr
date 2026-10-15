@@ -10,13 +10,9 @@ export const RoomsLook = createComponent('RoomsLook', {
     type: Types.Float32, default: 0.7, min: 0, max: 2, step: 0.05, label: 'Glass',
     help: 'How bright the glass shells read at grazing angles, and their mist.',
   },
-  dust: {
-    type: Types.Float32, default: 1, min: 0, max: 1, step: 0.05, label: 'Dust',
-    help: 'Share of the dust plume and box sparkles drawn. 0 turns them off.',
-  },
   kick: {
     type: Types.Float32, default: 1, min: 0, max: 2, step: 0.05, label: 'Beat response',
-    help: 'How hard edges, dust, fog and the camera answer each beat.',
+    help: 'How hard the edges, glass, floor ring and camera answer each beat.',
   },
   focusDim: {
     type: Types.Float32, default: 0.75, min: 0, max: 1, step: 0.05, label: 'Front-view dim',
