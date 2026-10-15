@@ -1,6 +1,7 @@
 /**
- * Rooms' geometry and shaders: the glass boxes (a video room inside a frosted shell with bright
- * edges) and the grid frame with its vault arch.
+ * Rooms' geometry and shaders: the grid frame with its vault arch, and for each room the parts
+ * of its frame stack that Frame stack's own materials (`stack-materials.ts`) don't cover: the
+ * sharp frame (the clip itself, travelling through the stack) and the time ruler under it.
  * Everything that moves is driven by uniforms the system writes from the song clock.
  *
  * Same conventions as sorang-materials.ts: three compiles these as GLSL ES 3.00 with its
@@ -9,27 +10,20 @@
  */
 import {
   AdditiveBlending,
-  BackSide,
-  BoxGeometry,
   BufferGeometry,
-  EdgesGeometry,
+  DoubleSide,
   Float32BufferAttribute,
-  FrontSide,
-  NoBlending,
+  NormalBlending,
   ShaderMaterial,
   Vector2,
-  Vector3,
-  Vector4,
   type Texture,
 } from '@iwsdk/core';
-import { CELLS, FLOOR, SLAB, WALL, boxHeight, type BoxSpec } from './rooms-layout.js';
+import { CELLS, FLOOR, SLAB, WALL } from './rooms-layout.js';
+import { FEATHER } from './stack-materials.js';
 
 /** Uniform objects shared by reference across Rooms' materials. */
 export function createRoomsUniforms() {
   return {
-    /** Song seconds: everything that drifts reads it, so a frozen moment always looks the same. */
-    uSong: { value: 0 },
-    uKick: { value: 0 },
     uEnergy: { value: 0 },
     /** Seconds since the latest beat, and how hard the floor ring pulses from it. */
     uBeatAge: { value: 1 },
@@ -45,209 +39,106 @@ export function createRoomsUniforms() {
 }
 export type RoomsUniforms = ReturnType<typeof createRoomsUniforms>;
 
-const NOISE = /* glsl */ `
-  float hash3(vec3 p) {
-    p = fract(p * 0.3183099 + 0.1);
-    p *= 17.0;
-    return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
-  }
-  float vnoise(vec3 x) {
-    vec3 i = floor(x);
-    vec3 f = fract(x);
-    f = f * f * (3.0 - 2.0 * f);
-    return mix(
-      mix(mix(hash3(i), hash3(i + vec3(1, 0, 0)), f.x), mix(hash3(i + vec3(0, 1, 0)), hash3(i + vec3(1, 1, 0)), f.x), f.y),
-      mix(mix(hash3(i + vec3(0, 0, 1)), hash3(i + vec3(1, 0, 1)), f.x), mix(hash3(i + vec3(0, 1, 1)), hash3(i + vec3(1, 1, 1)), f.x), f.y),
-      f.z);
-  }
-  float fbm(vec3 p) {
-    float a = 0.5;
-    float s = 0.0;
-    for (int i = 0; i < 4; i++) {
-      s += a * vnoise(p);
-      p = p * 2.03 + vec3(1.7, 9.2, 3.1);
-      a *= 0.5;
-    }
-    return s;
-  }`;
+// ---------------------------------------------------------------- stacks
 
-// ---------------------------------------------------------------- boxes
-
-export interface BoxUniforms {
-  uSong: { value: number };
-  uKick: { value: number };
+/** Per room: what the sharp frame and the ruler read besides the stack's own uniforms. */
+export interface FrameUniforms {
   uVideo: { value: Texture };
-  /** Cover fit: uv scale (xy) and offset (zw), so a clip of any shape fills the back wall. */
-  uCover: { value: Vector4 };
-  /** 1 once a real clip plays; 0 shows the test card's sweep. */
-  uLive: { value: number };
-  uSize: { value: Vector3 };
-  uTint: { value: Vector3 };
-  /** Presence × focus × occluder fade. */
+  /** Presence × focus × occluder fade: the sharp frame's opacity. */
   uBright: { value: number };
-  uGlass: { value: number };
-  uHaze: { value: number };
-  uEdge: { value: number };
-}
-
-export function createBoxUniforms(U: RoomsUniforms, box: BoxSpec, video: Texture): BoxUniforms {
-  return {
-    uSong: U.uSong,
-    uKick: U.uKick,
-    uVideo: { value: video },
-    uCover: { value: new Vector4(1, 1, 0, 0) },
-    uLive: { value: 0 },
-    uSize: { value: new Vector3(box.w, boxHeight(box), box.d) },
-    uTint: { value: new Vector3(box.tint[0], box.tint[1], box.tint[2]) },
-    uBright: { value: 0 },
-    uGlass: { value: 0.6 },
-    uHaze: { value: 1 },
-    uEdge: { value: 0 },
-  };
-}
-
-/** A box's size, for its interior, shell and edges. The shell sits a hair outside the room. */
-export function boxGeometry(box: BoxSpec, grow = 1): BoxGeometry {
-  return new BoxGeometry(box.w * grow, boxHeight(box) * grow, box.d * grow);
+  /** Lit like Frame stack's current frame: 0 flat, 1 glowing. */
+  uGlow: { value: number };
+  /** Shared with the stack: how soft the frame's edges are. */
+  uFeather: { value: number };
+  /** The stack layer the sharp frame is at (continuous), for the ruler. */
+  uCur: { value: number };
+  /** The ruler's brightness. */
+  uRuler: { value: number };
 }
 
 /**
- * The room inside a box, seen through its open glass: the clip on the back wall, a soft
- * reflection of it on the floor and ceiling, and its outer columns streaked along the side walls.
- * Drawn from inside (back faces), so the near walls never cover the room. `glowGain` scales it in
- * the bloom twin, so only the brightest parts of a clip glow.
+ * The sharp frame: the clip itself at full resolution, lit and feathered like Frame stack's
+ * current frame, drawn with premultiplied alpha over the ghost layers behind it.
  */
-export function interiorMaterial(u: BoxUniforms, glowGain = 1): ShaderMaterial {
+export function currentFrameMaterial(u: FrameUniforms): ShaderMaterial {
   return new ShaderMaterial({
-    uniforms: { ...u, uGlowGain: { value: glowGain } },
+    uniforms: { uVideo: u.uVideo, uBright: u.uBright, uGlow: u.uGlow, uFeather: u.uFeather },
     vertexShader: /* glsl */ `
-      varying vec3 vLocal;
-      varying vec3 vN;
+      varying vec2 vUv;
       void main() {
-        vLocal = position;
-        vN = normal;
+        vUv = uv;
         gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
       }`,
     fragmentShader: /* glsl */ `
       uniform sampler2D uVideo;
-      uniform vec4 uCover;
-      uniform float uLive;
-      uniform vec3 uSize;
-      uniform vec3 uTint;
       uniform float uBright;
-      uniform float uGlowGain;
-      uniform float uSong;
-      varying vec3 vLocal;
-      varying vec3 vN;
-      vec3 clip(vec2 uv) { return texture(uVideo, clamp(uv, 0.002, 0.998) * uCover.xy + uCover.zw).rgb; }
-      vec3 soft(vec2 uv, float r) {
-        return 0.2 * (clip(uv) + clip(uv + vec2(r, 0.0)) + clip(uv - vec2(r, 0.0)) + clip(uv + vec2(0.0, r)) + clip(uv - vec2(0.0, r)));
-      }
+      uniform float uGlow;
+      uniform float uFeather;
+      varying vec2 vUv;
+      ${FEATHER}
       void main() {
-        vec3 h = 0.5 * uSize;
-        // From the back wall toward the open front, metres.
-        float dz = vLocal.z + h.z;
-        float depth01 = dz / uSize.z;
-        vec3 col;
-        if (vN.z > 0.5) {
-          // The front, seen only from inside the box.
-          col = uTint * 0.02;
-        } else if (vN.z < -0.5) {
-          vec2 uv = vLocal.xy / uSize.xy + 0.5;
-          col = clip(uv);
-          // A test card: a slow bright sweep, so it reads as a placeholder at a glance.
-          if (uLive < 0.5) col *= 0.8 + 0.4 * smoothstep(0.96, 1.0, fract(uv.y - uSong * 0.18));
-        } else if (vN.y < -0.5) {
-          vec2 uv = vec2(vLocal.x / uSize.x + 0.5, dz / uSize.y);
-          col = soft(uv, 0.015 + 0.04 * depth01) * 0.33 * exp(-2.4 * depth01) + uTint * 0.025;
-        } else if (vN.y > 0.5) {
-          vec2 uv = vec2(vLocal.x / uSize.x + 0.5, 1.0 - dz / uSize.y);
-          col = soft(uv, 0.04) * 0.16 * exp(-3.0 * depth01) + uTint * 0.02;
-        } else {
-          // Side walls: the clip's outer column, drawn out toward the front like light spilling.
-          float edge = vN.x > 0.0 ? 0.995 : 0.005;
-          vec2 uv = vec2(edge, vLocal.y / uSize.y + 0.5);
-          col = soft(uv, 0.01) * 0.3 * exp(-1.6 * depth01) + uTint * 0.025;
-        }
-        gl_FragColor = vec4(col * uBright * uGlowGain, 1.0);
+        vec3 rgb = texture(uVideo, vUv).rgb;
+        float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+        // Gentler than Frame stack's: a bright clip (a sky, a lit carriage) must not burn out face on.
+        vec3 lit = rgb * (1.0 + uGlow * 0.25) + rgb * smoothstep(0.5, 0.9, luma) * (uGlow * 0.25);
+        float a = edgeFeather(vUv, uFeather) * uBright;
+        if (a < 0.003) discard;
+        gl_FragColor = vec4(lit, a);
         #include <colorspace_fragment>
+        gl_FragColor.rgb *= gl_FragColor.a;
       }`,
-    side: BackSide,
-    blending: NoBlending,
-    depthWrite: true,
-    depthTest: true,
-    // Behind the edge lines that run along its corners.
-    polygonOffset: true,
-    polygonOffsetFactor: 1,
-    polygonOffsetUnits: 1,
-  });
-}
-
-/** The frosted glass: bright at grazing angles, misty toward the top, nearly clear head on. */
-export function glassMaterial(u: BoxUniforms): ShaderMaterial {
-  return new ShaderMaterial({
-    uniforms: u as unknown as Record<string, { value: unknown }>,
-    vertexShader: /* glsl */ `
-      varying vec3 vLocal;
-      varying vec3 vWorldN;
-      varying vec3 vView;
-      void main() {
-        vec4 wp = modelMatrix * vec4(position, 1.0);
-        vLocal = position;
-        vWorldN = normalize(mat3(modelMatrix) * normal);
-        vView = cameraPosition - wp.xyz;
-        gl_Position = projectionMatrix * viewMatrix * wp;
-      }`,
-    fragmentShader: /* glsl */ `
-      ${NOISE}
-      uniform vec3 uSize;
-      uniform vec3 uTint;
-      uniform float uBright;
-      uniform float uGlass;
-      uniform float uHaze;
-      uniform float uSong;
-      uniform float uKick;
-      varying vec3 vLocal;
-      varying vec3 vWorldN;
-      varying vec3 vView;
-      void main() {
-        float ndv = abs(dot(normalize(vWorldN), normalize(vView)));
-        float graze = max(1.0 - ndv, 0.0);
-        float fres = graze * graze * graze;
-        vec3 q = vLocal / uSize + 0.5;
-        float top = smoothstep(0.1, 1.0, q.y);
-        float mist = fbm(vec3(vLocal.xy * 2.2, vLocal.z * 2.2 + uSong * 0.08));
-        float haze = (0.025 + 0.09 * top * mist) * uHaze;
-        vec3 col = uTint * (0.45 * fres + haze) * uGlass * (1.0 + 0.6 * uKick);
-        gl_FragColor = vec4(col * uBright, 1.0);
-        #include <colorspace_fragment>
-      }`,
-    side: FrontSide,
     transparent: true,
-    blending: AdditiveBlending,
     depthWrite: false,
-    depthTest: true,
+    side: DoubleSide,
+    blending: NormalBlending,
+    premultipliedAlpha: true,
   });
 }
 
-/** The box's twelve edges, white with a little of its tint. */
-export function edgeGeometry(box: BoxSpec): EdgesGeometry {
-  const solid = boxGeometry(box, 1.004);
-  const edges = new EdgesGeometry(solid);
-  solid.dispose();
-  return edges;
+/**
+ * The time ruler under a stack, along its time axis like Frame stack's filmstrip: a baseline,
+ * a tick per frame and a longer one every sixth, lit where the sharp frame is. Stack-local:
+ * frames face +z and run from +length/2 (first) to -length/2 (last).
+ */
+export function rulerGeometry(w: number, h: number, length: number, layers: number): BufferGeometry {
+  const pos: number[] = [];
+  const layer: number[] = [];
+  const y = -h / 2 - 0.12;
+  const x = -w / 2;
+  const z0 = length / 2;
+  const step = layers > 1 ? length / (layers - 1) : 0;
+  pos.push(x, y, z0, x, y, -z0);
+  layer.push(-1, -1);
+  for (let i = 0; i < layers; i++) {
+    const z = z0 - i * step;
+    const tick = i % 6 === 0 ? 0.16 : 0.07;
+    pos.push(x, y, z, x, y - tick, z);
+    layer.push(i, i);
+  }
+  const geo = new BufferGeometry();
+  geo.setAttribute('position', new Float32BufferAttribute(pos, 3));
+  geo.setAttribute('aLayer', new Float32BufferAttribute(layer, 1));
+  return geo;
 }
 
-export function edgeMaterial(u: BoxUniforms): ShaderMaterial {
+export function rulerMaterial(u: FrameUniforms): ShaderMaterial {
   return new ShaderMaterial({
-    uniforms: u as unknown as Record<string, { value: unknown }>,
+    uniforms: { uCur: u.uCur, uRuler: u.uRuler },
     vertexShader: /* glsl */ `
-      void main() { gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }`,
-    fragmentShader: /* glsl */ `
-      uniform vec3 uTint;
-      uniform float uEdge;
+      attribute float aLayer;
+      varying float vLayer;
       void main() {
-        gl_FragColor = vec4(mix(vec3(1.0), uTint, 0.35) * uEdge, 1.0);
+        vLayer = aLayer;
+        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+      }`,
+    fragmentShader: /* glsl */ `
+      uniform float uCur;
+      uniform float uRuler;
+      varying float vLayer;
+      void main() {
+        float d = (vLayer - uCur) / 1.5;
+        float at = vLayer < 0.0 ? 0.0 : exp(-d * d);
+        gl_FragColor = vec4(vec3(0.86, 0.89, 1.0) * uRuler * (0.35 + 1.6 * at), 1.0);
         #include <colorspace_fragment>
       }`,
     transparent: true,

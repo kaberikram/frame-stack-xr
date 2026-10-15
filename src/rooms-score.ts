@@ -52,8 +52,26 @@ export const FADE_OUT: readonly [number, number] = [barTime(72), SONG_LENGTH];
 
 // ---------------------------------------------------------------- shots
 
-/** An overview preset (see `ISO` in `rooms-layout.ts`) or a box's front view by slot index. */
-export type ShotView = 'rise' | 'wide' | 'mid' | 'high' | 'low' | 'side' | 'orbit' | 'pull' | number;
+/** An overview preset: see `ISO` in `rooms-layout.ts`. */
+export type IsoView = 'rise' | 'wide' | 'mid' | 'high' | 'low' | 'side' | 'orbit' | 'pull';
+
+/**
+ * How the camera sees one room's frame stack:
+ * - `front`: face on, the clip in full at the front of its stack, the layers glowing out behind it.
+ * - `quarter` / `quarterL`: a 3/4 view from the right / left, turning slowly round the stack.
+ * - `oblique` / `obliqueL`: low and steep along the stack, gliding down its time axis.
+ * - `top`: from above, looking down the layers.
+ */
+export type Angle = 'front' | 'quarter' | 'quarterL' | 'oblique' | 'obliqueL' | 'top';
+
+export interface RoomView {
+  room: number;
+  angle: Angle;
+}
+
+export type ShotView = IsoView | RoomView;
+
+export const isRoom = (view: ShotView): view is RoomView => typeof view === 'object';
 
 export interface ShotCue {
   /** Arrival: bar, plus beats into it. A fly lands here, so it lands on the beat. */
@@ -73,68 +91,75 @@ const cut = (bar: number, view: ShotView, beat = 0, flash = 0.18): ShotCue => ({
 const everyBeat = (bar: number, views: readonly ShotView[]): ShotCue[] => views.map((v, i) => cut(bar, v, i));
 /** One cut every two beats of `bar`. */
 const halfBars = (bar: number, a: ShotView, b: ShotView): ShotCue[] => [cut(bar, a), cut(bar, b, 2)];
+const front = (room: number): RoomView => ({ room, angle: 'front' });
+const q = (room: number): RoomView => ({ room, angle: 'quarter' });
+const ql = (room: number): RoomView => ({ room, angle: 'quarterL' });
+const ob = (room: number): RoomView => ({ room, angle: 'oblique' });
+const obl = (room: number): RoomView => ({ room, angle: 'obliqueL' });
+const top = (room: number): RoomView => ({ room, angle: 'top' });
 
 /**
- * The edit. Room slots (one per clip): 0 car park, 1 hallway, 2 dark room, 3 rooftop (top of the
- * stack), 4 train (bottom). Reorder freely: each cue lands on its own bar, so changing one never
- * shifts the rest. No room cuts straight back to itself.
+ * The edit. Rooms (one per clip): 0 car park, 1 hallway, 2 dark room, 3 rooftop (top of the
+ * stack), 4 train (bottom). `front(r)` shows the clip in full; `q`/`ql`, `ob`/`obl` and `top` show
+ * its stack of frames from the side, below and above. Reorder freely: each cue lands on its own
+ * bar, so changing one never shifts the rest.
  */
 export const SHOTS: readonly ShotCue[] = [
-  // Intro: high above the stack, craning down as the rooms appear.
+  // Intro: high above the stack, craning down as the rooms build up frame by frame.
   cut(0, 'rise', 0, 0),
   fly(2, 'wide', 6),
-  // Verse: eased flights between the overview and single rooms, every two bars.
-  fly(4, 0, 3),
-  fly(6, 'high', 2),
-  fly(8, 1, 2),
-  fly(10, 2, 3),
-  fly(12, 'low', 3),
-  fly(14, 3, 3),
-  fly(16, 4, 3), // and a slow push into it across the build
+  // Verse: eased flights every two bars, round a stack and then face on to see the memory in full.
+  fly(4, q(0), 3),
+  fly(6, front(0), 2),
+  fly(8, 'high', 2),
+  fly(10, ob(1), 3),
+  fly(12, front(1), 2),
+  fly(14, ql(2), 3),
+  fly(16, front(4), 3), // and a slow push into it across the build
   // Drop 1: hard cuts, one a bar, then one a beat.
   cut(18, 'wide', 0, 1),
-  cut(19, 3),
-  cut(20, 1),
+  cut(19, front(3)),
+  cut(20, q(1)),
   cut(21, 'high'),
-  cut(22, 4),
-  cut(23, 0),
-  cut(24, 2),
+  cut(22, front(4)),
+  cut(23, ob(0)),
+  cut(24, front(2)),
   cut(25, 'low'),
-  cut(26, 3),
-  cut(27, 1),
-  cut(28, 0),
+  cut(26, ql(3)),
+  cut(27, front(1)),
+  cut(28, top(4)),
   cut(29, 'side'),
-  cut(30, 4),
-  cut(31, 2),
-  ...everyBeat(32, [3, 0, 1, 4]),
-  ...halfBars(33, 'wide', 2),
+  cut(30, front(0)),
+  cut(31, q(2)),
+  ...everyBeat(32, [front(3), front(1), front(4), front(0)]),
+  ...halfBars(33, 'wide', top(2)),
   // Break: back to flights, with the overview turning slowly around the stack.
   cut(34, 'orbit', 0, 0.35),
-  fly(36, 1, 3),
-  fly(38, 4, 3),
-  fly(40, 'orbit', 3),
-  fly(42, 2, 2),
-  fly(44, 0, 3),
+  fly(36, q(1), 3),
+  fly(38, front(1), 2),
+  fly(40, obl(4), 3),
+  fly(42, front(3), 2),
+  fly(44, ql(0), 3),
   fly(46, 'mid', 2),
-  fly(48, 3, 2), // pushing in across the build
+  fly(48, front(2), 2), // pushing in across the build
   // Drop 2: cuts every bar, then every two beats, then every beat.
   cut(50, 'wide', 0, 1),
-  cut(51, 4),
-  cut(52, 0),
+  cut(51, front(4)),
+  cut(52, q(0)),
   cut(53, 'low'),
-  cut(54, 1),
-  cut(55, 3),
-  cut(56, 2),
+  cut(54, front(1)),
+  cut(55, top(3)),
+  cut(56, front(2)),
   cut(57, 'high'),
-  ...halfBars(58, 4, 0),
-  ...halfBars(59, 1, 3),
-  ...halfBars(60, 'side', 2),
-  ...halfBars(61, 4, 1),
-  ...halfBars(62, 0, 'wide'),
-  ...halfBars(63, 3, 2),
-  ...everyBeat(64, [4, 0, 1, 3]),
-  ...everyBeat(65, [2, 4, 0, 1]),
-  // Outro: the wide view, then one long pull back and up while the rooms go out.
+  ...halfBars(58, ob(4), front(0)),
+  ...halfBars(59, q(1), front(3)),
+  ...halfBars(60, 'side', front(2)),
+  ...halfBars(61, ql(4), front(1)),
+  ...halfBars(62, front(0), 'wide'),
+  ...halfBars(63, q(3), front(2)),
+  ...everyBeat(64, [front(4), front(0), front(1), front(3)]),
+  ...everyBeat(65, [q(2), front(4), obl(0), front(1)]),
+  // Outro: the wide view, then one long pull back and up while the rooms come apart.
   cut(66, 'wide', 0, 0.5),
   fly(74, 'pull', 30),
 ];
@@ -256,19 +281,23 @@ export function fadeAt(s: number): number {
 /** Beats between one room appearing and the next, through the intro. */
 const REVEAL_STEP = 1.4;
 
+/** Beats a room takes to build up, frame by frame. */
+const BUILD = 1.6;
+
 /**
- * 0..1 how present the room ranked `index` from the top is: they appear one after another
- * through the intro, top first, and go out one a bar through the outro, top first.
+ * 0..1 how present the room ranked `index` from the top is: they build up one after another
+ * through the intro, top first, and come apart one a bar through the outro, top first. The
+ * system shows this share of the stack's frames, so 0.5 is its first half.
  */
 export function presenceAt(s: number, index: number): number {
   const inAt = barTime(0, 0.5 + index * REVEAL_STEP);
   const outAt = barTime(67 + index);
-  const fadeIn = smooth(clamp01((s - inAt) / (0.8 * BEAT)));
+  const fadeIn = smooth(clamp01((s - inAt) / (BUILD * BEAT)));
   const fadeOut = smooth(clamp01((s - outAt) / BAR));
   return fadeIn * (1 - fadeOut);
 }
 
-/** 0..1 for a room's edges flaring as it appears. */
+/** 0..1 for a room's glow flaring as it starts to build. */
 export function arrivalFlareAt(s: number, index: number): number {
   const since = s - barTime(0, 0.5 + index * REVEAL_STEP);
   return since < 0 ? 0 : Math.exp(-since / 0.35);

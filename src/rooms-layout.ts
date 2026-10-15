@@ -1,7 +1,8 @@
 /**
- * Rooms' composition: the frame (a grid floor, two grid walls and a vault arch), the five glass
- * rooms stacked inside it, and the overview camera presets. Pure data in root-local metres: +y up,
- * the floor centred on the origin, every room's front facing roughly +z.
+ * Rooms' composition: the frame (a grid floor, two grid walls and a vault arch), the five rooms
+ * floating inside it (each a stack of its clip's frames), and the overview camera presets. Pure
+ * data in root-local metres: +y up, the floor centred on the origin, every stack's first frame
+ * facing roughly +z with time running away from it.
  *
  * Positions are written as `at(u, y, v)`: `u` runs left to right and `v` toward the viewer as
  * seen from the default overview (looking at the walls' corner from 45°), so the stack can be
@@ -26,21 +27,21 @@ export interface BoxSpec {
   name: string;
   /** Centre, root-local metres. */
   pos: readonly [number, number, number];
-  /** Front width, metres. */
+  /** Frame width, metres. */
   w: number;
-  /** Front width over height: its clip's own shape, so the clip fills the back wall uncropped. */
+  /** Frame width over height: its clip's own shape, so the frames show it uncropped. */
   aspect: number;
-  /** Depth front to back, metres. */
+  /** The stack's length along its time axis, first frame to last, metres. */
   d: number;
   /** Where the front faces, degrees from +z toward +x. */
   yaw: number;
-  /** Glass tint, linear RGB. */
+  /** The test card's tint, linear RGB, for a room without its clip. */
   tint: readonly [number, number, number];
   /** Rank from the top of the stack: rooms appear and leave in this order. */
   order: number;
 }
 
-/** Front height, metres. */
+/** Frame height, metres. */
 export const boxHeight = (box: BoxSpec): number => box.w / box.aspect;
 
 const PINK = [1, 0.62, 0.78] as const;
@@ -51,11 +52,11 @@ const VIOLET = [0.9, 0.5, 1] as const;
 
 /** One room per clip, each the shape of its clip (`scripts/rooms/prep_clips.sh --keep-aspect`). */
 export const BOXES: readonly BoxSpec[] = [
-  { slot: 0, name: 'car park', pos: at(-2.2, 6.2, 0.4), w: 4.0, aspect: 16 / 9, d: 2.8, yaw: 10, tint: LILAC, order: 1 },
-  { slot: 1, name: 'hallway', pos: at(2.4, 5.0, -0.9), w: 3.0, aspect: 448 / 352, d: 2.2, yaw: 18, tint: WARM, order: 2 },
-  { slot: 2, name: 'dark room', pos: at(-1.8, 2.9, 1.1), w: 2.9, aspect: 592 / 480, d: 2.1, yaw: 12, tint: PINK, order: 3 },
-  { slot: 3, name: 'rooftop', pos: at(0.8, 8.45, -0.6), w: 3.8, aspect: 16 / 9, d: 2.7, yaw: 14, tint: ICE, order: 0 },
-  { slot: 4, name: 'train', pos: at(2.2, 1.5, 1.3), w: 3.1, aspect: 576 / 480, d: 2.2, yaw: 16, tint: VIOLET, order: 4 },
+  { slot: 0, name: 'car park', pos: at(-2.2, 6.05, 0.4), w: 4.0, aspect: 16 / 9, d: 3.3, yaw: 10, tint: LILAC, order: 1 },
+  { slot: 1, name: 'hallway', pos: at(2.4, 5.0, -0.9), w: 3.0, aspect: 448 / 352, d: 2.8, yaw: 18, tint: WARM, order: 2 },
+  { slot: 2, name: 'dark room', pos: at(-1.8, 2.9, 1.1), w: 2.9, aspect: 592 / 480, d: 2.7, yaw: 12, tint: PINK, order: 3 },
+  { slot: 3, name: 'rooftop', pos: at(0.8, 8.6, -0.6), w: 3.8, aspect: 16 / 9, d: 3.2, yaw: 14, tint: ICE, order: 0 },
+  { slot: 4, name: 'train', pos: at(2.2, 1.5, 1.3), w: 3.1, aspect: 576 / 480, d: 2.8, yaw: 16, tint: VIOLET, order: 4 },
 ];
 
 export interface IsoPreset {
@@ -84,7 +85,5 @@ export const ISO: Record<'rise' | 'wide' | 'mid' | 'high' | 'low' | 'side' | 'or
   pull: { target: [0, 8, 0], az: 45, el: 30, fitH: 30, fitW: 22, fov: 24, spin: 0.6 },
 };
 
-/** Field of view for a box's front view, degrees. */
-export const FRONT_FOV = 26;
-/** Share of the frame the framed plane fills in a front view. */
-export const FRONT_FILL = 0.92;
+/** Field of view for a close-up of one room, degrees. */
+export const ROOM_FOV = 30;

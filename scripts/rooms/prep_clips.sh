@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Turns clips into Rooms' box loops: public/rooms/videos/01.mp4, 02.mp4, … in the order given.
+# Turns clips into Rooms' loops: public/rooms/videos/01.mp4, 02.mp4, … in the order given, each
+# with its frame stack baked beside it (01-frames.jpg, by scripts/rooms/bake_frames.sh).
 # Each one is centre-cropped to 16:9 (or kept at its own shape with --keep-aspect), scaled,
 # stripped of sound and encoded as H.264 for the web, with a keyframe every second. --loop-fade
 # crossfades the end into the start so the loop has no seam (the clip comes out that much shorter).
@@ -35,12 +36,12 @@ while [[ $# -gt 0 ]]; do
     --height) height="$2"; shift 2 ;;
     --keep-aspect) own_shape=yes; shift ;;
     --out) out="$2"; shift 2 ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,19p' "$0"; exit 0 ;;
     *) clips+=("$1"); shift ;;
   esac
 done
 if [[ ${#clips[@]} -eq 0 ]]; then
-  sed -n '2,18p' "$0"
+  sed -n '2,19p' "$0"
   exit 1
 fi
 
@@ -79,5 +80,6 @@ for clip in "${clips[@]}"; do
   size=$(du -h "$out/$name" | cut -f1)
   dims=$(ffprobe -v error -select_streams v:0 -show_entries stream=width,height -of csv=s=x:p=0 "$out/$name")
   echo "$out/$name  ${dims}  from $clip  ($size)"
+  "$(dirname "$0")/bake_frames.sh" "$out/$name"
   slot=$((slot + 1))
 done

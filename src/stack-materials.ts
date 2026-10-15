@@ -15,7 +15,7 @@ import {
 import { UNIT } from './layout.js';
 
 // Soft rectangular mask: each side dissolves independently so corners go first, like a dream vignette.
-const FEATHER = /* glsl */ `
+export const FEATHER = /* glsl */ `
 float edgeFeather(vec2 u, float w) {
   if (w <= 1e-4) return 1.0;
   float fx = smoothstep(0.0, w, min(u.x, 1.0 - u.x));

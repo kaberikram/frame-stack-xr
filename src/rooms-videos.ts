@@ -1,10 +1,18 @@
 /**
- * Rooms' clips: one muted, looping, inline video per box from `public/rooms/videos/NN.mp4`.
- * A slot with no clip (or one that won't decode) shows a numbered test card instead, so the
- * piece plays in full before any footage exists.
+ * Rooms' clips: per room, one muted, looping, inline video from `public/rooms/videos/NN.mp4`
+ * (the sharp frame that travels through the stack) and its baked frame sheet `NN-frames.jpg`,
+ * cut into the stack's layers. A slot with no clip shows a numbered test card in every layer,
+ * so the piece plays in full before any footage exists.
  */
-import { CanvasTexture, SRGBColorSpace, VideoTexture, type Texture } from '@iwsdk/core';
-import { videoName, videoUrl } from './rooms-assets.js';
+import {
+  CanvasTexture,
+  DataArrayTexture,
+  LinearFilter,
+  SRGBColorSpace,
+  VideoTexture,
+  type Texture,
+} from '@iwsdk/core';
+import { LAYERS, SHEET_COLS, framesUrl, videoName, videoUrl } from './rooms-assets.js';
 import type { BoxSpec } from './rooms-layout.js';
 
 export interface VideoSlot {
@@ -18,29 +26,55 @@ export interface VideoSlot {
   aspect: number;
   /** The room's own shape, shown until a clip says otherwise. */
   readonly roomAspect: number;
+  /** The stack: LAYERS frames, one per layer, rows stored top-down. The card until the sheet lands. */
+  readonly frames: DataArrayTexture;
+  /** Per layer: the frame's mean linear colour, three floats each, for its glow. */
+  readonly means: Float32Array;
+  /** The frame sheet has landed in `frames`. */
+  stacked: boolean;
 }
 
 /** A frozen frame is re-seeked only when it is further off than this, seconds. */
 const HOLD_SLOP = 0.04;
+/** Width of each stack layer, pixels; the height follows the room's shape. */
+const LAYER_W = 256;
+/** A slot without a clip cycles its card's stack over this many seconds. */
+const CARD_LOOP = 6;
+
+const LINEAR = Float32Array.from({ length: 256 }, (_, i) => {
+  const c = i / 255;
+  return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+});
 
 export class RoomsVideos {
-  /** Called when a slot's clip starts to show, so its material can switch textures. */
+  /** Called when a slot's clip or frame sheet starts to show, so its materials can follow. */
   onChange: ((slot: VideoSlot) => void) | null = null;
   readonly slots: VideoSlot[];
   private loading = false;
+  private sheetsLoading = false;
   private playing = false;
   private readonly cleanups: Array<() => void> = [];
+  private readonly sheetCleanups: Array<() => void> = [];
 
   constructor(boxes: readonly BoxSpec[]) {
-    this.slots = boxes.map((box) => ({
-      slot: box.slot,
-      card: testCard(box),
-      video: null,
-      texture: null,
-      live: false,
-      aspect: box.aspect,
-      roomAspect: box.aspect,
-    }));
+    this.slots = boxes.map((box) => {
+      const card = testCard(box);
+      const frames = layerTexture(box.aspect);
+      const means = new Float32Array(LAYERS * 3);
+      fillWithCard(frames, means, card.image as HTMLCanvasElement);
+      return {
+        slot: box.slot,
+        card,
+        video: null,
+        texture: null,
+        live: false,
+        aspect: box.aspect,
+        roomAspect: box.aspect,
+        frames,
+        means,
+        stacked: false,
+      };
+    });
   }
 
   get liveCount(): number {
@@ -49,12 +83,32 @@ export class RoomsVideos {
     return n;
   }
 
+  get stackedCount(): number {
+    let n = 0;
+    for (const s of this.slots) if (s.stacked) n++;
+    return n;
+  }
+
   texture(slot: VideoSlot): Texture {
     return slot.live && slot.texture ? slot.texture : slot.card;
   }
 
-  /** Start fetching every slot's clip. Once is enough. */
+  /**
+   * 0..1 through the slot's loop: where the sharp frame sits in its stack. The clip's own time
+   * while it plays; without a clip, the song second `s` cycles the card.
+   */
+  phase(slot: VideoSlot, s: number): number {
+    const v = slot.video;
+    if (slot.live && v && v.duration > 0) return Math.min(0.9999, Math.max(0, v.currentTime / v.duration));
+    return (s / CARD_LOOP) % 1;
+  }
+
+  /** Start fetching every slot's clip and frame sheet. Sheets stay once loaded; clips reopen after `unload`. */
   load(): void {
+    if (!this.sheetsLoading) {
+      this.sheetsLoading = true;
+      for (const slot of this.slots) this.openSheet(slot);
+    }
     if (this.loading) return;
     this.loading = true;
     for (const slot of this.slots) this.open(slot);
@@ -87,7 +141,7 @@ export class RoomsVideos {
     }
   }
 
-  /** Let go of every clip and its decoder; the cards show until `load` opens them again. */
+  /** Let go of every clip and its decoder. The stacks keep their frames; `load` opens the clips again. */
   unload(): void {
     for (const cleanup of this.cleanups) cleanup();
     this.cleanups.length = 0;
@@ -110,7 +164,12 @@ export class RoomsVideos {
 
   dispose(): void {
     this.unload();
-    for (const slot of this.slots) slot.card.dispose();
+    for (const cleanup of this.sheetCleanups) cleanup();
+    this.sheetCleanups.length = 0;
+    for (const slot of this.slots) {
+      slot.card.dispose();
+      slot.frames.dispose();
+    }
   }
 
   // ----------------------------------------------------------------
@@ -147,12 +206,100 @@ export class RoomsVideos {
     });
     v.src = videoUrl(slot.slot);
   }
+
+  /** Cut the slot's frame sheet into its stack's layers once it lands. */
+  private openSheet(slot: VideoSlot): void {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.decoding = 'async';
+    let gone = false;
+    const onLoad = () => {
+      if (gone || !(img.naturalWidth > 0)) return;
+      fillFromSheet(slot.frames, slot.means, img);
+      slot.stacked = true;
+      console.info(`[rooms] slot ${videoName(slot.slot)} stack of ${LAYERS} frames`);
+      this.onChange?.(slot);
+    };
+    const onError = () => {
+      if (!gone) console.info(`[rooms] slot ${videoName(slot.slot)}: no frame sheet, its stack shows the card`);
+    };
+    img.addEventListener('load', onLoad);
+    img.addEventListener('error', onError);
+    this.sheetCleanups.push(() => {
+      gone = true;
+      img.removeEventListener('load', onLoad);
+      img.removeEventListener('error', onError);
+    });
+    img.src = framesUrl(slot.slot);
+  }
+}
+
+/** An empty LAYERS-deep stack at the room's shape. */
+function layerTexture(aspect: number): DataArrayTexture {
+  const w = LAYER_W;
+  const h = Math.max(2, Math.round(LAYER_W / Math.max(0.2, aspect) / 2) * 2);
+  const tex = new DataArrayTexture(new Uint8Array(w * h * 4 * LAYERS), w, h, LAYERS);
+  tex.colorSpace = SRGBColorSpace;
+  tex.minFilter = LinearFilter;
+  tex.magFilter = LinearFilter;
+  tex.generateMipmaps = false;
+  tex.needsUpdate = true;
+  return tex;
+}
+
+/** Paint every layer with `draw`, keep the pixels in the texture's data, and record each layer's mean colour. */
+function paintLayers(
+  tex: DataArrayTexture,
+  means: Float32Array,
+  draw: (ctx: CanvasRenderingContext2D, i: number, w: number, h: number) => void,
+): void {
+  const { width: w, height: h } = tex.image;
+  const data = tex.image.data as Uint8Array;
+  const canvas = document.createElement('canvas');
+  canvas.width = w;
+  canvas.height = h;
+  const ctx = canvas.getContext('2d', { willReadFrequently: true });
+  if (!ctx) return;
+  for (let i = 0; i < LAYERS; i++) {
+    ctx.clearRect(0, 0, w, h);
+    draw(ctx, i, w, h);
+    const px = ctx.getImageData(0, 0, w, h).data;
+    data.set(px, i * w * h * 4);
+    let r = 0;
+    let g = 0;
+    let b = 0;
+    let n = 0;
+    for (let p = 0; p < px.length; p += 4 * 17) {
+      r += LINEAR[px[p]];
+      g += LINEAR[px[p + 1]];
+      b += LINEAR[px[p + 2]];
+      n++;
+    }
+    means[i * 3] = r / n;
+    means[i * 3 + 1] = g / n;
+    means[i * 3 + 2] = b / n;
+  }
+  tex.needsUpdate = true;
+}
+
+function fillWithCard(tex: DataArrayTexture, means: Float32Array, card: HTMLCanvasElement): void {
+  paintLayers(tex, means, (ctx, _i, w, h) => ctx.drawImage(card, 0, 0, w, h));
+}
+
+/** The sheet holds LAYERS frames SHEET_COLS across, top-left first (`bake_frames.sh`). */
+function fillFromSheet(tex: DataArrayTexture, means: Float32Array, sheet: HTMLImageElement): void {
+  const rows = Math.ceil(LAYERS / SHEET_COLS);
+  const tw = sheet.naturalWidth / SHEET_COLS;
+  const th = sheet.naturalHeight / rows;
+  paintLayers(tex, means, (ctx, i, w, h) => {
+    ctx.drawImage(sheet, (i % SHEET_COLS) * tw, Math.floor(i / SHEET_COLS) * th, tw, th, 0, 0, w, h);
+  });
 }
 
 /** A numbered card for an empty slot: colour bars, the room's name, and the file it wants. */
 function testCard(box: BoxSpec): CanvasTexture {
   const w = 640;
-  // The room's own shape, so the card fills its back wall unstretched.
+  // The room's own shape, so the card fills its frame unstretched.
   const h = Math.round(w / box.aspect);
   const canvas = document.createElement('canvas');
   canvas.width = w;
@@ -182,9 +329,6 @@ function testCard(box: BoxSpec): CanvasTexture {
     ctx.fillStyle = 'rgba(255,255,255,0.55)';
     ctx.font = '400 20px ui-monospace, monospace';
     ctx.fillText(`add public/rooms/videos/${videoName(box.slot)}`, 40, h - 30);
-    ctx.strokeStyle = 'rgba(255,255,255,0.35)';
-    ctx.lineWidth = 2;
-    ctx.strokeRect(1, 1, w - 2, h - 2);
   }
   const tex = new CanvasTexture(canvas);
   tex.colorSpace = SRGBColorSpace;
