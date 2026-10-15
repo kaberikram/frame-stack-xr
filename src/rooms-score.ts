@@ -116,7 +116,7 @@ export const SHOTS: readonly ShotCue[] = [
   fly(12, front(1), 2),
   fly(14, ql(2), 3),
   fly(16, front(4), 3), // and a slow push into it across the build
-  // Drop 1: hard cuts, one a bar, then one a beat.
+  // Drop 1: a short glide every bar, then every beat. Each lands on the beat.
   cut(18, 'wide', 0, 1),
   cut(19, front(3)),
   cut(20, q(1)),
@@ -142,7 +142,7 @@ export const SHOTS: readonly ShotCue[] = [
   fly(44, ql(0), 3),
   fly(46, 'mid', 2),
   fly(48, front(2), 2), // pushing in across the build
-  // Drop 2: cuts every bar, then every two beats, then every beat.
+  // Drop 2: glides every bar, then every two beats, then every beat.
   cut(50, 'wide', 0, 1),
   cut(51, front(4)),
   cut(52, q(0)),
@@ -182,18 +182,32 @@ export function sectionAt(s: number): Section {
   return found;
 }
 
-/** The cues on the clock, checked in order. A fly that would start before its previous shot lands is shortened. */
+/** Longest glide that replaces a cut, in beats. About 0.8 s at this tempo. */
+const GLIDE_BEATS = 1.5;
+/** A glide never takes more of the gap than this, so the angle just landed stays readable. */
+const GLIDE_SHARE = 2 / 3;
+
+/** The cues on the clock, checked in order. A fly that would start before its previous shot lands is shortened. A cut after the opening becomes a short glide and does not flash. */
 export const SHOT_TIMES: readonly ShotTiming[] = (() => {
   const out: ShotTiming[] = [];
   for (const cue of SHOTS) {
     const at = barTime(cue.bar, cue.beat ?? 0);
     const prev = out.length > 0 ? out[out.length - 1].at : -Infinity;
+    let move = cue.move;
+    let flash = cue.flash ?? 0;
     let start = cue.move === 'fly' ? at - (cue.beats ?? 2) * BEAT : at;
+    if (cue.move === 'cut' && out.length > 0) {
+      const gap = at - prev;
+      const glide = Math.min(GLIDE_BEATS * BEAT, Math.max(0, gap) * GLIDE_SHARE);
+      start = at - glide;
+      move = 'fly';
+      flash = 0;
+    }
     if (start < prev) {
       if (typeof console !== 'undefined') console.warn(`[rooms] shot at bar ${cue.bar} starts before the previous one lands; shortened`);
       start = prev;
     }
-    out.push({ view: cue.view, move: cue.move, start, at, flash: cue.flash ?? 0, kind: sectionAt(at).kind });
+    out.push({ view: cue.view, move, start, at, flash, kind: sectionAt(at).kind });
   }
   return out;
 })();

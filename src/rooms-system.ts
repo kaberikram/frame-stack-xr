@@ -21,6 +21,7 @@ import {
   type RoomsUniforms,
 } from './rooms-build.js';
 import { RoomsCamera, createPose, segmentHitsBox } from './rooms-camera.js';
+import { RoomsLens, ROOMS_LENS_APERTURE } from './rooms-lens.js';
 import { RoomsLook } from './rooms-component.js';
 import { BOXES, WALL, boxHeight, type BoxSpec } from './rooms-layout.js';
 import {
@@ -64,6 +65,8 @@ const PARAMS = typeof location === 'undefined' ? new URLSearchParams() : new URL
 const MUSIC_OFF = PARAMS.get('music') === '0';
 /** `?bloom=0` turns the glow off. */
 const BLOOM_OFF = PARAMS.get('bloom') === '0';
+/** `?lens=0` shows the raw picture, without the focus or the LED grid. */
+const LENS_OFF = PARAMS.get('lens') === '0';
 
 /** `?roomsT=<song seconds>` freezes the piece there, for repeatable captures. */
 function frozenFromUrl(): number | null {
@@ -128,7 +131,7 @@ function viewName(view: ShotView): string {
  * Rooms: five clips floating inside a grid frame, each as a frame stack like Frame
  * stack's: its frames as feathered ghost layers along a time axis, the clip itself travelling
  * through them sharp and lit. The camera follows the shot list in
- * `rooms-score.ts`: eased flights in the verses, hard cuts on the beat in the drops, face on to see
+ * `rooms-score.ts`: eased flights in the verses, short glides on the beat in the drops, face on to see
  * a clip in full or round its stack. Everything is a function of the song second, so any moment
  * can be frozen and captured. Desktop only.
  */
@@ -141,6 +144,8 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
   private readonly drawOrder: number[] = BOXES.map((_, i) => i);
   private bloom!: SorangBloom;
   private bloomOn = !BLOOM_OFF;
+  private lens!: RoomsLens;
+  private readonly lensOn = !LENS_OFF;
   private bloomSwaps: BloomSwap[] = [];
   private twins: Material[] = [];
   private music!: SorangMusic;
@@ -224,6 +229,8 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     this.bloom = new SorangBloom(this.renderer, 'rooms');
     this.bloom.composite.name = 'rooms-bloom';
     this.root.add(this.bloom.composite);
+    this.lens = new RoomsLens(this.renderer);
+    this.root.add(this.lens.quad);
 
     this.music = new SorangMusic(MUSIC_URL, MUSIC_OFF, 'rooms');
     this.music.duration = SONG_LENGTH;
@@ -355,6 +362,8 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     this.videos.unload();
     for (const rig of this.rooms) this.useClip(rig);
     this.bloom.hide();
+    this.lens.hide();
+    this.setSceneVisible(true);
     this.toPreroll(true);
     this.downId = -1;
     this.releaseCamera();
@@ -537,13 +546,51 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     }
     this.sortStacks();
 
-    // The glow: everything glows a little, and it swells on the drops and the cuts.
-    if (!this.bloomOn || look.bloom <= 0 || frameShow <= 0) {
+    // The glow, then the lens. The lens captures the stacks and shows that picture instead,
+    // so the raw geometry is hidden while the quad (and the glow on top of it) remain.
+    this.setSceneVisible(true);
+    this.lens.quad.visible = false;
+    const glow = this.bloomOn && look.bloom > 0 && frameShow > 0;
+    if (glow) {
+      const strength = look.bloom * (0.55 + 0.45 * energy + 0.4 * flash) * Math.max(frameShow, 0.2);
+      this.bloom.render(this.root, cam, NOTHING_HIDDEN, this.bloomSwaps, U.uViewportH, strength, look.bloomThreshold);
+    } else {
       this.bloom.hide();
-      return;
     }
-    const strength = look.bloom * (0.55 + 0.45 * energy + 0.4 * flash) * Math.max(frameShow, 0.2);
-    this.bloom.render(this.root, cam, NOTHING_HIDDEN, this.bloomSwaps, U.uViewportH, strength, look.bloomThreshold);
+    if (!this.lensOn) return;
+    const glowQuad = this.bloom.composite;
+    const glowShown = glowQuad.visible;
+    glowQuad.visible = false;
+    // The stacks and the grid are drawn without depth, so the capture asks them to write it
+    // for this one pass. The live picture is unchanged.
+    this.setDepthWrite(true);
+    let captured = false;
+    try {
+      captured = this.lens.capture(this.root, cam);
+    } finally {
+      this.setDepthWrite(false);
+      glowQuad.visible = glowShown;
+    }
+    if (!captured) return;
+    this.lens.present(pose.dist, ROOMS_LENS_APERTURE * (reduced ? 0.5 : 1), Math.floor(s * 30), cam.near, cam.far);
+    this.setSceneVisible(false);
+    this.lens.quad.visible = true;
+  }
+
+  /** The stacks and the grid. The lens quad and the glow are separate. */
+  private setSceneVisible(on: boolean): void {
+    this.frame.visible = on;
+    for (const rig of this.rooms) rig.group.visible = on;
+  }
+
+  /** Depth for the lens capture only. These materials leave it off the rest of the time. */
+  private setDepthWrite(on: boolean): void {
+    (this.frame.material as Material).depthWrite = on;
+    for (const rig of this.rooms) {
+      (rig.ghosts.material as Material).depthWrite = on;
+      (rig.current.material as Material).depthWrite = on;
+      (rig.halo.material as Material).depthWrite = on;
+    }
   }
 
   // ---------------------------------------------------------------- input
@@ -833,10 +880,12 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     this.root.removeFromParent();
     this.root.traverse((object) => {
       const mesh = object as Mesh;
-      if (mesh.geometry && mesh !== this.bloom.composite) mesh.geometry.dispose();
-      if (mesh.material && mesh !== this.bloom.composite) (mesh.material as Material).dispose();
+      if (mesh === this.bloom.composite || mesh === this.lens.quad) return;
+      if (mesh.geometry) mesh.geometry.dispose();
+      if (mesh.material) (mesh.material as Material).dispose();
     });
     for (const twin of this.twins) twin.dispose();
+    this.lens.dispose();
     this.bloom.dispose();
     this.music.dispose();
     this.videos.dispose();
