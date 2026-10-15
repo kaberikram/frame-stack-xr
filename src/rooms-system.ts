@@ -190,6 +190,10 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
   private readonly eyeW = new Vector3();
   private readonly targetW = new Vector3();
   private readonly tmp = new Vector3();
+  /** World up, and the same axis rolled around the view for the dutch angle. */
+  private readonly worldUp = new Vector3(0, 1, 0);
+  private readonly viewAxis = new Vector3();
+  private readonly rolledUp = new Vector3();
   private readonly bufSize = new Vector2();
   private statusNow: RoomsStatus = { text: 'Building the rooms', busy: true };
   private readonly listeners = new Set<() => void>();
@@ -356,8 +360,32 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     this.releaseCamera();
   }
 
-  /** The lens back as it was. Safe to call twice. */
+  /** Tip world up around the view axis, then lookAt reads it. `roll` of 0 stays level. */
+  private rollUp(roll: number): void {
+    if (roll === 0) {
+      this.camera.up.copy(this.worldUp);
+      return;
+    }
+    this.viewAxis.subVectors(this.targetW, this.eyeW);
+    const len = this.viewAxis.length();
+    if (len < 1e-6) {
+      this.camera.up.copy(this.worldUp);
+      return;
+    }
+    this.viewAxis.multiplyScalar(1 / len);
+    const c = Math.cos(roll);
+    const s = Math.sin(roll);
+    const along = this.viewAxis.dot(this.worldUp);
+    this.rolledUp.crossVectors(this.viewAxis, this.worldUp);
+    this.rolledUp.multiplyScalar(s);
+    this.rolledUp.addScaledVector(this.worldUp, c);
+    this.rolledUp.addScaledVector(this.viewAxis, along * (1 - c));
+    this.camera.up.copy(this.rolledUp);
+  }
+
+  /** The lens back as it was, including a level horizon. Safe to call twice. */
   private releaseCamera(): void {
+    this.camera.up.copy(this.worldUp);
     const lens = this.savedLens;
     if (!lens) return;
     this.savedLens = null;
@@ -426,7 +454,7 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
 
     // The camera, root-local, then into the world.
     const cam = this.camera;
-    this.cam.evaluate(s, cam.aspect || 1, reduced ? 0 : kick, this.pose);
+    this.cam.evaluate(s, cam.aspect || 1, reduced ? 0 : kick, reduced ? 0.5 : 1, this.pose);
     const pose = this.pose;
     if (this.frozen === null) {
       const k = 1 - Math.exp(-3 * dt);
@@ -448,6 +476,7 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
       cam.parent.worldToLocal(this.tmp);
     }
     cam.position.copy(this.tmp);
+    this.rollUp(pose.roll);
     cam.lookAt(this.targetW);
     // Far enough for the outro's long pull, however tall the window.
     const far = Math.max(this.savedLens?.far ?? cam.far, pose.dist + 30);

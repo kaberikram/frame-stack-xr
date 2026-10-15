@@ -86,7 +86,7 @@ export interface ShotCue {
 }
 
 const fly = (bar: number, view: ShotView, beats = 2, beat = 0): ShotCue => ({ bar, beat, view, move: 'fly', beats });
-const cut = (bar: number, view: ShotView, beat = 0, flash = 0.18): ShotCue => ({ bar, beat, view, move: 'cut', flash });
+const cut = (bar: number, view: ShotView, beat = 0, flash = 0.45): ShotCue => ({ bar, beat, view, move: 'cut', flash });
 /** One cut per beat of `bar`, through `views`. */
 const everyBeat = (bar: number, views: readonly ShotView[]): ShotCue[] => views.map((v, i) => cut(bar, v, i));
 /** One cut every two beats of `bar`. */

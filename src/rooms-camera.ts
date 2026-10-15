@@ -1,8 +1,8 @@
 /**
  * Rooms' camera: turns the shot list into a pose at any song second. A pose orbits a target
- * (azimuth, elevation, distance, field of view), so a fly between two shots interpolates those
- * and swoops around the stack instead of cutting straight through it. Every vector is allocated
- * up front; `evaluate` allocates nothing.
+ * (azimuth, elevation, roll, distance, field of view), so a fly between two shots interpolates
+ * those and swoops around the stack instead of cutting straight through it. Every vector is
+ * allocated up front; `evaluate` allocates nothing.
  */
 import { Vector3 } from '@iwsdk/core';
 import { BOXES, ISO, ROOM_FOV, boxHeight, type BoxSpec } from './rooms-layout.js';
@@ -16,18 +16,44 @@ export interface Pose {
   /** Radians from +z toward +x. */
   az: number;
   el: number;
+  /** Radians of dutch angle around the view axis. */
+  roll: number;
   dist: number;
   /** Degrees, vertical. */
   fov: number;
 }
 
 export function createPose(): Pose {
-  return { target: new Vector3(), az: 0, el: 0, dist: 10, fov: 24 };
+  return { target: new Vector3(), az: 0, el: 0, roll: 0, dist: 10, fov: 24 };
 }
 
 const easeInOut = (u: number) => (u < 0.5 ? 4 * u * u * u : 1 - (-2 * u + 2) ** 3 / 2);
+/** Fast at the start, still moving until the end of the hold. */
+const easeOut = (u: number) => 1 - (1 - u) ** 3;
 /** Eases toward 1 over about `tau` seconds of hold. */
 const settle = (hold: number, tau: number) => 1 - Math.exp(-hold / tau);
+
+/** How far the aim trails the stack, in seconds. Clamped to the start of the shot. */
+const AIM_LAG = 0.14;
+/** Share of the aim that is the pose right now; the rest is where it was `AIM_LAG` ago. */
+const AIM_NOW = 0.28;
+/** Dutch angle each shot holds, radians (~3°), sign alternating with the shot. */
+const DUTCH = 3 * DEG;
+/** Slow roll sway, radians (~1°). */
+const ROLL_SWAY = 1 * DEG;
+/** Elevation breathe on top of the shot's own angle, radians (~1.5°). */
+const EL_BREATHE = 1.5 * DEG;
+/** Share of the distance eased in across a room hold. */
+const DOLLY = 0.08;
+/** Slow zoom that keeps a long hold from sitting still. */
+const DOLLY_SINE = 0.015;
+
+/** Seconds a shot is held before the next one takes over. The last shot has none. */
+function holdSpan(index: number): number {
+  const next = SHOT_TIMES[index + 1];
+  if (!next) return 0;
+  return Math.max(0, next.start - SHOT_TIMES[index].at);
+}
 
 const isRoomView = (view: ShotView): view is RoomView => typeof view === 'object';
 
@@ -41,26 +67,42 @@ export class RoomsCamera {
   readonly state: ShotState = { from: 0, to: 0, u: 1 };
   private readonly a = createPose();
   private readonly b = createPose();
+  /** Where the aim was a moment earlier. Allocated once; only its target is read. */
+  private readonly trailed = createPose();
   private readonly centres: Vector3[] = BOXES.map((box) => new Vector3(box.pos[0], box.pos[1], box.pos[2]));
   private readonly off = new Vector3();
 
-  /** The pose at song second `s` on a screen of this aspect. `kick` shakes it a little on the drops. */
-  evaluate(s: number, aspect: number, kick: number, out: Pose): Pose {
+  /**
+   * The pose at song second `s` on a screen of this aspect. `kick` shakes it a little on the
+   * drops. `motion` scales the roll, the elevation breathe and the dolly (1 full, 0.5 reduced).
+   */
+  evaluate(s: number, aspect: number, kick: number, motion: number, out: Pose): Pose {
     const st = shotAt(s, this.state);
     const to = SHOT_TIMES[st.to];
-    this.poseFor(to.view, Math.max(0, s - to.at), to.kind, aspect, this.b);
+    const toHold = Math.max(0, s - to.at);
+    this.poseFor(to.view, toHold, to.kind, aspect, st.to, holdSpan(st.to), motion, this.b);
     const fb = isRoomView(to.view) ? 1 : 0;
     const frontB = isRoomView(to.view) && to.view.angle === 'front' ? 1 : 0;
     if (st.from === st.to) {
       copyPose(this.b, out);
+      // The aim trails the stack, but never back into the shot before this one, and never
+      // during a fly: a fly has to land on the beat.
+      if (toHold > 0) {
+        this.poseFor(to.view, Math.max(0, toHold - AIM_LAG), to.kind, aspect, st.to, holdSpan(st.to), motion, this.a);
+        out.target.lerpVectors(this.a.target, this.b.target, AIM_NOW);
+      }
       this.focus = fb;
       this.frontness = frontB;
       this.focusSlot = isRoomView(to.view) ? to.view.room : -1;
     } else {
       const from = SHOT_TIMES[st.from];
+      const fromHold = Math.max(0, s - from.at);
       // The shot it leaves keeps drifting as it goes, so the start of the fly has no seam.
-      this.poseFor(from.view, Math.max(0, s - from.at), from.kind, aspect, this.a);
+      this.poseFor(from.view, fromHold, from.kind, aspect, st.from, holdSpan(st.from), motion, this.a);
+      // The trail is still there as the fly leaves, and gone by the landing, so the landing is the beat.
+      this.poseFor(from.view, Math.max(0, fromHold - AIM_LAG), from.kind, aspect, st.from, holdSpan(st.from), motion, this.trailed);
       const u = easeInOut(st.u);
+      this.a.target.lerpVectors(this.trailed.target, this.a.target, AIM_NOW + (1 - AIM_NOW) * u);
       blendPose(this.a, this.b, u, out);
       const fa = isRoomView(from.view) ? 1 : 0;
       const frontA = isRoomView(from.view) && from.view.angle === 'front' ? 1 : 0;
@@ -85,21 +127,30 @@ export class RoomsCamera {
     return out.set(Math.sin(pose.az) * c, Math.sin(pose.el), Math.cos(pose.az) * c).multiplyScalar(pose.dist).add(pose.target);
   }
 
-  private poseFor(view: ShotView, hold: number, kind: SectionKind, aspect: number, out: Pose): void {
+  private poseFor(view: ShotView, hold: number, kind: SectionKind, aspect: number, shot: number, span: number, motion: number, out: Pose): void {
     if (isRoomView(view)) {
       this.roomPose(BOXES[view.room] ?? BOXES[0], this.centres[view.room] ?? this.centres[0], view.angle, hold, kind, aspect, out);
-      return;
+      // An ease-out push across the whole hold, plus a slow breathe so it never sits.
+      // The drop's punch is already in `dist`; the outro pull is an overview and skips this.
+      const u = span > 0 ? Math.min(1, hold / span) : 1;
+      const breathe = 1 + DOLLY_SINE * Math.sin(hold * 0.9 + shot) * motion;
+      out.dist *= (1 - DOLLY * easeOut(u) * motion) * breathe;
+    } else {
+      const p = ISO[view];
+      out.target.set(p.target[0], p.target[1], p.target[2]);
+      out.fov = p.fov;
+      out.az = (p.az + p.spin * hold) * DEG;
+      out.el = p.el * DEG;
+      // A slow dolly in while held; a drop lands a little wide and punches in.
+      let scale = Math.max(0.85, 1 - 0.008 * hold);
+      if (kind === 'drop') scale *= 1 + 0.1 * Math.exp(-hold / 0.2);
+      const t = Math.tan((p.fov * DEG) / 2);
+      out.dist = Math.max((p.fitH * scale) / 2 / t, (p.fitW * scale) / 2 / (t * aspect));
     }
-    const p = ISO[view];
-    out.target.set(p.target[0], p.target[1], p.target[2]);
-    out.fov = p.fov;
-    out.az = (p.az + p.spin * hold) * DEG;
-    out.el = p.el * DEG;
-    // A slow dolly in while held; a drop lands a little wide and punches in.
-    let scale = Math.max(0.85, 1 - 0.008 * hold);
-    if (kind === 'drop') scale *= 1 + 0.1 * Math.exp(-hold / 0.2);
-    const t = Math.tan((p.fov * DEG) / 2);
-    out.dist = Math.max((p.fitH * scale) / 2 / t, (p.fitW * scale) / 2 / (t * aspect));
+    const sign = shot % 2 === 0 ? 1 : -1;
+    const sway = Math.sin(hold * 0.7 + shot * 1.7);
+    out.roll = (sign * DUTCH + sway * ROLL_SWAY) * motion;
+    out.el += Math.sin(hold * 0.55 + shot * 0.9) * EL_BREATHE * motion;
   }
 
   /**
@@ -164,6 +215,7 @@ function copyPose(src: Pose, out: Pose): void {
   out.target.copy(src.target);
   out.az = src.az;
   out.el = src.el;
+  out.roll = src.roll;
   out.dist = src.dist;
   out.fov = src.fov;
 }
@@ -175,6 +227,10 @@ function blendPose(a: Pose, b: Pose, u: number, out: Pose): void {
   while (daz < -Math.PI) daz += 2 * Math.PI;
   out.az = a.az + daz * u;
   out.el = a.el + (b.el - a.el) * u;
+  let droll = b.roll - a.roll;
+  while (droll > Math.PI) droll -= 2 * Math.PI;
+  while (droll < -Math.PI) droll += 2 * Math.PI;
+  out.roll = a.roll + droll * u;
   out.dist = Math.exp(Math.log(a.dist) + (Math.log(b.dist) - Math.log(a.dist)) * u);
   out.fov = a.fov + (b.fov - a.fov) * u;
 }
