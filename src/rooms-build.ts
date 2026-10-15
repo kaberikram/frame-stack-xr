@@ -1,7 +1,7 @@
 /**
  * Rooms' geometry and shaders: the grid frame with its vault arch, and for each room the parts
  * of its frame stack that Frame stack's own materials (`stack-materials.ts`) don't cover: the
- * sharp frame (the clip itself, travelling through the stack) and the time ruler under it.
+ * sharp frame (the clip itself, travelling through the stack).
  * Everything that moves is driven by uniforms the system writes from the song clock.
  *
  * Same conventions as sorang-materials.ts: three compiles these as GLSL ES 3.00 with its
@@ -41,7 +41,7 @@ export type RoomsUniforms = ReturnType<typeof createRoomsUniforms>;
 
 // ---------------------------------------------------------------- stacks
 
-/** Per room: what the sharp frame and the ruler read besides the stack's own uniforms. */
+/** Per room: what the sharp frame reads besides the stack's own uniforms. */
 export interface FrameUniforms {
   uVideo: { value: Texture };
   /** Presence × focus × occluder fade: the sharp frame's opacity. */
@@ -50,10 +50,6 @@ export interface FrameUniforms {
   uGlow: { value: number };
   /** Shared with the stack: how soft the frame's edges are. */
   uFeather: { value: number };
-  /** The stack layer the sharp frame is at (continuous), for the ruler. */
-  uCur: { value: number };
-  /** The ruler's brightness. */
-  uRuler: { value: number };
 }
 
 /**
@@ -92,59 +88,6 @@ export function currentFrameMaterial(u: FrameUniforms): ShaderMaterial {
     side: DoubleSide,
     blending: NormalBlending,
     premultipliedAlpha: true,
-  });
-}
-
-/**
- * The time ruler under a stack, along its time axis like Frame stack's filmstrip: a baseline,
- * a tick per frame and a longer one every sixth, lit where the sharp frame is. Stack-local:
- * frames face +z and run from +length/2 (first) to -length/2 (last).
- */
-export function rulerGeometry(w: number, h: number, length: number, layers: number): BufferGeometry {
-  const pos: number[] = [];
-  const layer: number[] = [];
-  const y = -h / 2 - 0.12;
-  const x = -w / 2;
-  const z0 = length / 2;
-  const step = layers > 1 ? length / (layers - 1) : 0;
-  pos.push(x, y, z0, x, y, -z0);
-  layer.push(-1, -1);
-  for (let i = 0; i < layers; i++) {
-    const z = z0 - i * step;
-    const tick = i % 6 === 0 ? 0.16 : 0.07;
-    pos.push(x, y, z, x, y - tick, z);
-    layer.push(i, i);
-  }
-  const geo = new BufferGeometry();
-  geo.setAttribute('position', new Float32BufferAttribute(pos, 3));
-  geo.setAttribute('aLayer', new Float32BufferAttribute(layer, 1));
-  return geo;
-}
-
-export function rulerMaterial(u: FrameUniforms): ShaderMaterial {
-  return new ShaderMaterial({
-    uniforms: { uCur: u.uCur, uRuler: u.uRuler },
-    vertexShader: /* glsl */ `
-      attribute float aLayer;
-      varying float vLayer;
-      void main() {
-        vLayer = aLayer;
-        gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-      }`,
-    fragmentShader: /* glsl */ `
-      uniform float uCur;
-      uniform float uRuler;
-      varying float vLayer;
-      void main() {
-        float d = (vLayer - uCur) / 1.5;
-        float at = vLayer < 0.0 ? 0.0 : exp(-d * d);
-        gl_FragColor = vec4(vec3(0.86, 0.89, 1.0) * uRuler * (0.35 + 1.6 * at), 1.0);
-        #include <colorspace_fragment>
-      }`,
-    transparent: true,
-    blending: AdditiveBlending,
-    depthWrite: false,
-    depthTest: true,
   });
 }
 

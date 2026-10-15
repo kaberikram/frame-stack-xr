@@ -17,8 +17,6 @@ import {
   currentFrameMaterial,
   frameGeometry,
   frameMaterial,
-  rulerGeometry,
-  rulerMaterial,
   type FrameUniforms,
   type RoomsUniforms,
 } from './rooms-build.js';
@@ -104,13 +102,12 @@ interface StackRig {
   readonly slot: VideoSlot;
   /** Frame stack's own uniforms: layers, spacing, ghost, trail, feather, halo. */
   readonly S: StackUniforms;
-  /** The sharp frame's and the ruler's. */
+  /** The sharp frame's. */
   readonly F: FrameUniforms;
   readonly group: Group;
   readonly ghosts: Mesh;
   readonly current: Mesh;
   readonly halo: Mesh;
-  readonly ruler: LineSegments;
   /** Frame height, metres. */
   readonly h: number;
   /** 0..1, fading while it stands between the camera and the room it is on. */
@@ -119,7 +116,7 @@ interface StackRig {
   dist: number;
 }
 
-/** Each stack's draw-order block: ghosts, then its sharp frame, halo and ruler. */
+/** Each stack's draw-order block: ghosts, then its sharp frame and halo. */
 const ORDER_BASE = 100;
 const ORDER_STEP = 10;
 
@@ -130,7 +127,7 @@ function viewName(view: ShotView): string {
 /**
  * Rooms: five clips floating inside a grid frame under a vault, each as a frame stack like Frame
  * stack's: its frames as feathered ghost layers along a time axis, the clip itself travelling
- * through them sharp and lit, and a time ruler underneath. The camera follows the shot list in
+ * through them sharp and lit. The camera follows the shot list in
  * `rooms-score.ts`: eased flights in the verses, hard cuts on the beat in the drops, face on to see
  * a clip in full or round its stack. Everything is a function of the song second, so any moment
  * can be frozen and captured. Desktop only.
@@ -573,7 +570,7 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     this.twins.push(twin);
   }
 
-  /** One room: its frames as ghost layers, the clip itself as the sharp frame, its halo, and the time ruler. */
+  /** One room: its frames as ghost layers, the clip itself as the sharp frame, and its halo. */
   private buildStack(spec: BoxSpec, quad: PlaneGeometry): StackRig {
     const slot = this.videos.slots[spec.slot];
     const h = boxHeight(spec);
@@ -591,8 +588,6 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
       uBright: { value: 0 },
       uGlow: { value: this.look.glow },
       uFeather: S.feather,
-      uCur: { value: 0 },
-      uRuler: { value: 0 },
     };
     const group = new Group();
     group.name = `rooms-stack-${spec.slot + 1}`;
@@ -610,14 +605,12 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     current.scale.set(spec.w, h, 1);
     const halo = new Mesh(quad, haloMaterial(S));
     halo.frustumCulled = false; // sized in its shader
-    const ruler = new LineSegments(rulerGeometry(spec.w, h, spec.d, LAYERS), rulerMaterial(F));
-    group.add(ghosts, current, halo, ruler);
+    group.add(ghosts, current, halo);
     this.root.add(group);
     this.addPiece(ghosts, ghostMaterial(S), false);
     this.addPiece(current, currentFrameMaterial(F), false);
     this.addPiece(halo, haloMaterial(S), false);
-    this.addPiece(ruler, rulerMaterial(F), false);
-    return { spec, slot, S, F, group, ghosts, current, halo, ruler, h, occ: 1, dist: 0 };
+    return { spec, slot, S, F, group, ghosts, current, halo, h, occ: 1, dist: 0 };
   }
 
   /**
@@ -660,8 +653,6 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     const means = rig.slot.means;
     S.haloColor.value.setRGB(Math.min(1, means[m] * 1.6 + 0.02), Math.min(1, means[m + 1] * 1.6 + 0.02), Math.min(1, means[m + 2] * 1.6 + 0.02));
     S.haloStrength.value = 0.18 * look.glow * bright * shown * (1 + 0.8 * kick + 2 * flare + 1.2 * flash);
-    F.uCur.value = cur;
-    F.uRuler.value = bright * presence * (0.5 + 0.6 * kick + flash);
     rig.group.visible = presence > 0.001 && rig.occ > 0.01;
   }
 
@@ -684,7 +675,6 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
       rig.ghosts.renderOrder = base;
       rig.current.renderOrder = base + 2;
       rig.halo.renderOrder = base + 3;
-      rig.ruler.renderOrder = base + 4;
     }
   }
 

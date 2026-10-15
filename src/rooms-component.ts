@@ -20,7 +20,7 @@ export const RoomsLook = createComponent('RoomsLook', {
   glow: { type: Types.Float32, default: 0.4, min: 0, max: 1, step: 0.01, label: 'Glow' },
   kick: {
     type: Types.Float32, default: 1, min: 0, max: 2, step: 0.05, label: 'Beat response',
-    help: 'How hard the trail, glow, rulers, floor ring and camera answer each beat.',
+    help: 'How hard the trail, glow, floor ring and camera answer each beat.',
   },
   focusDim: {
     type: Types.Float32, default: 0.75, min: 0, max: 1, step: 0.05, label: 'Front-view dim',
@@ -28,7 +28,7 @@ export const RoomsLook = createComponent('RoomsLook', {
   },
   flash: {
     type: Types.Float32, default: 1, min: 0, max: 2, step: 0.05, label: 'Cut flash',
-    help: 'How hard the glow, rulers and grid flare on a cut.',
+    help: 'How hard the glow and grid flare on a cut.',
   },
   parallax: {
     type: Types.Float32, default: 1, min: 0, max: 3, step: 0.1, label: 'Mouse parallax',
