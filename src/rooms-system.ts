@@ -1,7 +1,9 @@
 import {
   Group,
+  InstancedBufferGeometry,
   LineSegments,
   Mesh,
+  PlaneGeometry,
   Vector2,
   Vector3,
   createSystem,
@@ -9,23 +11,20 @@ import {
   type Material,
 } from '@iwsdk/core';
 import { getMode } from './experience.js';
-import { MUSIC_URL } from './rooms-assets.js';
+import { LAYERS, MUSIC_URL } from './rooms-assets.js';
 import {
-  boxGeometry,
-  createBoxUniforms,
   createRoomsUniforms,
-  edgeGeometry,
-  edgeMaterial,
+  currentFrameMaterial,
   frameGeometry,
   frameMaterial,
-  glassMaterial,
-  interiorMaterial,
-  type BoxUniforms,
+  rulerGeometry,
+  rulerMaterial,
+  type FrameUniforms,
   type RoomsUniforms,
 } from './rooms-build.js';
 import { RoomsCamera, createPose, segmentHitsBox } from './rooms-camera.js';
 import { RoomsLook } from './rooms-component.js';
-import { BOXES, WALL, type BoxSpec } from './rooms-layout.js';
+import { BOXES, WALL, boxHeight, type BoxSpec } from './rooms-layout.js';
 import {
   BAR,
   SHOT_TIMES,
@@ -36,6 +35,7 @@ import {
   energyAt,
   fadeAt,
   flashAt,
+  isRoom,
   kickAt,
   presenceAt,
   sectionAt,
@@ -44,8 +44,9 @@ import {
 import { RoomsVideos, type VideoSlot } from './rooms-videos.js';
 import { SorangBloom, type BloomSwap } from './sorang-bloom.js';
 import { SorangMusic } from './sorang-music.js';
+import { createStackUniforms, ghostMaterial, haloMaterial, type StackUniforms } from './stack-materials.js';
 
-const LOOK_KEYS = ['glass', 'kick', 'focusDim', 'flash', 'parallax', 'bloom', 'bloomThreshold', 'volume'] as const;
+const LOOK_KEYS = ['ghost', 'trail', 'feather', 'glow', 'kick', 'focusDim', 'flash', 'parallax', 'bloom', 'bloomThreshold', 'volume'] as const;
 type Look = Record<(typeof LOOK_KEYS)[number], number>;
 
 /** Seconds the empty frame takes to fade in before the song can start. */
@@ -98,34 +99,49 @@ export interface RoomsHook {
   stats(): Record<string, number | string>;
 }
 
-interface BoxRig {
+interface StackRig {
   readonly spec: BoxSpec;
-  readonly u: BoxUniforms;
-  readonly group: Group;
-  readonly interior: Mesh;
-  readonly glass: Mesh;
-  readonly edges: LineSegments;
   readonly slot: VideoSlot;
-  /** 0..1, fading while it stands between the camera and the box it faces. */
+  /** Frame stack's own uniforms: layers, spacing, ghost, trail, feather, halo. */
+  readonly S: StackUniforms;
+  /** The sharp frame's and the ruler's. */
+  readonly F: FrameUniforms;
+  readonly group: Group;
+  readonly ghosts: Mesh;
+  readonly current: Mesh;
+  readonly halo: Mesh;
+  readonly ruler: LineSegments;
+  /** Frame height, metres. */
+  readonly h: number;
+  /** 0..1, fading while it stands between the camera and the room it is on. */
   occ: number;
+  /** Camera distance this frame, for drawing the stacks far to near. */
+  dist: number;
 }
 
+/** Each stack's draw-order block: ghosts, then its sharp frame, halo and ruler. */
+const ORDER_BASE = 100;
+const ORDER_STEP = 10;
+
 function viewName(view: ShotView): string {
-  return typeof view === 'number' ? `box ${view + 1} (${BOXES[view]?.name ?? '?'})` : view;
+  return isRoom(view) ? `room ${view.room + 1} (${BOXES[view.room]?.name ?? '?'}) ${view.angle}` : view;
 }
 
 /**
- * Rooms: glass rooms stacked inside a grid frame under a vault, each looping its own clip and
- * shaped to it. The camera follows the shot
- * list in `rooms-score.ts`: eased flights between the overview and single rooms in the verses,
- * hard cuts on the beat in the drops. Everything is a function of the song second, so any moment
+ * Rooms: five clips floating inside a grid frame under a vault, each as a frame stack like Frame
+ * stack's: its frames as feathered ghost layers along a time axis, the clip itself travelling
+ * through them sharp and lit, and a time ruler underneath. The camera follows the shot list in
+ * `rooms-score.ts`: eased flights in the verses, hard cuts on the beat in the drops, face on to see
+ * a clip in full or round its stack. Everything is a function of the song second, so any moment
  * can be frozen and captured. Desktop only.
  */
 export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook] } }) {
   private U!: RoomsUniforms;
   private root!: Group;
   private frame!: LineSegments;
-  private boxes: BoxRig[] = [];
+  private rooms: StackRig[] = [];
+  /** Room indices, far to near, re-sorted each frame without allocating. */
+  private readonly drawOrder: number[] = BOXES.map((_, i) => i);
   private bloom!: SorangBloom;
   private bloomOn = !BLOOM_OFF;
   private bloomSwaps: BloomSwap[] = [];
@@ -135,13 +151,16 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
   private readonly cam = new RoomsCamera();
   private readonly pose = createPose();
   private readonly look: Look = {
-    glass: 0.7,
+    ghost: 0.6,
+    trail: 5,
+    feather: 0.2,
+    glow: 0.4,
     kick: 1,
     focusDim: 0.75,
     flash: 1,
     parallax: 1,
-    bloom: 1.1,
-    bloomThreshold: 0.35,
+    bloom: 0.8,
+    bloomThreshold: 0.6,
     volume: 0.9,
   };
 
@@ -188,7 +207,7 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     this.root.visible = false;
     this.videos = new RoomsVideos(BOXES);
     this.videos.onChange = (slot) => {
-      const rig = this.boxes.find((b) => b.slot === slot);
+      const rig = this.rooms.find((r) => r.slot === slot);
       if (rig) this.useClip(rig);
       this.refreshStatus();
     };
@@ -197,27 +216,9 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     this.frame.renderOrder = 15;
     this.addPiece(this.frame, frameMaterial(this.U));
 
-    for (const spec of BOXES) {
-      const slot = this.videos.slots[spec.slot];
-      const u = createBoxUniforms(this.U, spec, this.videos.texture(slot));
-      const group = new Group();
-      group.name = `rooms-box-${spec.slot + 1}`;
-      group.position.set(spec.pos[0], spec.pos[1], spec.pos[2]);
-      group.rotation.y = spec.yaw * DEG;
-      const interior = new Mesh(boxGeometry(spec), interiorMaterial(u));
-      interior.renderOrder = 10;
-      const glass = new Mesh(boxGeometry(spec, 1.003), glassMaterial(u));
-      glass.renderOrder = 30;
-      const edges = new LineSegments(edgeGeometry(spec), edgeMaterial(u));
-      edges.renderOrder = 35;
-      group.add(interior, glass, edges);
-      this.root.add(group);
-      // The clip glows only where it is brightest (a sky, a window); the glass and edges glow fully.
-      this.addPiece(interior, interiorMaterial(u, 0.3), false);
-      this.addPiece(glass, glassMaterial(u), false);
-      this.addPiece(edges, edgeMaterial(u), false);
-      this.boxes.push({ spec, u, group, interior, glass, edges, slot, occ: 1 });
-    }
+    // One quad for every frame: each stack scales it to its frames' size.
+    const quad = new PlaneGeometry(1, 1);
+    for (const spec of BOXES) this.rooms.push(this.buildStack(spec, quad));
 
     this.bloom = new SorangBloom(this.renderer, 'rooms');
     this.bloom.composite.name = 'rooms-bloom';
@@ -351,7 +352,7 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     this.music.stop();
     // Release the decoders too: the other modes (and a headset's 2D page) need them more.
     this.videos.unload();
-    for (const rig of this.boxes) this.useClip(rig);
+    for (const rig of this.rooms) this.useClip(rig);
     this.bloom.hide();
     this.toPreroll(true);
     this.downId = -1;
@@ -474,8 +475,6 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     const fade = fadeAt(s);
     const frameShow = preroll ? smooth01(this.prerollT / PREROLL) : this.phase === 'ended' && this.frozen === null ? 0 : 1 - fade;
     const beats = beatsAt(s);
-    U.uSong.value = s;
-    U.uKick.value = kick;
     U.uEnergy.value = energy;
     U.uBeatAge.value = s < 0.045 ? 1 : (beats - Math.floor(beats)) * (BAR / 4);
     U.uRing.value = (sectionAt(s).kind === 'drop' ? 1 : 0.3) * energy * look.kick;
@@ -488,32 +487,29 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     this.renderer.getDrawingBufferSize(this.bufSize);
     U.uViewportH.value = this.bufSize.y;
 
-    // Focus: the box the camera faces stays lit; the others dim and any in the way fade out.
+    // Focus: the room in view stays lit; the others dim and any in the way fade out.
     const focus = this.cam.focus;
     const focusSlot = this.cam.focusSlot;
-    const focused = focusSlot >= 0 ? this.boxes[focusSlot] : null;
-    if (focused) {
-      // Aim at the middle of its open front, so the box itself never counts as in the way.
-      this.aimL.set(0, 0, focused.spec.d / 2).applyAxisAngle(Y_AXIS, focused.spec.yaw * DEG).add(focused.group.position);
-    }
+    const focused = focusSlot >= 0 ? this.rooms[focusSlot] : null;
+    // What the camera looks at is the room's own centre or front, so it never counts as in the way.
+    this.aimL.copy(pose.target);
     const snap = cut || this.frozen !== null;
     const kOcc = snap ? 1 : 1 - Math.exp(-OCCLUDE_RATE * dt);
-    for (const rig of this.boxes) {
+    // Frame stack's ghost opacity, normalised by the layer count so density reads the same at any count.
+    const ghostK = (look.ghost / 0.5) ** 2;
+    const ghost = 1 - Math.exp((-6.75 * ghostK) / Math.max(2, LAYERS));
+    for (const rig of this.rooms) {
       const spec = rig.spec;
       const presence = preroll ? 0 : presenceAt(s, spec.order);
       const mine = rig === focused;
       const dim = focused && !mine ? look.focusDim * focus : 0;
       const blocking = focused !== null && !mine && focus > 0.05 && segmentHitsBox(this.eyeL, this.aimL, spec, OCCLUDE_MARGIN);
       rig.occ += ((blocking ? 0 : 1) - rig.occ) * kOcc;
-      const bright = presence * (1 - dim) * rig.occ;
-      const facing = mine ? focus : 0;
-      rig.u.uBright.value = bright;
-      rig.u.uGlass.value = look.glass * (1 - 0.8 * facing);
-      rig.u.uHaze.value = 1 - 0.85 * facing;
+      const bright = (1 - dim) * rig.occ;
       const flare = preroll ? 0 : arrivalFlareAt(s, spec.order);
-      rig.u.uEdge.value = presence * rig.occ * (1 - 0.6 * dim) * (0.35 + 0.55 * kick + 1.6 * flare + 1.2 * flash);
-      rig.group.visible = presence > 0.001 && rig.occ > 0.01;
+      this.syncStack(rig, s, presence, bright, mine ? this.cam.frontness : 0, ghost, kick, flare, flash);
     }
+    this.sortStacks();
 
     // The glow: everything glows a little, and it swells on the drops and the cuts.
     if (!this.bloomOn || look.bloom <= 0 || frameShow <= 0) {
@@ -577,16 +573,125 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
     this.twins.push(twin);
   }
 
-  /** A slot's clip has decoded: show it, cover-fitted to the room's back wall (a no-op when it matches the room's shape). */
-  private useClip(rig: BoxRig): void {
-    const tex = this.videos.texture(rig.slot);
-    rig.u.uVideo.value = tex;
-    rig.u.uLive.value = rig.slot.live ? 1 : 0;
-    const a = rig.slot.aspect;
-    const room = rig.spec.aspect;
-    const cover = rig.u.uCover.value;
-    if (a > room) cover.set(room / a, 1, (1 - room / a) / 2, 0);
-    else cover.set(1, a / room, 0, (1 - a / room) / 2);
+  /** One room: its frames as ghost layers, the clip itself as the sharp frame, its halo, and the time ruler. */
+  private buildStack(spec: BoxSpec, quad: PlaneGeometry): StackRig {
+    const slot = this.videos.slots[spec.slot];
+    const h = boxHeight(spec);
+    const S = createStackUniforms(slot.frames);
+    S.n.value = LAYERS;
+    S.loaded.value = 0;
+    S.z0.value = spec.d / 2;
+    S.spacing.value = LAYERS > 1 ? spec.d / (LAYERS - 1) : 0;
+    // Every layer keeps its slot; the sharp frame is drawn over its own.
+    S.lift.value = 1;
+    S.haloHalf.value.set(spec.w / 2, h / 2);
+    S.haloReach.value = 0.05 * spec.w;
+    const F: FrameUniforms = {
+      uVideo: { value: this.videos.texture(slot) },
+      uBright: { value: 0 },
+      uGlow: { value: this.look.glow },
+      uFeather: S.feather,
+      uCur: { value: 0 },
+      uRuler: { value: 0 },
+    };
+    const group = new Group();
+    group.name = `rooms-stack-${spec.slot + 1}`;
+    group.position.set(spec.pos[0], spec.pos[1], spec.pos[2]);
+    group.rotation.y = spec.yaw * DEG;
+    const geo = new InstancedBufferGeometry();
+    geo.setIndex(quad.getIndex());
+    geo.setAttribute('position', quad.getAttribute('position'));
+    geo.setAttribute('uv', quad.getAttribute('uv'));
+    geo.instanceCount = LAYERS;
+    const ghosts = new Mesh(geo, ghostMaterial(S));
+    ghosts.scale.set(spec.w, h, 1); // x/y only: the layers' z offsets come from the shader
+    ghosts.frustumCulled = false;
+    const current = new Mesh(quad, currentFrameMaterial(F));
+    current.scale.set(spec.w, h, 1);
+    const halo = new Mesh(quad, haloMaterial(S));
+    halo.frustumCulled = false; // sized in its shader
+    const ruler = new LineSegments(rulerGeometry(spec.w, h, spec.d, LAYERS), rulerMaterial(F));
+    group.add(ghosts, current, halo, ruler);
+    this.root.add(group);
+    this.addPiece(ghosts, ghostMaterial(S), false);
+    this.addPiece(current, currentFrameMaterial(F), false);
+    this.addPiece(halo, haloMaterial(S), false);
+    this.addPiece(ruler, rulerMaterial(F), false);
+    return { spec, slot, S, F, group, ghosts, current, halo, ruler, h, occ: 1, dist: 0 };
+  }
+
+  /**
+   * One room's frame for song second `s`. `presence` builds it up frame by frame (and takes it
+   * apart), `bright` dims it while another room is in view, and `frontness` brings the sharp
+   * frame from its slot in the stack to the front, for the face-on views.
+   */
+  private syncStack(rig: StackRig, s: number, presence: number, bright: number, frontness: number, ghost: number, kick: number, flare: number, flash: number): void {
+    const { S, F, spec } = rig;
+    const look = this.look;
+    // Where the clip is in its loop is where its sharp frame sits in the stack.
+    const cur = Math.min(LAYERS - 1, this.videos.phase(rig.slot, s) * LAYERS);
+    const shown = Math.min(1, presence * 1.4);
+    S.loaded.value = presence * LAYERS;
+    S.cur.value = Math.round(cur);
+    S.focus.value = cur;
+    S.ghost.value = ghost * bright;
+    S.peak.value = (0.38 + 0.3 * kick) * bright;
+    S.spread.value = look.trail;
+    S.feather.value = look.feather;
+    F.uGlow.value = look.glow;
+
+    // The camera in the stack's frame: draw each side from its far end inward, like Frame stack.
+    const dx = this.eyeL.x - spec.pos[0];
+    const dz = this.eyeL.z - spec.pos[2];
+    const dy = this.eyeL.y - spec.pos[1];
+    const yaw = spec.yaw * DEG;
+    const localZ = dx * Math.sin(yaw) + dz * Math.cos(yaw);
+    const ci = S.spacing.value > 0 ? (S.z0.value - localZ) / S.spacing.value : -1e4;
+    S.split.value = Math.min(LAYERS, Math.max(0, Math.floor(ci) + 1));
+    rig.dist = dx * dx + dy * dy + dz * dz;
+
+    // The sharp frame: in its slot, or at the front of the stack when the camera is face on.
+    const slotZ = S.z0.value - cur * S.spacing.value;
+    const z = slotZ + (S.z0.value + 0.6 * S.spacing.value - slotZ) * frontness;
+    rig.current.position.set(0, 0, z);
+    rig.halo.position.set(0, 0, z);
+    F.uBright.value = bright * shown;
+    const m = Math.round(cur) * 3;
+    const means = rig.slot.means;
+    S.haloColor.value.setRGB(Math.min(1, means[m] * 1.6 + 0.02), Math.min(1, means[m + 1] * 1.6 + 0.02), Math.min(1, means[m + 2] * 1.6 + 0.02));
+    S.haloStrength.value = 0.18 * look.glow * bright * shown * (1 + 0.8 * kick + 2 * flare + 1.2 * flash);
+    F.uCur.value = cur;
+    F.uRuler.value = bright * presence * (0.5 + 0.6 * kick + flash);
+    rig.group.visible = presence > 0.001 && rig.occ > 0.01;
+  }
+
+  /** Transparent stacks draw far to near, each as one block, so a near stack's layers veil a far one's frame. */
+  private sortStacks(): void {
+    const order = this.drawOrder;
+    const rooms = this.rooms;
+    for (let i = 1; i < order.length; i++) {
+      const k = order[i];
+      let j = i - 1;
+      while (j >= 0 && rooms[order[j]].dist < rooms[k].dist) {
+        order[j + 1] = order[j];
+        j--;
+      }
+      order[j + 1] = k;
+    }
+    for (let rank = 0; rank < order.length; rank++) {
+      const rig = rooms[order[rank]];
+      const base = ORDER_BASE + rank * ORDER_STEP;
+      rig.ghosts.renderOrder = base;
+      rig.current.renderOrder = base + 2;
+      rig.halo.renderOrder = base + 3;
+      rig.ruler.renderOrder = base + 4;
+    }
+  }
+
+  /** A slot's clip or frame sheet has landed: the sharp frame shows the clip, the layers its frames. */
+  private useClip(rig: StackRig): void {
+    rig.F.uVideo.value = this.videos.texture(rig.slot);
+    rig.S.frames.value = rig.slot.frames;
   }
 
   private readLook(): void {
@@ -690,6 +795,7 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
       bloomSize: `${src.w}x${src.h}`,
       music: this.music.isSilent ? 'silent' : this.music.isPlaying ? 'playing' : this.music.needsGesture ? 'locked' : 'idle',
       clips: `${this.videos.liveCount}/${BOXES.length}`,
+      stacks: `${this.videos.stackedCount}/${BOXES.length}`,
       fov: this.camera.fov,
       far: this.camera.far,
       calls: info.render.calls,
@@ -718,7 +824,6 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
   }
 }
 
-const Y_AXIS = new Vector3(0, 1, 0);
 const NOTHING_HIDDEN: readonly Mesh[] = [];
 
 function smooth01(v: number): number {
