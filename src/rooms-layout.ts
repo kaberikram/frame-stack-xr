@@ -53,8 +53,8 @@ const VIOLET = [0.9, 0.5, 1] as const;
 /** One room per clip, each the shape of its clip (`scripts/rooms/prep_clips.sh --keep-aspect`). */
 export const BOXES: readonly BoxSpec[] = [
   { slot: 0, name: 'car park', pos: at(-2.2, 6.05, 0.4), w: 4.0, aspect: 16 / 9, d: 3.3, yaw: 10, tint: LILAC, order: 1 },
-  { slot: 1, name: 'hallway', pos: at(2.4, 5.0, -0.9), w: 3.0, aspect: 448 / 352, d: 2.8, yaw: 18, tint: WARM, order: 2 },
-  { slot: 2, name: 'dark room', pos: at(-1.8, 2.9, 1.1), w: 2.9, aspect: 592 / 480, d: 2.7, yaw: 12, tint: PINK, order: 3 },
+  { slot: 1, name: 'hallway', pos: at(2.4, 5.0, -0.9), w: 3.0, aspect: 832 / 464, d: 2.8, yaw: 18, tint: WARM, order: 2 },
+  { slot: 2, name: 'dark room', pos: at(-1.8, 2.9, 1.1), w: 2.9, aspect: 656 / 480, d: 2.7, yaw: 12, tint: PINK, order: 3 },
   { slot: 3, name: 'rooftop', pos: at(0.8, 8.6, -0.6), w: 3.8, aspect: 16 / 9, d: 3.2, yaw: 14, tint: ICE, order: 0 },
   { slot: 4, name: 'train', pos: at(2.2, 1.5, 1.3), w: 3.1, aspect: 576 / 480, d: 2.8, yaw: 16, tint: VIOLET, order: 4 },
 ];

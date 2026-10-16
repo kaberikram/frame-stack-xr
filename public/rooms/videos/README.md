@@ -5,9 +5,9 @@ Each room floats as a frame stack: its clip plays sharp through a stack of its o
 | Clip | Frame sheet | Room | Shape |
 |---|---|---|---|
 | 01.mp4 | 01-frames.jpg | car park | 960×540 (16:9) |
-| 02.mp4 | 02-frames.jpg | hallway | 448×352 |
-| 03.mp4 | 03-frames.jpg | dark room | 592×480 |
-| 04.mp4 | 04-frames.jpg | rooftop (top of the stack) | 960×540 (16:9) |
+| 02.mp4 | 02-frames.jpg | hallway | 832×464 |
+| 03.mp4 | 03-frames.jpg | dark room | 656×480 |
+| 04.mp4 | 04-frames.jpg | rooftop (top of the stack) | 1024×576 (16:9) |
 | 05.mp4 | 05-frames.jpg | train (bottom) | 576×480 |
 
 - **The clip** plays muted on a loop as the sharp frame travelling through the stack.
