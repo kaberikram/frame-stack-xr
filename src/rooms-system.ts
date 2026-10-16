@@ -322,6 +322,8 @@ export class RoomsSystem extends createSystem({ anchors: { required: [RoomsLook]
         this.phase = 'ended';
         this.videos.pause();
         this.notify();
+        // The outro is already black. Start again from the top, unless a freeze is holding this moment.
+        if (this.frozen === null) this.restartWanted = true;
       }
     }
     const s = this.frozen ?? (this.phase === 'preroll' ? 0 : this.phase === 'ended' ? SONG_LENGTH : this.song);
