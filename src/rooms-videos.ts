@@ -141,6 +141,48 @@ export class RoomsVideos {
     }
   }
 
+  /**
+   * Put every clip on the frame at song second `s` and wait until that frame is the one
+   * the texture will upload. Used by the export, which steps faster than playback.
+   */
+  seekHold(s: number): Promise<void> {
+    const waits: Promise<void>[] = [];
+    for (const slot of this.slots) {
+      const video = slot.video;
+      if (!slot.live || !video || !(video.duration > 0)) continue;
+      const at = s % video.duration;
+      if (Math.abs(video.currentTime - at) <= 1 / 120 && video.readyState >= 2) {
+        if (slot.texture) slot.texture.needsUpdate = true;
+        continue;
+      }
+      waits.push(
+        new Promise((resolve) => {
+          let settled = false;
+          const finish = () => {
+            if (settled) return;
+            settled = true;
+            window.clearTimeout(timer);
+            video.removeEventListener('seeked', finish);
+            video.removeEventListener('error', finish);
+            if (slot.texture) slot.texture.needsUpdate = true;
+            resolve();
+          };
+          const timer = window.setTimeout(finish, 400);
+          video.addEventListener('seeked', finish);
+          video.addEventListener('error', finish);
+          video.pause();
+          try {
+            video.currentTime = at;
+          } catch {
+            finish();
+          }
+        }),
+      );
+    }
+    this.playing = false;
+    return Promise.all(waits).then(() => undefined);
+  }
+
   /** Let go of every clip and its decoder. The stacks keep their frames; `load` opens the clips again. */
   unload(): void {
     for (const cleanup of this.cleanups) cleanup();
